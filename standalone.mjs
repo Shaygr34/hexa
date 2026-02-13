@@ -49,6 +49,16 @@ const state = {
     riskManager: { lastSeen: Date.now(), status: 'idle', interval: 120000 },
   },
   opportunityCache: { data: [], fetchedAt: 0, ttl: 15000 },
+  // ── Founder decision state ──
+  founder: {
+    capitalAllocated: false,
+    fundSize: 6000,             // $6K default
+    risksApproved: false,
+    decisions: {},              // { marketId: 'BUY' | 'PASS' }
+    positions: {},              // { marketId: { side, size, entryPrice, timestamp } }
+    capitalDeployed: 0,
+    completedSteps: [],
+  },
 };
 
 // ─── Polymarket API helpers ──────────────────────────────────────────────────
@@ -232,6 +242,120 @@ function getConfig() {
   };
 }
 
+// ─── AI Blocker Detection Engine ────────────────────────────────────────────
+// Analyzes system state and returns prioritized founder actions.
+// Critical blockers (API keys, wallet) come first. Then capital, risk approval,
+// and finally trading decisions. Each step unlocks the next.
+function getBlockers() {
+  const cfg = getConfig();
+  const blockers = [];
+
+  // ── Priority 1: Polymarket API Keys ──
+  const missingApi = [];
+  if (!process.env.POLYMARKET_API_KEY) missingApi.push('POLYMARKET_API_KEY');
+  if (!process.env.POLYMARKET_API_SECRET) missingApi.push('POLYMARKET_API_SECRET');
+  if (!process.env.POLYMARKET_API_PASSPHRASE) missingApi.push('POLYMARKET_API_PASSPHRASE');
+
+  blockers.push({
+    id: 'api-keys',
+    priority: 1,
+    title: 'Connect API Keys',
+    desc: 'Polymarket CLOB credentials are required to place orders.',
+    status: missingApi.length === 0 ? 'done' : 'blocked',
+    missing: missingApi,
+    action: 'Add keys to .env.local and restart',
+    category: 'critical',
+  });
+
+  // ── Priority 2: Wallet Private Key ──
+  const hasWallet = !!process.env.POLYMARKET_PRIVATE_KEY;
+  blockers.push({
+    id: 'wallet',
+    priority: 2,
+    title: 'Connect Wallet',
+    desc: 'Private key needed to sign transactions on Polygon.',
+    status: hasWallet ? 'done' : 'blocked',
+    missing: hasWallet ? [] : ['POLYMARKET_PRIVATE_KEY'],
+    action: 'Add POLYMARKET_PRIVATE_KEY to .env.local',
+    category: 'critical',
+  });
+
+  // ── Priority 3: Fund Capital Allocation ──
+  blockers.push({
+    id: 'capital',
+    priority: 3,
+    title: 'Fund Capital',
+    desc: 'Confirm USDC allocation for trading. Current: $' + state.founder.fundSize.toLocaleString(),
+    status: state.founder.capitalAllocated ? 'done' : 'action-needed',
+    missing: [],
+    action: 'Set fund size and confirm',
+    category: 'setup',
+    interactive: true,
+    fundSize: state.founder.fundSize,
+  });
+
+  // ── Priority 4: Approve Risk Limits ──
+  blockers.push({
+    id: 'risks',
+    priority: 4,
+    title: 'Approve Risk Limits',
+    desc: 'Max/market: $' + cfg.riskLimits.maxExposurePerMarket +
+          ' | Daily: $' + cfg.riskLimits.dailyMaxExposure +
+          ' | Min edge: ' + (cfg.riskLimits.minEdgeThreshold * 100).toFixed(1) + '%',
+    status: state.founder.risksApproved ? 'done' : 'action-needed',
+    missing: [],
+    action: 'Review and approve limits',
+    category: 'setup',
+    interactive: true,
+    limits: cfg.riskLimits,
+  });
+
+  // ── Priority 5: Trading decisions (auto-unlocks) ──
+  const prevDone = blockers.every(b => b.status === 'done');
+  const decisionCount = Object.keys(state.founder.decisions).length;
+  blockers.push({
+    id: 'trade',
+    priority: 5,
+    title: 'BUY / PASS Decisions',
+    desc: prevDone
+      ? 'All systems go. Review opportunities and make decisions. ' + decisionCount + ' decided so far.'
+      : 'Complete steps above to unlock trading.',
+    status: prevDone ? 'ready' : 'locked',
+    missing: [],
+    action: 'Review opportunities below',
+    category: 'trade',
+    decisionsCount: decisionCount,
+  });
+
+  const currentStep = blockers.findIndex(b => b.status !== 'done');
+  return {
+    blockers,
+    currentStep: currentStep === -1 ? blockers.length : currentStep + 1,
+    totalSteps: blockers.length,
+    allClear: prevDone,
+    founder: {
+      fundSize: state.founder.fundSize,
+      capitalAllocated: state.founder.capitalAllocated,
+      risksApproved: state.founder.risksApproved,
+      capitalDeployed: state.founder.capitalDeployed,
+      decisions: state.founder.decisions,
+    },
+  };
+}
+
+// Position sizing: Kelly-lite based on edge, confidence, fund size
+function recommendPosition(opp) {
+  const fundSize = state.founder.fundSize;
+  const maxPerMarket = parseInt(process.env.MAX_EXPOSURE_PER_MARKET) || 500;
+  const edgeFraction = opp.edge / 100;
+  const confFraction = opp.confidence / 100;
+  // Fractional Kelly: edge * confidence * fund, capped at max per market
+  const kellySize = Math.round(edgeFraction * confFraction * fundSize * 0.25);
+  const size = Math.min(Math.max(kellySize, 10), maxPerMarket);
+  const pctOfFund = ((size / fundSize) * 100).toFixed(1);
+  return { size, pctOfFund, maxPerMarket };
+}
+
 // ─── HTTP helpers ────────────────────────────────────────────────────────────
 function json(res, data, status = 200) {
   const body = JSON.stringify(data);
@@ -267,27 +391,27 @@ function dashboardHTML() {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ZVI v1 — Fund Operating System</title>
+<title>ZVI v1 — Founder Command Center</title>
 <style>
   :root {
-    --bg-primary: #0a0e17;
-    --bg-secondary: #111827;
-    --bg-card: #1a2035;
-    --bg-card-hover: #1f2847;
-    --border: #2a3555;
-    --border-bright: #3b4f80;
-    --text-primary: #e2e8f0;
-    --text-secondary: #8892a8;
-    --text-muted: #5a6478;
-    --accent-blue: #3b82f6;
+    --bg-primary: #0a0a0f;
+    --bg-secondary: #0f0f18;
+    --bg-card: #12121a;
+    --bg-card-hover: #1a1a2e;
+    --border: #2a2a3e;
+    --border-bright: #3b3b55;
+    --text-primary: #e4e4ef;
+    --text-secondary: #8888a0;
+    --text-muted: #5a5a72;
+    --accent-blue: #6366f1;
     --accent-cyan: #06b6d4;
-    --accent-green: #10b981;
-    --accent-yellow: #f59e0b;
+    --accent-green: #22c55e;
+    --accent-yellow: #eab308;
     --accent-red: #ef4444;
     --accent-purple: #8b5cf6;
-    --glow-blue: rgba(59, 130, 246, 0.15);
-    --glow-green: rgba(16, 185, 129, 0.15);
-    --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
+    --glow-blue: rgba(99, 102, 241, 0.15);
+    --glow-green: rgba(34, 197, 94, 0.15);
+    --font-mono: 'SF Mono', 'Fira Code', 'JetBrains Mono', monospace;
     --font-sans: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
   }
 
@@ -328,7 +452,7 @@ function dashboardHTML() {
     font-family: var(--font-mono);
     font-size: 16px;
     font-weight: 700;
-    background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
+    background: linear-gradient(135deg, var(--accent-blue), var(--accent-cyan));
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     letter-spacing: 0.5px;
@@ -990,6 +1114,236 @@ function dashboardHTML() {
     align-items: flex-end;
     flex-wrap: wrap;
   }
+
+  /* ── Action Queue (Founder Priority Flow) ── */
+  .action-queue {
+    padding: 16px 24px;
+    background: linear-gradient(180deg, rgba(99, 102, 241, 0.04) 0%, transparent 100%);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .aq-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+  }
+
+  .aq-title {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--accent-blue);
+    font-family: var(--font-mono);
+  }
+
+  .aq-progress {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .aq-steps {
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+  }
+
+  .aq-step {
+    flex: 1;
+    min-width: 170px;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    transition: all 0.2s;
+    position: relative;
+  }
+
+  .aq-step.step-blocked {
+    border-color: rgba(239, 68, 68, 0.4);
+    background: rgba(239, 68, 68, 0.04);
+  }
+
+  .aq-step.step-current {
+    border-color: var(--accent-blue);
+    background: rgba(99, 102, 241, 0.06);
+    box-shadow: 0 0 20px rgba(99, 102, 241, 0.08);
+  }
+
+  .aq-step.step-done {
+    border-color: rgba(34, 197, 94, 0.3);
+    background: rgba(34, 197, 94, 0.04);
+    opacity: 0.65;
+  }
+
+  .aq-step.step-locked {
+    opacity: 0.3;
+    pointer-events: none;
+  }
+
+  .aq-num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    font-size: 10px;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    margin-bottom: 6px;
+  }
+
+  .step-blocked .aq-num { background: rgba(239, 68, 68, 0.2); color: var(--accent-red); }
+  .step-current .aq-num { background: rgba(99, 102, 241, 0.2); color: var(--accent-blue); }
+  .step-done .aq-num { background: rgba(34, 197, 94, 0.2); color: var(--accent-green); }
+  .step-locked .aq-num { background: rgba(90, 90, 114, 0.15); color: var(--text-muted); }
+
+  .aq-step-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 3px;
+  }
+
+  .aq-step-desc {
+    font-size: 10px;
+    color: var(--text-muted);
+    line-height: 1.5;
+    font-family: var(--font-mono);
+  }
+
+  .aq-step-action {
+    margin-top: 8px;
+  }
+
+  .aq-step-action .btn {
+    font-size: 10px;
+    padding: 3px 10px;
+  }
+
+  .aq-missing {
+    margin-top: 6px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--accent-red);
+    line-height: 1.6;
+  }
+
+  .aq-all-clear {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 16px;
+    background: rgba(34, 197, 94, 0.06);
+    border: 1px solid rgba(34, 197, 94, 0.25);
+    border-radius: 8px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--accent-green);
+    font-weight: 600;
+  }
+
+  .aq-capital-input {
+    display: flex;
+    gap: 6px;
+    margin-top: 6px;
+    align-items: center;
+  }
+
+  .aq-capital-input input {
+    width: 80px;
+    padding: 3px 6px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+
+  .aq-capital-input input:focus {
+    border-color: var(--accent-blue);
+    outline: none;
+  }
+
+  /* ── BUY / PASS Verdict Buttons ── */
+  .verdict-cell {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+  }
+
+  .verdict-btn {
+    padding: 3px 10px;
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    border: 1px solid;
+    cursor: pointer;
+    transition: all 0.15s;
+    letter-spacing: 0.5px;
+    background: none;
+  }
+
+  .vb-buy {
+    border-color: rgba(34, 197, 94, 0.3);
+    color: var(--accent-green);
+  }
+  .vb-buy:hover { background: rgba(34, 197, 94, 0.15); border-color: var(--accent-green); }
+  .vb-buy.active { background: var(--accent-green); color: #000; }
+
+  .vb-pass {
+    border-color: rgba(239, 68, 68, 0.3);
+    color: var(--accent-red);
+  }
+  .vb-pass:hover { background: rgba(239, 68, 68, 0.15); border-color: var(--accent-red); }
+  .vb-pass.active { background: var(--accent-red); color: #fff; }
+
+  .verdict-locked .verdict-btn {
+    opacity: 0.25;
+    pointer-events: none;
+  }
+
+  .position-rec {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    color: var(--accent-blue);
+    margin-top: 2px;
+  }
+
+  .verdict-decided {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+  }
+
+  .verdict-decided.decided-buy { color: var(--accent-green); }
+  .verdict-decided.decided-pass { color: var(--text-muted); text-decoration: line-through; }
+
+  /* ── Fund Summary Bar ── */
+  .fund-bar {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+    padding: 8px 16px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-bottom: 12px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+
+  .fund-bar .fb-item { display: flex; gap: 6px; align-items: center; }
+  .fund-bar .fb-label { color: var(--text-muted); }
+  .fund-bar .fb-value { font-weight: 700; }
+  .fund-bar .fb-green { color: var(--accent-green); }
+  .fund-bar .fb-yellow { color: var(--accent-yellow); }
+  .fund-bar .fb-red { color: var(--accent-red); }
 </style>
 </head>
 <body>
@@ -1010,6 +1364,17 @@ function dashboardHTML() {
     </div>
   </div>
 
+  <!-- ── Founder Action Queue ── -->
+  <div class="action-queue" id="actionQueue">
+    <div class="aq-header">
+      <span class="aq-title">Founder Action Queue</span>
+      <span class="aq-progress" id="aqProgress">Loading...</span>
+    </div>
+    <div class="aq-steps" id="aqSteps">
+      <div style="color:var(--text-muted);font-family:var(--font-mono);font-size:11px;padding:8px;">Detecting blockers...</div>
+    </div>
+  </div>
+
   <!-- ── Tabs ── -->
   <div class="tabs">
     <div class="tab active" data-tab="opportunities">Opportunities <span class="count" id="countOpps">--</span></div>
@@ -1023,6 +1388,7 @@ function dashboardHTML() {
 
     <!-- Opportunities Panel -->
     <div class="panel active" id="panel-opportunities">
+      <div class="fund-bar" id="fundBar" style="display:none"></div>
       <div class="summary-strip" id="oppSummary"></div>
       <div class="table-wrap">
         <div class="table-header">
@@ -1225,6 +1591,7 @@ function dashboardHTML() {
       '<th>Volume 24h</th>' +
       '<th>Liquidity</th>' +
       '<th>Confidence</th>' +
+      '<th>Verdict</th>' +
       '<th>Pin</th>' +
       '</tr></thead><tbody>';
 
@@ -1248,6 +1615,7 @@ function dashboardHTML() {
           '<div class="confidence-track"><div class="confidence-fill" style="width:' + o.confidence + '%;background:' + confColor + '"></div></div>' +
           '<span class="confidence-val">' + o.confidence.toFixed(0) + '</span>' +
         '</div></td>' +
+        '<td>' + renderVerdictCell(o) + '</td>' +
         '<td><button class="pin-btn' + (isPinned ? ' pinned' : '') + '" onclick="togglePin(\'' + o.id + '\')">' + (isPinned ? 'Unpin' : 'Pin') + '</button></td>' +
         '</tr>';
     });
@@ -1455,16 +1823,205 @@ function dashboardHTML() {
     }, 1000);
   }
 
+  // ── Blocker / Action Queue State ──
+  let blockerData = null;
+  let founderDecisions = {};
+  let tradingUnlocked = false;
+
+  async function fetchBlockers() {
+    try {
+      const r = await fetch('/api/blockers');
+      blockerData = await r.json();
+      founderDecisions = blockerData.founder?.decisions || {};
+      tradingUnlocked = blockerData.allClear;
+      renderActionQueue();
+      renderFundBar();
+      // Re-render opportunities to update verdict buttons
+      if (opportunities.length > 0) renderOpportunities();
+    } catch (e) {
+      console.error('Blocker fetch error:', e);
+    }
+  }
+
+  function renderActionQueue() {
+    if (!blockerData) return;
+    const { blockers, currentStep, totalSteps, allClear } = blockerData;
+
+    document.getElementById('aqProgress').textContent =
+      allClear ? 'ALL CLEAR' : 'Step ' + currentStep + ' of ' + totalSteps;
+
+    if (allClear) {
+      document.getElementById('aqSteps').innerHTML =
+        '<div class="aq-all-clear">' +
+          '<span style="font-size:16px">></span> ALL SYSTEMS GO — Ready to trade. ' +
+          'Scroll down to make BUY / PASS decisions.' +
+        '</div>';
+      return;
+    }
+
+    document.getElementById('aqSteps').innerHTML = blockers.map((b, i) => {
+      let stepClass = 'step-locked';
+      if (b.status === 'done') stepClass = 'step-done';
+      else if (b.status === 'blocked') stepClass = i === currentStep - 1 ? 'step-blocked step-current' : 'step-blocked';
+      else if (b.status === 'action-needed') stepClass = i === currentStep - 1 ? 'step-current' : '';
+      else if (b.status === 'ready') stepClass = 'step-current';
+
+      let statusIcon = '';
+      if (b.status === 'done') statusIcon = '[OK]';
+      else if (b.status === 'blocked') statusIcon = '[!!]';
+      else if (b.status === 'action-needed') statusIcon = '[>>]';
+      else if (b.status === 'locked') statusIcon = '[--]';
+
+      let actionHtml = '';
+      if (b.status !== 'done' && b.status !== 'locked') {
+        if (b.id === 'capital' && b.status === 'action-needed') {
+          actionHtml =
+            '<div class="aq-capital-input">' +
+              '<span style="color:var(--text-muted);font-size:10px">$</span>' +
+              '<input type="number" id="aqCapitalInput" value="' + (blockerData.founder?.fundSize || 6000) + '" min="100" step="500">' +
+              '<button class="btn btn-primary" style="font-size:10px;padding:3px 8px" onclick="setCapital()">Confirm</button>' +
+            '</div>';
+        } else if (b.id === 'risks' && b.status === 'action-needed') {
+          actionHtml =
+            '<div class="aq-step-action">' +
+              '<button class="btn btn-primary" onclick="approveRisks()">Approve Limits</button>' +
+            '</div>';
+        } else if (b.status === 'blocked' && b.missing && b.missing.length > 0) {
+          actionHtml = '<div class="aq-missing">Missing: ' + b.missing.join(', ') + '</div>';
+        }
+      }
+
+      return '<div class="aq-step ' + stepClass + '">' +
+        '<div class="aq-num">' + (b.status === 'done' ? '>' : (i + 1)) + '</div>' +
+        '<div class="aq-step-title">' + statusIcon + ' ' + esc(b.title) + '</div>' +
+        '<div class="aq-step-desc">' + esc(b.desc) + '</div>' +
+        actionHtml +
+      '</div>';
+    }).join('');
+  }
+
+  function renderFundBar() {
+    const bar = document.getElementById('fundBar');
+    if (!blockerData || !blockerData.founder) { bar.style.display = 'none'; return; }
+    const f = blockerData.founder;
+    if (!f.capitalAllocated) { bar.style.display = 'none'; return; }
+
+    const remaining = f.fundSize - f.capitalDeployed;
+    const pctUsed = ((f.capitalDeployed / f.fundSize) * 100).toFixed(0);
+    const decisions = Object.values(f.decisions || {});
+    const buys = decisions.filter(d => d.verdict === 'BUY').length;
+    const passes = decisions.filter(d => d.verdict === 'PASS').length;
+    const remainClass = remaining > f.fundSize * 0.3 ? 'fb-green' : remaining > f.fundSize * 0.1 ? 'fb-yellow' : 'fb-red';
+
+    bar.style.display = 'flex';
+    bar.innerHTML =
+      '<div class="fb-item"><span class="fb-label">Fund:</span><span class="fb-value">$' + f.fundSize.toLocaleString() + '</span></div>' +
+      '<div class="fb-item"><span class="fb-label">Deployed:</span><span class="fb-value fb-yellow">$' + f.capitalDeployed.toLocaleString() + ' (' + pctUsed + '%)</span></div>' +
+      '<div class="fb-item"><span class="fb-label">Remaining:</span><span class="fb-value ' + remainClass + '">$' + remaining.toLocaleString() + '</span></div>' +
+      '<div class="fb-item"><span class="fb-label">Decisions:</span><span class="fb-value">' + buys + ' BUY / ' + passes + ' PASS</span></div>';
+  }
+
+  // ── Verdict rendering per opportunity ──
+  function renderVerdictCell(o) {
+    const decision = founderDecisions[o.id];
+
+    if (decision) {
+      if (decision.verdict === 'BUY') {
+        return '<div class="verdict-decided decided-buy">BUY</div>';
+      }
+      return '<div class="verdict-decided decided-pass">PASS</div>';
+    }
+
+    if (!tradingUnlocked) {
+      return '<div class="verdict-cell verdict-locked">' +
+        '<button class="verdict-btn vb-buy" disabled>BUY</button>' +
+        '<button class="verdict-btn vb-pass" disabled>PASS</button>' +
+      '</div>';
+    }
+
+    return '<div class="verdict-cell">' +
+      '<button class="verdict-btn vb-buy" onclick="founderDecide(\'' + o.id + '\', \'BUY\', \'' + esc(o.market).replace(/'/g, "\\\\'") + '\')">BUY</button>' +
+      '<button class="verdict-btn vb-pass" onclick="founderDecide(\'' + o.id + '\', \'PASS\', \'' + esc(o.market).replace(/'/g, "\\\\'") + '\')">PASS</button>' +
+    '</div>';
+  }
+
+  async function founderDecide(marketId, verdict, market) {
+    try {
+      const r = await fetch('/api/founder/decide', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ marketId, verdict, market }),
+      });
+      const data = await r.json();
+      if (data.ok) {
+        founderDecisions[marketId] = { verdict };
+        if (verdict === 'BUY' && data.position) {
+          toast('BUY — Recommended: $' + data.position.size + ' (' + data.position.pctOfFund + '% of fund)', 'success');
+        } else {
+          toast('PASS — Market skipped', 'info');
+        }
+        await fetchBlockers();
+      }
+    } catch (e) {
+      toast('Decision failed', 'error');
+    }
+  }
+
+  async function setCapital() {
+    const input = document.getElementById('aqCapitalInput');
+    const size = parseInt(input?.value);
+    if (!size || size < 100) { toast('Fund size must be >= $100', 'error'); return; }
+
+    try {
+      const r = await fetch('/api/founder/set-capital', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fundSize: size }),
+      });
+      const data = await r.json();
+      if (data.ok) {
+        blockerData = data.blockers;
+        toast('Fund capital set: $' + size.toLocaleString(), 'success');
+        renderActionQueue();
+        renderFundBar();
+      }
+    } catch (e) {
+      toast('Failed to set capital', 'error');
+    }
+  }
+
+  async function approveRisks() {
+    try {
+      const r = await fetch('/api/founder/approve-risks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const data = await r.json();
+      if (data.ok) {
+        blockerData = data.blockers;
+        tradingUnlocked = data.blockers.allClear;
+        toast('Risk limits approved', 'success');
+        renderActionQueue();
+        if (opportunities.length > 0) renderOpportunities();
+      }
+    } catch (e) {
+      toast('Failed to approve risks', 'error');
+    }
+  }
+
   // ── Init ──
   async function init() {
     loadConfig();
+    await fetchBlockers();
     await fetchOpportunities();
     fetchSignals();
     fetchHealth();
     startCountdown();
 
-    // Auto-refresh health every 30s
+    // Auto-refresh health + blockers every 30s
     setInterval(fetchHealth, 30000);
+    setInterval(fetchBlockers, 30000);
   }
 
   init();
@@ -1556,6 +2113,69 @@ async function handleRequest(req, res) {
 
     if (pathname === '/api/config' && method === 'GET') {
       return json(res, getConfig());
+    }
+
+    // ── Founder Blocker / Action Queue ──
+    if (pathname === '/api/blockers' && method === 'GET') {
+      return json(res, getBlockers());
+    }
+
+    if (pathname === '/api/founder/set-capital' && method === 'POST') {
+      const body = await readBody(req);
+      const size = parseInt(body.fundSize);
+      if (!size || size < 100) {
+        return json(res, { error: 'Fund size must be >= $100' }, 400);
+      }
+      state.founder.fundSize = size;
+      state.founder.capitalAllocated = true;
+      if (!state.founder.completedSteps.includes('capital')) {
+        state.founder.completedSteps.push('capital');
+      }
+      return json(res, { ok: true, fundSize: size, blockers: getBlockers() });
+    }
+
+    if (pathname === '/api/founder/approve-risks' && method === 'POST') {
+      state.founder.risksApproved = true;
+      if (!state.founder.completedSteps.includes('risks')) {
+        state.founder.completedSteps.push('risks');
+      }
+      return json(res, { ok: true, blockers: getBlockers() });
+    }
+
+    if (pathname === '/api/founder/decide' && method === 'POST') {
+      const body = await readBody(req);
+      const { marketId, verdict, market } = body;
+      if (!marketId || !['BUY', 'PASS'].includes(verdict)) {
+        return json(res, { error: 'Requires marketId and verdict (BUY|PASS)' }, 400);
+      }
+      state.founder.decisions[marketId] = {
+        verdict,
+        market: market || '',
+        timestamp: new Date().toISOString(),
+      };
+      // If BUY, compute position recommendation
+      let position = null;
+      if (verdict === 'BUY') {
+        const opp = state.opportunityCache.data.find(o => o.id === marketId);
+        if (opp) {
+          position = recommendPosition(opp);
+          state.founder.positions[marketId] = {
+            side: 'YES',
+            recommendedSize: position.size,
+            entryEdge: opp.edge,
+            timestamp: new Date().toISOString(),
+          };
+          state.founder.capitalDeployed += position.size;
+        }
+      }
+      return json(res, {
+        ok: true,
+        marketId,
+        verdict,
+        position,
+        decisions: state.founder.decisions,
+        capitalDeployed: state.founder.capitalDeployed,
+      });
     }
 
     // ── Dashboard ──
