@@ -1,0 +1,53 @@
+# ═══════════════════════════════════════════════════════════════
+# ZVI v1 — Docker Compose
+# Run on Mac minis: multiple agents + dashboard
+# ═══════════════════════════════════════════════════════════════
+
+version: '3.8'
+
+services:
+  # ── Dashboard + API ──
+  dashboard:
+    build: .
+    ports:
+      - "3000:3000"
+    env_file: .env.local
+    volumes:
+      - zvi-data:/app/data
+    restart: unless-stopped
+
+  # ── NegRisk Observatory Agent ──
+  agent-negrisk:
+    build: .
+    command: npx tsx src/agents/negrisk-agent.ts
+    env_file: .env.local
+    volumes:
+      - zvi-data:/app/data
+    restart: unless-stopped
+    depends_on:
+      - dashboard
+
+  # ── Signal Watcher Agent ──
+  agent-signals:
+    build: .
+    command: npx tsx src/agents/signal-watcher-agent.ts
+    env_file: .env.local
+    volumes:
+      - zvi-data:/app/data
+    restart: unless-stopped
+    depends_on:
+      - dashboard
+
+  # ── LLM Probability Engine ──
+  agent-llm:
+    build: .
+    command: npx tsx src/agents/llm-probability-agent.ts
+    env_file: .env.local
+    volumes:
+      - zvi-data:/app/data
+    restart: unless-stopped
+    depends_on:
+      - dashboard
+
+volumes:
+  zvi-data:
