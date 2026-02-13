@@ -1,0 +1,46 @@
+{
+  "name": "zvi",
+  "version": "1.0.0",
+  "description": "ZVI v1 — Polymarket Fund Operating System",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "agents": "tsx src/agents/runner.ts",
+    "agents:negrisk": "tsx src/agents/negrisk-agent.ts",
+    "agents:signals": "tsx src/agents/signal-watcher-agent.ts",
+    "agents:llm": "tsx src/agents/llm-probability-agent.ts",
+    "db:init": "tsx src/lib/db-init.ts",
+    "test:negrisk": "tsx scripts/test-negrisk.ts",
+    "test:feerate": "tsx scripts/test-feerate.ts",
+    "test:rpol": "tsx scripts/test-rpol.ts",
+    "test:all": "npm run test:negrisk && npm run test:feerate && npm run test:rpol",
+    "lint": "next lint",
+    "setup": "npm install && npm run db:init"
+  },
+  "dependencies": {
+    "next": "^14.2.0",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
+    "better-sqlite3": "^11.0.0",
+    "ethers": "^6.13.0",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^6.9.0",
+    "uuid": "^9.0.0",
+    "zod": "^3.23.0",
+    "@anthropic-ai/sdk": "^0.32.0",
+    "openai": "^4.60.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^20.0.0",
+    "@types/node-cron": "^3.0.0",
+    "@types/nodemailer": "^6.4.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "@types/uuid": "^9.0.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}
