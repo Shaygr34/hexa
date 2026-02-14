@@ -38,6 +38,26 @@ function loadEnv() {
 
 loadEnv();
 
+// ─── Activity Log ────────────────────────────────────────────────────────────
+const activityLog = [];
+const STARTUP_TIME = Date.now();
+
+function logActivity(type, message, details = {}) {
+  const entry = {
+    id: crypto.randomUUID(),
+    timestamp: new Date().toISOString(),
+    type, // 'system' | 'trade' | 'config' | 'scan' | 'error' | 'decision'
+    message,
+    details,
+  };
+  activityLog.unshift(entry);
+  if (activityLog.length > 1000) activityLog.pop();
+  console.log('[' + type + '] ' + message);
+  return entry;
+}
+
+logActivity('system', 'ZVI v1 starting up');
+
 // ─── In-memory state ─────────────────────────────────────────────────────────
 const state = {
   thresholds: [],
@@ -49,6 +69,8 @@ const state = {
     riskManager: { lastSeen: Date.now(), status: 'idle', interval: 120000 },
   },
   opportunityCache: { data: [], fetchedAt: 0, ttl: 15000 },
+  totalScans: 0,
+  totalMarketsScanned: 0,
   // ── Founder decision state ──
   founder: {
     capitalAllocated: false,
@@ -58,6 +80,13 @@ const state = {
     positions: {},              // { marketId: { side, size, entryPrice, timestamp } }
     capitalDeployed: 0,
     completedSteps: [],
+  },
+  // ── Configurable settings (editable from UI) ──
+  settings: {
+    marketLimit: 200,
+    refreshInterval: 30,
+    scanMode: 'volume',         // 'volume' | 'newest' | 'ending-soon'
+    minEdgeDisplay: 0,          // show all markets by default
   },
 };
 
@@ -71,18 +100,36 @@ async function fetchOpportunities() {
   }
 
   try {
-    const url = `${GAMMA_BASE}/markets?closed=false&limit=50&order=volume24hr&ascending=false`;
-    const resp = await fetch(url, {
-      headers: { 'Accept': 'application/json', 'User-Agent': 'ZVI-FundOS/1.0' },
-      signal: AbortSignal.timeout(4000),
-    });
+    // ── Configurable limit — NO hard cap. Default 200, configurable from UI ──
+    const limit = state.settings.marketLimit || 200;
+    const orderBy = state.settings.scanMode === 'newest' ? 'startDate'
+      : state.settings.scanMode === 'ending-soon' ? 'endDate'
+      : 'volume24hr';
+    const ascending = state.settings.scanMode === 'ending-soon' ? 'true' : 'false';
 
-    if (!resp.ok) throw new Error(`Gamma API ${resp.status}: ${resp.statusText}`);
-    const markets = await resp.json();
+    // Fetch multiple pages if limit > 100 (Gamma API max per page)
+    let allMarkets = [];
+    let offset = 0;
+    const pageSize = Math.min(limit, 100);
+
+    while (allMarkets.length < limit) {
+      const url = `${GAMMA_BASE}/markets?closed=false&limit=${pageSize}&offset=${offset}&order=${orderBy}&ascending=${ascending}`;
+      const resp = await fetch(url, {
+        headers: { 'Accept': 'application/json', 'User-Agent': 'ZVI-FundOS/1.0' },
+        signal: AbortSignal.timeout(8000),
+      });
+
+      if (!resp.ok) throw new Error(`Gamma API ${resp.status}: ${resp.statusText}`);
+      const page = await resp.json();
+      if (!Array.isArray(page) || page.length === 0) break;
+      allMarkets = allMarkets.concat(page);
+      offset += page.length;
+      if (page.length < pageSize) break; // no more pages
+    }
 
     const opportunities = [];
 
-    for (const m of markets) {
+    for (const m of allMarkets) {
       if (!m.outcomePrices) continue;
 
       let prices;
@@ -109,12 +156,27 @@ async function fetchOpportunities() {
       const liqScore = Math.min(liquidity / 100000, 1.0);
       const confidence = (edgeScore * 0.4 + volScore * 0.35 + liqScore * 0.25) * 100;
 
-      const slug = m.slug || m.conditionId || '';
-      const link = slug ? `https://polymarket.com/event/${slug}` : 'https://polymarket.com';
+      // ── Fix Polymarket links — use correct slug-based URL ──
+      // Gamma API returns slugs that map to polymarket.com/event/{slug}
+      // If slug is missing, fall back to condition ID search
+      const slug = m.slug || '';
+      let link;
+      if (slug) {
+        link = `https://polymarket.com/event/${slug}`;
+      } else if (m.conditionId) {
+        link = `https://polymarket.com/markets?tid=${m.conditionId}`;
+      } else {
+        link = `https://polymarket.com`;
+      }
+
+      // Parse end date for time-to-expiry info
+      const endDate = m.endDate || m.endDateIso || null;
+      const daysToExpiry = endDate ? Math.max(0, Math.round((new Date(endDate) - now) / 86400000)) : null;
 
       opportunities.push({
         id: m.id || m.conditionId || crypto.randomUUID(),
         market: m.question || m.title || 'Unknown Market',
+        description: m.description || '',
         edge: parseFloat((edge * 100).toFixed(3)),
         bestBid: parseFloat(bestBid.toFixed(4)),
         bestAsk: parseFloat(bestAsk.toFixed(4)),
@@ -124,8 +186,11 @@ async function fetchOpportunities() {
         liquidity: Math.round(liquidity),
         confidence: parseFloat(confidence.toFixed(1)),
         link,
+        slug,
         negRisk: !!m.negRisk,
         conditionId: m.conditionId || '',
+        endDate,
+        daysToExpiry,
         updatedAt: m.updatedAt || new Date().toISOString(),
       });
     }
@@ -136,10 +201,15 @@ async function fetchOpportunities() {
     state.opportunityCache = { data: opportunities, fetchedAt: now, ttl: 15000 };
     state.agentHeartbeats.scanner.lastSeen = now;
     state.agentHeartbeats.scanner.status = 'running';
+    state.totalScans++;
+    state.totalMarketsScanned += allMarkets.length;
+
+    logActivity('scan', `Scanned ${allMarkets.length} markets, found ${opportunities.filter(o => o.edge > 0.5).length} with edge > 0.5%`);
 
     return opportunities;
   } catch (err) {
     console.error('[gamma] Fetch error:', err.message, '— loading demo data');
+    logActivity('error', 'Gamma API fetch failed: ' + err.message);
     state.agentHeartbeats.scanner.status = 'demo';
     // Return stale cache or demo data
     if (state.opportunityCache.data.length > 0) return state.opportunityCache.data;
@@ -174,6 +244,7 @@ function getDemoOpportunities() {
     return {
       id: crypto.randomUUID(),
       market: m.market,
+      description: 'Demo market — connect Polymarket API for live data',
       edge: parseFloat((edge * 100).toFixed(3)),
       bestBid: m.yes,
       bestAsk: m.no,
@@ -182,14 +253,18 @@ function getDemoOpportunities() {
       volume: m.vol,
       liquidity: m.liq,
       confidence: parseFloat(confidence.toFixed(1)),
-      link: `https://polymarket.com/event/${m.slug}`,
+      link: 'https://polymarket.com',
+      slug: '',
       negRisk: m.negRisk,
-      conditionId: `demo-${i}`,
+      conditionId: 'demo-' + i,
+      endDate: null,
+      daysToExpiry: null,
       updatedAt: new Date().toISOString(),
       demo: true,
     };
   }).sort((a, b) => b.edge - a.edge);
 }
+
 
 function checkThresholds(symbol, price) {
   const triggered = [];
@@ -354,6 +429,85 @@ function recommendPosition(opp) {
   const size = Math.min(Math.max(kellySize, 10), maxPerMarket);
   const pctOfFund = ((size / fundSize) * 100).toFixed(1);
   return { size, pctOfFund, maxPerMarket };
+}
+
+// ─── System Status ───────────────────────────────────────────────────────────
+function getSystemStatus() {
+  const cfg = getConfig();
+  const uptime = Math.round((Date.now() - STARTUP_TIME) / 1000);
+  const cacheAge = state.opportunityCache.fetchedAt > 0
+    ? Math.round((Date.now() - state.opportunityCache.fetchedAt) / 1000) : -1;
+
+  return {
+    uptime,
+    uptimeFormatted: uptime > 3600 ? Math.floor(uptime/3600) + 'h ' + Math.floor((uptime%3600)/60) + 'm'
+      : uptime > 60 ? Math.floor(uptime/60) + 'm ' + (uptime%60) + 's'
+      : uptime + 's',
+    mode: cfg.mode,
+    totalScans: state.totalScans,
+    totalMarketsScanned: state.totalMarketsScanned,
+    marketsInCache: state.opportunityCache.data.length,
+    cacheAge,
+    dataSource: state.agentHeartbeats.scanner.status === 'demo' ? 'demo' : 'live',
+    secrets: cfg.secrets,
+    riskLimits: cfg.riskLimits,
+    settings: state.settings,
+    founder: {
+      capitalAllocated: state.founder.capitalAllocated,
+      fundSize: state.founder.fundSize,
+      risksApproved: state.founder.risksApproved,
+      capitalDeployed: state.founder.capitalDeployed,
+      totalDecisions: Object.keys(state.founder.decisions).length,
+      buys: Object.values(state.founder.decisions).filter(d => d.verdict === 'BUY').length,
+      passes: Object.values(state.founder.decisions).filter(d => d.verdict === 'PASS').length,
+    },
+    agents: state.agentHeartbeats,
+    activityCount: activityLog.length,
+  };
+}
+
+// ─── .env.local updater (for UI-based API key config) ────────────────────────
+function updateEnvFile(updates) {
+  // updates is { KEY: 'value', KEY2: 'value2', ... }
+  // Only allow known safe keys
+  const ALLOWED_KEYS = new Set([
+    'POLYMARKET_API_KEY', 'POLYMARKET_API_SECRET', 'POLYMARKET_API_PASSPHRASE',
+    'POLYMARKET_PRIVATE_KEY', 'POLYMARKET_GAMMA_URL', 'POLYMARKET_CLOB_URL',
+    'POLYGON_RPC_URL', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'XAI_API_KEY',
+    'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID', 'WEBHOOK_URL',
+    'MAX_EXPOSURE_PER_MARKET', 'DAILY_MAX_EXPOSURE', 'MIN_EDGE_THRESHOLD', 'MIN_DEPTH_USDC',
+    'OBSERVATION_ONLY', 'MANUAL_APPROVAL_REQUIRED', 'AUTO_EXEC', 'KILL_SWITCH',
+  ]);
+
+  const filteredUpdates = {};
+  for (const [key, val] of Object.entries(updates)) {
+    if (ALLOWED_KEYS.has(key)) filteredUpdates[key] = val;
+  }
+
+  if (Object.keys(filteredUpdates).length === 0) return { ok: false, error: 'No valid keys to update' };
+
+  try {
+    let content = '';
+    try { content = fs.readFileSync(ENV_PATH, 'utf-8'); } catch { content = ''; }
+
+    for (const [key, val] of Object.entries(filteredUpdates)) {
+      const regex = new RegExp('^' + key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '=.*$', 'm');
+      if (regex.test(content)) {
+        content = content.replace(regex, key + '=' + val);
+      } else {
+        content += '\n' + key + '=' + val;
+      }
+      // Also update process.env immediately
+      process.env[key] = val;
+    }
+
+    fs.writeFileSync(ENV_PATH, content, 'utf-8');
+    logActivity('config', 'Updated .env.local: ' + Object.keys(filteredUpdates).join(', '));
+    return { ok: true, updated: Object.keys(filteredUpdates) };
+  } catch (err) {
+    logActivity('error', 'Failed to update .env.local: ' + err.message);
+    return { ok: false, error: err.message };
+  }
 }
 
 // ─── HTTP helpers ────────────────────────────────────────────────────────────
@@ -1348,6 +1502,400 @@ function dashboardHTML() {
   .fund-bar .fb-green { color: var(--accent-green); }
   .fund-bar .fb-yellow { color: var(--accent-yellow); }
   .fund-bar .fb-red { color: var(--accent-red); }
+
+  /* ── Search Bar ── */
+  .search-bar {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 16px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .search-bar input {
+    flex: 1;
+    min-width: 200px;
+    padding: 8px 14px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .search-bar input:focus { border-color: var(--accent-cyan); }
+  .search-bar select {
+    padding: 8px 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    outline: none;
+    appearance: none;
+    cursor: pointer;
+  }
+  .search-bar .result-count {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  /* ── Modal / Drawer ── */
+  .modal-overlay {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.7);
+    z-index: 500;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: fadeIn 0.15s;
+  }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  .modal {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    width: 90%;
+    max-width: 700px;
+    max-height: 85vh;
+    overflow-y: auto;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }
+  .modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+  }
+  .modal-header h2 {
+    font-size: 16px;
+    font-weight: 700;
+  }
+  .modal-close {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s;
+  }
+  .modal-close:hover { border-color: var(--accent-red); color: var(--accent-red); }
+  .modal-body { padding: 20px; }
+  .modal-footer {
+    padding: 12px 20px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+
+  /* ── Settings ── */
+  .settings-section {
+    margin-bottom: 24px;
+  }
+  .settings-section h3 {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--accent-cyan);
+    margin-bottom: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-family: var(--font-mono);
+  }
+  .settings-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 10px;
+  }
+  .setting-item {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .setting-item label {
+    font-size: 11px;
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .setting-item .setting-desc {
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+  }
+  .setting-item input, .setting-item select {
+    padding: 7px 10px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .setting-item input:focus { border-color: var(--accent-cyan); }
+  .setting-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10px;
+    font-family: var(--font-mono);
+    padding: 2px 6px;
+    border-radius: 3px;
+  }
+  .setting-status.connected { background: rgba(34,197,94,0.1); color: var(--accent-green); }
+  .setting-status.missing { background: rgba(239,68,68,0.1); color: var(--accent-red); }
+
+  /* ── Explain Hub ── */
+  .hub-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  @media (max-width: 900px) { .hub-grid { grid-template-columns: 1fr; } }
+  .hub-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    position: relative;
+    overflow: hidden;
+  }
+  .hub-card.full-width { grid-column: 1 / -1; }
+  .hub-card h3 {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--accent-blue);
+    font-family: var(--font-mono);
+    margin-bottom: 12px;
+  }
+  .hub-card p {
+    font-size: 13px;
+    line-height: 1.7;
+    color: var(--text-secondary);
+    margin-bottom: 8px;
+  }
+  .hub-status-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .hub-stat {
+    padding: 10px;
+    background: rgba(0,0,0,0.2);
+    border-radius: 6px;
+  }
+  .hub-stat .hs-label {
+    font-size: 10px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    text-transform: uppercase;
+  }
+  .hub-stat .hs-val {
+    font-size: 18px;
+    font-weight: 700;
+    font-family: var(--font-mono);
+  }
+
+  /* ── Activity Feed ── */
+  .activity-feed {
+    max-height: 400px;
+    overflow-y: auto;
+  }
+  .activity-entry {
+    display: flex;
+    gap: 10px;
+    padding: 8px 0;
+    border-bottom: 1px solid rgba(42,53,85,0.3);
+    font-size: 12px;
+    align-items: flex-start;
+  }
+  .activity-entry:last-child { border-bottom: none; }
+  .activity-time {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    min-width: 60px;
+  }
+  .activity-type {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    min-width: 55px;
+    text-align: center;
+  }
+  .at-system { background: rgba(99,102,241,0.15); color: var(--accent-blue); }
+  .at-scan { background: rgba(6,182,212,0.15); color: var(--accent-cyan); }
+  .at-config { background: rgba(245,158,11,0.15); color: var(--accent-yellow); }
+  .at-trade { background: rgba(34,197,94,0.15); color: var(--accent-green); }
+  .at-decision { background: rgba(139,92,246,0.15); color: var(--accent-purple); }
+  .at-error { background: rgba(239,68,68,0.15); color: var(--accent-red); }
+  .activity-msg { color: var(--text-secondary); }
+
+  /* ── Glossary ── */
+  .glossary-item {
+    padding: 10px;
+    margin-bottom: 6px;
+    background: rgba(0,0,0,0.15);
+    border-radius: 6px;
+    border-left: 3px solid var(--accent-blue);
+  }
+  .glossary-item .gi-term {
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 12px;
+    color: var(--accent-cyan);
+    margin-bottom: 3px;
+  }
+  .glossary-item .gi-def {
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+  }
+
+  /* ── Roadmap ── */
+  .roadmap-phase {
+    padding: 12px;
+    margin-bottom: 8px;
+    background: rgba(0,0,0,0.15);
+    border-radius: 8px;
+    border-left: 3px solid var(--border);
+  }
+  .roadmap-phase.active { border-left-color: var(--accent-green); background: rgba(34,197,94,0.04); }
+  .roadmap-phase.next { border-left-color: var(--accent-blue); }
+  .roadmap-phase.future { opacity: 0.6; }
+  .rp-title {
+    font-size: 13px;
+    font-weight: 700;
+    margin-bottom: 4px;
+  }
+  .rp-desc {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+  }
+  .rp-tag {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 9px;
+    font-family: var(--font-mono);
+    font-weight: 700;
+    margin-right: 6px;
+  }
+  .rp-tag.current { background: rgba(34,197,94,0.2); color: var(--accent-green); }
+  .rp-tag.upcoming { background: rgba(99,102,241,0.2); color: var(--accent-blue); }
+  .rp-tag.planned { background: rgba(90,90,114,0.2); color: var(--text-muted); }
+
+  /* ── Interactive Action Queue (expanded) ── */
+  .aq-step { cursor: pointer; }
+  .aq-step:hover:not(.step-locked) { border-color: var(--accent-cyan); }
+  .aq-step-expanded {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+  }
+  .aq-input-row {
+    display: flex;
+    gap: 6px;
+    margin-top: 6px;
+    align-items: center;
+  }
+  .aq-input-row input {
+    flex: 1;
+    padding: 5px 8px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    outline: none;
+  }
+  .aq-input-row input:focus { border-color: var(--accent-cyan); }
+  .aq-input-row label {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    min-width: 50px;
+  }
+
+  /* ── Market Detail Modal ── */
+  .md-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    margin: 12px 0;
+  }
+  .md-stat {
+    padding: 10px;
+    background: rgba(0,0,0,0.2);
+    border-radius: 6px;
+  }
+  .md-stat .ms-label {
+    font-size: 10px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    text-transform: uppercase;
+  }
+  .md-stat .ms-val {
+    font-size: 16px;
+    font-weight: 700;
+    font-family: var(--font-mono);
+  }
+  .md-desc {
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.6;
+    padding: 12px;
+    background: rgba(0,0,0,0.15);
+    border-radius: 6px;
+    margin: 10px 0;
+  }
+  .md-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 16px;
+    background: rgba(99,102,241,0.1);
+    border: 1px solid rgba(99,102,241,0.3);
+    border-radius: 6px;
+    color: var(--accent-blue);
+    text-decoration: none;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    transition: all 0.15s;
+  }
+  .md-link:hover { background: rgba(99,102,241,0.2); border-color: var(--accent-blue); }
+
+  /* ── Clickable market rows ── */
+  tbody tr { cursor: pointer; }
 </style>
 </head>
 <body>
@@ -1384,6 +1932,8 @@ function dashboardHTML() {
     <div class="tab active" data-tab="opportunities">Opportunities <span class="count" id="countOpps">--</span></div>
     <div class="tab" data-tab="signals">Signals <span class="count" id="countSignals">0</span></div>
     <div class="tab" data-tab="pinned">Pinned Markets <span class="count" id="countPinned">0</span></div>
+    <div class="tab" data-tab="hub">Explain Hub</div>
+    <div class="tab" data-tab="settings">Settings</div>
     <div class="tab" data-tab="health">Agent Health</div>
   </div>
 
@@ -1394,6 +1944,23 @@ function dashboardHTML() {
     <div class="panel active" id="panel-opportunities">
       <div class="fund-bar" id="fundBar" style="display:none"></div>
       <div class="summary-strip" id="oppSummary"></div>
+      <div class="search-bar">
+        <input type="text" id="marketSearch" placeholder="Search markets... (e.g. Bitcoin, Trump, Fed)" oninput="filterAndRender()">
+        <select id="edgeFilter" onchange="filterAndRender()">
+          <option value="0">All Edges</option>
+          <option value="0.5">Edge > 0.5%</option>
+          <option value="1">Edge > 1%</option>
+          <option value="2">Edge > 2%</option>
+          <option value="5">Edge > 5%</option>
+        </select>
+        <select id="sortMode" onchange="filterAndRender()">
+          <option value="edge">Sort: Edge</option>
+          <option value="volume">Sort: Volume</option>
+          <option value="confidence">Sort: Confidence</option>
+          <option value="liquidity">Sort: Liquidity</option>
+        </select>
+        <span class="result-count" id="resultCount"></span>
+      </div>
       <div class="table-wrap">
         <div class="table-header">
           <div class="table-title">NegRisk Arbitrage Scanner</div>
@@ -1470,12 +2037,25 @@ function dashboardHTML() {
       </div>
     </div>
 
+    <!-- Explain Hub Panel -->
+    <div class="panel" id="panel-hub">
+      <div class="hub-grid" id="hubGrid"></div>
+    </div>
+
+    <!-- Settings Panel -->
+    <div class="panel" id="panel-settings">
+      <div id="settingsContent"></div>
+    </div>
+
     <!-- Agent Health Panel -->
     <div class="panel" id="panel-health">
       <h3 style="margin-bottom: 16px; font-size: 16px;">Agent Health Monitor</h3>
       <div class="health-grid" id="healthGrid"></div>
     </div>
   </div>
+
+  <!-- Market Detail Modal -->
+  <div id="marketModal"></div>
 
   <div class="toast-container" id="toastContainer"></div>
 
@@ -1558,16 +2138,18 @@ function dashboardHTML() {
     const withEdge = opportunities.filter(o => o.edge > 0.5);
     ct.textContent = withEdge.length;
 
-    // Summary
+    // Summary — always from full dataset
     const totalVol = opportunities.reduce((a, o) => a + o.volume, 0);
     const avgEdge = opportunities.length > 0
       ? opportunities.reduce((a, o) => a + o.edge, 0) / opportunities.length
       : 0;
     const maxEdge = opportunities.length > 0 ? Math.max(...opportunities.map(o => o.edge)) : 0;
     const negRiskCount = opportunities.filter(o => o.negRisk).length;
+    const liveCount = opportunities.filter(o => !o.demo).length;
+    const demoCount = opportunities.filter(o => o.demo).length;
 
     document.getElementById('oppSummary').innerHTML = [
-      { label: 'Markets Scanned', value: opportunities.length, cls: 'blue' },
+      { label: 'Markets Scanned', value: opportunities.length, cls: 'blue', sub: liveCount > 0 ? liveCount + ' live' : demoCount + ' demo' },
       { label: 'Arb Opportunities', value: withEdge.length, cls: 'green', sub: '> 0.5% edge' },
       { label: 'Max Edge', value: maxEdge.toFixed(2) + '%', cls: 'cyan' },
       { label: 'Avg Edge', value: avgEdge.toFixed(2) + '%', cls: 'yellow' },
@@ -1581,9 +2163,14 @@ function dashboardHTML() {
       '</div>'
     ).join('');
 
-    if (opportunities.length === 0) {
+    // Apply search/filter
+    const filtered = getFilteredOpportunities();
+    const rcEl = document.getElementById('resultCount');
+    if (rcEl) rcEl.textContent = filtered.length + ' of ' + opportunities.length + ' markets';
+
+    if (filtered.length === 0) {
       document.getElementById('oppTableBody').innerHTML =
-        '<div class="empty-state"><div class="empty-icon">~</div><p>No opportunities found</p></div>';
+        '<div class="empty-state"><div class="empty-icon">~</div><p>No opportunities match your filters</p></div>';
       return;
     }
 
@@ -1591,8 +2178,7 @@ function dashboardHTML() {
       '<th>#</th>' +
       '<th>Market</th>' +
       '<th>Edge %</th>' +
-      '<th>Best Bid</th>' +
-      '<th>Best Ask</th>' +
+      '<th>Yes / No</th>' +
       '<th>Volume 24h</th>' +
       '<th>Liquidity</th>' +
       '<th>Confidence</th>' +
@@ -1600,28 +2186,31 @@ function dashboardHTML() {
       '<th>Pin</th>' +
       '</tr></thead><tbody>';
 
-    opportunities.forEach((o, i) => {
+    filtered.forEach((o, i) => {
       const edgeClass = o.edge >= 2 ? 'edge-high' : o.edge >= 1 ? 'edge-mid' : 'edge-low';
       const confColor = o.confidence >= 60 ? 'var(--accent-green)'
         : o.confidence >= 30 ? 'var(--accent-yellow)' : 'var(--text-muted)';
       const isPinned = pinnedMarkets.has(o.id);
+      const expiryTag = o.daysToExpiry !== null && o.daysToExpiry !== undefined
+        ? ' <span style="font-size:9px;color:var(--text-muted);font-family:var(--font-mono)">' + o.daysToExpiry + 'd</span>' : '';
 
-      html += '<tr>' +
+      html += '<tr onclick="showMarketDetail(' + i + ')" title="Click for details">' +
         '<td class="price-cell">' + (i + 1) + '</td>' +
-        '<td class="market-name"><a href="' + esc(o.link) + '" target="_blank" rel="noopener">' + esc(o.market) + '</a>' +
+        '<td class="market-name">' + esc(o.market) +
           (o.negRisk ? '<span class="negrisk-tag">NegRisk</span>' : '') +
+          expiryTag +
+          (o.demo ? '<span style="font-size:9px;color:var(--accent-yellow);margin-left:4px;font-family:var(--font-mono)">[demo]</span>' : '') +
         '</td>' +
         '<td class="edge-cell ' + edgeClass + '">' + o.edge.toFixed(2) + '%</td>' +
-        '<td class="price-cell">' + o.bestBid.toFixed(4) + '</td>' +
-        '<td class="price-cell">' + o.bestAsk.toFixed(4) + '</td>' +
+        '<td class="price-cell">' + o.bestBid.toFixed(2) + ' / ' + o.bestAsk.toFixed(2) + '</td>' +
         '<td class="volume-cell">$' + fmt(o.volume) + '</td>' +
         '<td class="volume-cell">$' + fmt(o.liquidity) + '</td>' +
         '<td><div class="confidence-bar">' +
           '<div class="confidence-track"><div class="confidence-fill" style="width:' + o.confidence + '%;background:' + confColor + '"></div></div>' +
           '<span class="confidence-val">' + o.confidence.toFixed(0) + '</span>' +
         '</div></td>' +
-        '<td>' + renderVerdictCell(o) + '</td>' +
-        '<td><button class="pin-btn' + (isPinned ? ' pinned' : '') + '" onclick="togglePin(\\'' + o.id + '\\')">' + (isPinned ? 'Unpin' : 'Pin') + '</button></td>' +
+        '<td onclick="event.stopPropagation()">' + renderVerdictCell(o) + '</td>' +
+        '<td onclick="event.stopPropagation()"><button class="pin-btn' + (isPinned ? ' pinned' : '') + '" onclick="togglePin(\\'' + o.id + '\\')">' + (isPinned ? 'Unpin' : 'Pin') + '</button></td>' +
         '</tr>';
     });
 
@@ -1853,6 +2442,8 @@ function dashboardHTML() {
     }
   }
 
+  var expandedStep = null;
+
   function renderActionQueue() {
     if (!blockerData) return;
     const { blockers, currentStep, totalSteps, allClear } = blockerData;
@@ -1881,33 +2472,132 @@ function dashboardHTML() {
       else if (b.status === 'blocked') statusIcon = '[!!]';
       else if (b.status === 'action-needed') statusIcon = '[>>]';
       else if (b.status === 'locked') statusIcon = '[--]';
+      else if (b.status === 'ready') statusIcon = '[GO]';
 
-      let actionHtml = '';
+      // ── Interactive action forms for each blocker ──
+      var actionHtml = '';
+      var isExpanded = expandedStep === b.id;
+
       if (b.status !== 'done' && b.status !== 'locked') {
-        if (b.id === 'capital' && b.status === 'action-needed') {
+        if (b.id === 'api-keys') {
+          // API key blocker: show input fields inline
+          if (isExpanded) {
+            actionHtml = '<div class="aq-step-expanded">' +
+              '<div class="aq-input-row"><label>API Key</label><input type="password" id="aq_api_key" placeholder="Polymarket API Key"></div>' +
+              '<div class="aq-input-row"><label>Secret</label><input type="password" id="aq_api_secret" placeholder="API Secret"></div>' +
+              '<div class="aq-input-row"><label>Pass</label><input type="password" id="aq_api_pass" placeholder="Passphrase"></div>' +
+              '<div style="margin-top:8px;display:flex;gap:6px">' +
+                '<button class="btn btn-primary" style="font-size:10px" onclick="event.stopPropagation();saveAqApiKeys()">Save Keys</button>' +
+                '<button class="btn" style="font-size:10px" onclick="event.stopPropagation();switchToTab(\\'settings\\')">Full Settings</button>' +
+              '</div>' +
+            '</div>';
+          } else if (b.missing && b.missing.length > 0) {
+            actionHtml = '<div class="aq-missing">Missing: ' + b.missing.join(', ') + '</div>' +
+              '<div style="margin-top:4px;font-size:9px;color:var(--accent-cyan);font-family:var(--font-mono)">Click to configure</div>';
+          }
+        } else if (b.id === 'wallet') {
+          if (isExpanded) {
+            actionHtml = '<div class="aq-step-expanded">' +
+              '<div class="aq-input-row"><label>Key</label><input type="password" id="aq_wallet_key" placeholder="Polygon wallet private key"></div>' +
+              '<div style="margin-top:8px">' +
+                '<button class="btn btn-primary" style="font-size:10px" onclick="event.stopPropagation();saveAqWalletKey()">Save Wallet Key</button>' +
+              '</div>' +
+            '</div>';
+          } else if (b.missing && b.missing.length > 0) {
+            actionHtml = '<div class="aq-missing">Missing: ' + b.missing.join(', ') + '</div>' +
+              '<div style="margin-top:4px;font-size:9px;color:var(--accent-cyan);font-family:var(--font-mono)">Click to configure</div>';
+          }
+        } else if (b.id === 'capital') {
           actionHtml =
             '<div class="aq-capital-input">' +
               '<span style="color:var(--text-muted);font-size:10px">$</span>' +
-              '<input type="number" id="aqCapitalInput" value="' + (blockerData.founder?.fundSize || 6000) + '" min="100" step="500">' +
-              '<button class="btn btn-primary" style="font-size:10px;padding:3px 8px" onclick="setCapital()">Confirm</button>' +
+              '<input type="number" id="aqCapitalInput" value="' + (blockerData.founder?.fundSize || 6000) + '" min="100" step="500" onclick="event.stopPropagation()">' +
+              '<button class="btn btn-primary" style="font-size:10px;padding:3px 8px" onclick="event.stopPropagation();setCapital()">Confirm</button>' +
             '</div>';
-        } else if (b.id === 'risks' && b.status === 'action-needed') {
-          actionHtml =
-            '<div class="aq-step-action">' +
-              '<button class="btn btn-primary" onclick="approveRisks()">Approve Limits</button>' +
+        } else if (b.id === 'risks') {
+          if (isExpanded) {
+            var limits = b.limits || {};
+            actionHtml = '<div class="aq-step-expanded">' +
+              '<div class="aq-input-row"><label>Max/Mkt</label><input type="number" id="aq_risk_max" value="' + (limits.maxExposurePerMarket || 500) + '" onclick="event.stopPropagation()"></div>' +
+              '<div class="aq-input-row"><label>Daily</label><input type="number" id="aq_risk_daily" value="' + (limits.dailyMaxExposure || 2000) + '" onclick="event.stopPropagation()"></div>' +
+              '<div class="aq-input-row"><label>Min Edge</label><input type="number" step="0.001" id="aq_risk_edge" value="' + (limits.minEdgeThreshold || 0.02) + '" onclick="event.stopPropagation()"></div>' +
+              '<div style="margin-top:8px;display:flex;gap:6px">' +
+                '<button class="btn btn-primary" style="font-size:10px" onclick="event.stopPropagation();saveAqRiskAndApprove()">Save & Approve</button>' +
+                '<button class="btn" style="font-size:10px" onclick="event.stopPropagation();approveRisks()">Approve Current</button>' +
+              '</div>' +
             '</div>';
-        } else if (b.status === 'blocked' && b.missing && b.missing.length > 0) {
-          actionHtml = '<div class="aq-missing">Missing: ' + b.missing.join(', ') + '</div>';
+          } else {
+            actionHtml =
+              '<div class="aq-step-action">' +
+                '<div style="font-size:9px;color:var(--accent-cyan);font-family:var(--font-mono);margin-bottom:4px">Click to edit limits</div>' +
+                '<button class="btn btn-primary" onclick="event.stopPropagation();approveRisks()">Approve Current Limits</button>' +
+              '</div>';
+          }
+        } else if (b.id === 'trade' && b.status === 'ready') {
+          actionHtml = '<div class="aq-step-action">' +
+            '<button class="btn btn-primary" onclick="event.stopPropagation();switchToTab(\\'opportunities\\')">Go to Opportunities</button>' +
+          '</div>';
         }
       }
 
-      return '<div class="aq-step ' + stepClass + '">' +
+      var clickHandler = b.status !== 'done' && b.status !== 'locked'
+        ? ' onclick="toggleStepExpand(\\'' + b.id + '\\')"' : '';
+
+      return '<div class="aq-step ' + stepClass + '"' + clickHandler + '>' +
         '<div class="aq-num">' + (b.status === 'done' ? '>' : (i + 1)) + '</div>' +
         '<div class="aq-step-title">' + statusIcon + ' ' + esc(b.title) + '</div>' +
         '<div class="aq-step-desc">' + esc(b.desc) + '</div>' +
         actionHtml +
       '</div>';
     }).join('');
+  }
+
+  function toggleStepExpand(id) {
+    expandedStep = expandedStep === id ? null : id;
+    renderActionQueue();
+  }
+
+  async function saveAqApiKeys() {
+    var updates = {};
+    var k = document.getElementById('aq_api_key');
+    var s = document.getElementById('aq_api_secret');
+    var p = document.getElementById('aq_api_pass');
+    if (k && k.value.trim()) updates.POLYMARKET_API_KEY = k.value.trim();
+    if (s && s.value.trim()) updates.POLYMARKET_API_SECRET = s.value.trim();
+    if (p && p.value.trim()) updates.POLYMARKET_API_PASSPHRASE = p.value.trim();
+    if (Object.keys(updates).length === 0) { toast('Enter at least one key', 'error'); return; }
+    try {
+      var r = await fetch('/api/founder/update-env', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updates) });
+      var data = await r.json();
+      if (data.ok) { toast('API keys saved!', 'success'); expandedStep = null; fetchBlockers(); }
+      else toast('Failed: ' + (data.error || ''), 'error');
+    } catch (e) { toast('Save failed', 'error'); }
+  }
+
+  async function saveAqWalletKey() {
+    var el = document.getElementById('aq_wallet_key');
+    if (!el || !el.value.trim()) { toast('Enter wallet key', 'error'); return; }
+    try {
+      var r = await fetch('/api/founder/update-env', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ POLYMARKET_PRIVATE_KEY: el.value.trim() }) });
+      var data = await r.json();
+      if (data.ok) { toast('Wallet key saved!', 'success'); expandedStep = null; fetchBlockers(); }
+      else toast('Failed: ' + (data.error || ''), 'error');
+    } catch (e) { toast('Save failed', 'error'); }
+  }
+
+  async function saveAqRiskAndApprove() {
+    var updates = {};
+    var e1 = document.getElementById('aq_risk_max');
+    var e2 = document.getElementById('aq_risk_daily');
+    var e3 = document.getElementById('aq_risk_edge');
+    if (e1) updates.MAX_EXPOSURE_PER_MARKET = e1.value;
+    if (e2) updates.DAILY_MAX_EXPOSURE = e2.value;
+    if (e3) updates.MIN_EDGE_THRESHOLD = e3.value;
+    try {
+      await fetch('/api/founder/update-env', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updates) });
+      await approveRisks();
+      expandedStep = null;
+    } catch (e) { toast('Save failed', 'error'); }
   }
 
   function renderFundBar() {
@@ -2020,6 +2710,442 @@ function dashboardHTML() {
     }
   }
 
+  // ── Search / Filter ──
+  function filterAndRender() {
+    renderOpportunities();
+  }
+
+  function getFilteredOpportunities() {
+    let filtered = [...opportunities];
+    const query = (document.getElementById('marketSearch')?.value || '').toLowerCase();
+    const minEdge = parseFloat(document.getElementById('edgeFilter')?.value || '0');
+    const sortBy = document.getElementById('sortMode')?.value || 'edge';
+
+    if (query) {
+      filtered = filtered.filter(o => o.market.toLowerCase().includes(query));
+    }
+    if (minEdge > 0) {
+      filtered = filtered.filter(o => o.edge >= minEdge);
+    }
+    if (sortBy === 'volume') filtered.sort((a, b) => b.volume - a.volume);
+    else if (sortBy === 'confidence') filtered.sort((a, b) => b.confidence - a.confidence);
+    else if (sortBy === 'liquidity') filtered.sort((a, b) => b.liquidity - a.liquidity);
+    else filtered.sort((a, b) => b.edge - a.edge);
+
+    return filtered;
+  }
+
+  // ── Market Detail Modal ──
+  function showMarketDetail(idx) {
+    const filtered = getFilteredOpportunities();
+    const o = filtered[idx];
+    if (!o) return;
+
+    const edgeClass = o.edge >= 2 ? 'edge-high' : o.edge >= 1 ? 'edge-mid' : 'edge-low';
+    const isDemo = o.demo || false;
+    const expiryText = o.daysToExpiry !== null && o.daysToExpiry !== undefined ? o.daysToExpiry + ' days' : 'N/A';
+    const decision = founderDecisions[o.id];
+
+    document.getElementById('marketModal').innerHTML =
+      '<div class="modal-overlay" onclick="closeMarketModal(event)">' +
+        '<div class="modal" onclick="event.stopPropagation()">' +
+          '<div class="modal-header">' +
+            '<h2>' + esc(o.market) + '</h2>' +
+            '<button class="modal-close" onclick="closeMarketModal()">X</button>' +
+          '</div>' +
+          '<div class="modal-body">' +
+            (isDemo ? '<div style="padding:8px 12px;background:rgba(245,158,11,0.1);border:1px solid rgba(245,158,11,0.3);border-radius:6px;margin-bottom:12px;font-size:11px;color:var(--accent-yellow);font-family:var(--font-mono)">DEMO DATA — Connect Polymarket API for live markets</div>' : '') +
+            (o.description ? '<div class="md-desc">' + esc(o.description) + '</div>' : '') +
+            '<div class="md-grid">' +
+              '<div class="md-stat"><div class="ms-label">Edge</div><div class="ms-val ' + edgeClass + '">' + o.edge.toFixed(2) + '%</div></div>' +
+              '<div class="md-stat"><div class="ms-label">Confidence</div><div class="ms-val">' + o.confidence.toFixed(0) + '%</div></div>' +
+              '<div class="md-stat"><div class="ms-label">Yes Price</div><div class="ms-val">' + o.bestBid.toFixed(4) + '</div></div>' +
+              '<div class="md-stat"><div class="ms-label">No Price</div><div class="ms-val">' + o.bestAsk.toFixed(4) + '</div></div>' +
+              '<div class="md-stat"><div class="ms-label">Price Sum</div><div class="ms-val">' + o.priceSum.toFixed(4) + '</div></div>' +
+              '<div class="md-stat"><div class="ms-label">Volume 24h</div><div class="ms-val">$' + fmt(o.volume) + '</div></div>' +
+              '<div class="md-stat"><div class="ms-label">Liquidity</div><div class="ms-val">$' + fmt(o.liquidity) + '</div></div>' +
+              '<div class="md-stat"><div class="ms-label">Expires</div><div class="ms-val">' + expiryText + '</div></div>' +
+            '</div>' +
+            '<div style="margin-top:12px">' +
+              '<div style="font-size:11px;color:var(--text-muted);font-family:var(--font-mono);margin-bottom:6px">OUTCOMES: ' + (o.outcomes || []).join(' / ') + '</div>' +
+              (o.negRisk ? '<span class="negrisk-tag" style="margin-bottom:8px;display:inline-block">NegRisk Market</span>' : '') +
+              (decision ? '<div style="margin-top:8px;font-family:var(--font-mono);font-size:12px;font-weight:700;color:' + (decision.verdict === 'BUY' ? 'var(--accent-green)' : 'var(--text-muted)') + '">Decision: ' + decision.verdict + '</div>' : '') +
+            '</div>' +
+            '<div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">' +
+              (o.link !== 'https://polymarket.com' ? '<a class="md-link" href="' + esc(o.link) + '" target="_blank" rel="noopener">View on Polymarket</a>' : '') +
+              (!decision && tradingUnlocked ? '<button class="btn btn-primary" style="padding:8px 16px" onclick="founderDecide(\\'' + o.id + '\\', \\'BUY\\', \\'' + esc(o.market).replace(/'/g, "\\\\'") + '\\');closeMarketModal()">BUY</button>' +
+                '<button class="btn" style="padding:8px 16px" onclick="founderDecide(\\'' + o.id + '\\', \\'PASS\\', \\'' + esc(o.market).replace(/'/g, "\\\\'") + '\\');closeMarketModal()">PASS</button>' : '') +
+            '</div>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+  }
+
+  function closeMarketModal(event) {
+    if (event && event.target !== event.currentTarget) return;
+    document.getElementById('marketModal').innerHTML = '';
+  }
+
+  // ── Explain Hub ──
+  let hubData = null;
+
+  async function fetchSystemStatus() {
+    try {
+      const r = await fetch('/api/system-status');
+      hubData = await r.json();
+      renderHub();
+    } catch (e) {
+      console.error('Hub fetch error:', e);
+    }
+  }
+
+  async function fetchActivityLog() {
+    try {
+      const r = await fetch('/api/activity-log');
+      const data = await r.json();
+      renderActivityFeed(data.log || []);
+    } catch (e) { /* silent */ }
+  }
+
+  function renderHub() {
+    if (!hubData) {
+      document.getElementById('hubGrid').innerHTML = '<div class="loader"><div class="spinner"></div><div class="loader-text">Loading system status...</div></div>';
+      return;
+    }
+    const h = hubData;
+
+    // System overview card
+    let html = '<div class="hub-card">' +
+      '<h3>System Overview</h3>' +
+      '<p>ZVI v1 is a Polymarket Fund Operating System. It continuously scans prediction markets for mispriced opportunities, computes edge and confidence scores, and surfaces them for founder decision-making.</p>' +
+      '<div class="hub-status-grid">' +
+        '<div class="hub-stat"><div class="hs-label">Uptime</div><div class="hs-val">' + esc(h.uptimeFormatted) + '</div></div>' +
+        '<div class="hub-stat"><div class="hs-label">Mode</div><div class="hs-val">' + (h.mode === 'OBSERVATION_ONLY' ? 'Observe' : 'LIVE') + '</div></div>' +
+        '<div class="hub-stat"><div class="hs-label">Data Source</div><div class="hs-val">' + (h.dataSource === 'live' ? 'Polymarket API' : 'Demo Data') + '</div></div>' +
+        '<div class="hub-stat"><div class="hs-label">Markets Cached</div><div class="hs-val">' + h.marketsInCache + '</div></div>' +
+        '<div class="hub-stat"><div class="hs-label">Total Scans</div><div class="hs-val">' + h.totalScans + '</div></div>' +
+        '<div class="hub-stat"><div class="hs-label">Markets Scanned</div><div class="hs-val">' + h.totalMarketsScanned + '</div></div>' +
+      '</div>' +
+    '</div>';
+
+    // Setup progress
+    var secretsList = [
+      { key: 'polygonRpc', label: 'Polygon RPC' },
+      { key: 'anthropicKey', label: 'Anthropic LLM' },
+      { key: 'polymarketGamma', label: 'Polymarket API' },
+      { key: 'polymarketClob', label: 'CLOB Trading' },
+      { key: 'polymarketPrivateKey', label: 'Wallet Key' },
+      { key: 'telegram', label: 'Telegram Alerts' },
+    ];
+    html += '<div class="hub-card">' +
+      '<h3>Setup Progress</h3>';
+    for (var si = 0; si < secretsList.length; si++) {
+      var s = secretsList[si];
+      var ok = h.secrets[s.key];
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid rgba(42,53,85,0.3)">' +
+        '<span style="font-size:12px">' + s.label + '</span>' +
+        '<span class="setting-status ' + (ok ? 'connected' : 'missing') + '">' + (ok ? 'Connected' : 'Missing') + '</span>' +
+      '</div>';
+    }
+    html += '<div style="margin-top:12px"><button class="btn btn-primary" onclick="switchToTab(\\'settings\\')">Configure in Settings</button></div>' +
+    '</div>';
+
+    // Founder state
+    html += '<div class="hub-card">' +
+      '<h3>Founder Status</h3>' +
+      '<div class="hub-status-grid">' +
+        '<div class="hub-stat"><div class="hs-label">Fund Size</div><div class="hs-val" style="color:var(--accent-green)">$' + h.founder.fundSize.toLocaleString() + '</div></div>' +
+        '<div class="hub-stat"><div class="hs-label">Capital Deployed</div><div class="hs-val" style="color:var(--accent-yellow)">$' + h.founder.capitalDeployed.toLocaleString() + '</div></div>' +
+        '<div class="hub-stat"><div class="hs-label">Decisions Made</div><div class="hs-val">' + h.founder.totalDecisions + '</div></div>' +
+        '<div class="hub-stat"><div class="hs-label">BUY / PASS</div><div class="hs-val">' + h.founder.buys + ' / ' + h.founder.passes + '</div></div>' +
+      '</div>' +
+    '</div>';
+
+    // Glossary
+    html += '<div class="hub-card">' +
+      '<h3>Key Concepts</h3>' +
+      '<div class="glossary-item"><div class="gi-term">Edge %</div><div class="gi-def">The pricing inefficiency. Calculated as |1.0 - (YES price + NO price)| x 100. Markets should sum to exactly 1.0. Any deviation = potential arbitrage.</div></div>' +
+      '<div class="glossary-item"><div class="gi-term">Confidence Score</div><div class="gi-def">Composite metric: 40% edge magnitude + 35% volume + 25% liquidity. Higher = more reliable opportunity.</div></div>' +
+      '<div class="glossary-item"><div class="gi-term">NegRisk</div><div class="gi-def">Polymarket markets using the NegRisk adapter contract. These allow multi-outcome events and have specific arbitrage patterns.</div></div>' +
+      '<div class="glossary-item"><div class="gi-term">Kelly Sizing</div><div class="gi-def">Position size = edge x confidence x fund_size x 0.25 (quarter-Kelly). Caps at max per market. Conservative approach for capital preservation.</div></div>' +
+      '<div class="glossary-item"><div class="gi-term">Price Sum</div><div class="gi-def">YES + NO prices. Should equal 1.0. When below 1.0: buy-all-YES arb opportunity. When above 1.0: buy-all-NO + convert opportunity.</div></div>' +
+    '</div>';
+
+    // Roadmap
+    html += '<div class="hub-card">' +
+      '<h3>Development Roadmap</h3>' +
+      '<div class="roadmap-phase active">' +
+        '<div class="rp-title"><span class="rp-tag current">NOW</span>Phase 1 — Foundation</div>' +
+        '<div class="rp-desc">Live market scanning, founder decision queue, basic analytics. Dashboard operational with Polymarket API integration.</div>' +
+      '</div>' +
+      '<div class="roadmap-phase next">' +
+        '<div class="rp-title"><span class="rp-tag upcoming">NEXT</span>Phase 2 — Execution</div>' +
+        '<div class="rp-desc">CLOB order execution (dry-run first), basket execution for multi-leg arbs, simulate button showing expected fills without placing orders.</div>' +
+      '</div>' +
+      '<div class="roadmap-phase next">' +
+        '<div class="rp-title"><span class="rp-tag upcoming">NEXT</span>Phase 3 — LLM Engine</div>' +
+        '<div class="rp-desc">Claude/GPT probability estimates, mispricing alerts when model-vs-market gap > 10%, auto-generated RP Optical-style research briefs.</div>' +
+      '</div>' +
+      '<div class="roadmap-phase future">' +
+        '<div class="rp-title"><span class="rp-tag planned">PLANNED</span>Phase 4 — Risk & Scale</div>' +
+        '<div class="rp-desc">P&L tracking, position-aware risk checks, multi-exchange arb (Polymarket + Kalshi + Metaculus), portfolio optimization, mobile alerts.</div>' +
+      '</div>' +
+    '</div>';
+
+    // Activity Feed
+    html += '<div class="hub-card full-width">' +
+      '<h3>Activity Log</h3>' +
+      '<div class="activity-feed" id="activityFeed">' +
+        '<div style="color:var(--text-muted);font-family:var(--font-mono);font-size:11px">Loading...</div>' +
+      '</div>' +
+    '</div>';
+
+    document.getElementById('hubGrid').innerHTML = html;
+    fetchActivityLog();
+  }
+
+  function renderActivityFeed(log) {
+    var feedEl = document.getElementById('activityFeed');
+    if (!feedEl) return;
+    if (log.length === 0) {
+      feedEl.innerHTML = '<div style="color:var(--text-muted);font-family:var(--font-mono);font-size:11px;padding:8px">No activity yet</div>';
+      return;
+    }
+    feedEl.innerHTML = log.slice(0, 100).map(function(entry) {
+      var time = new Date(entry.timestamp).toLocaleTimeString();
+      var typeCls = 'at-' + entry.type;
+      return '<div class="activity-entry">' +
+        '<span class="activity-time">' + time + '</span>' +
+        '<span class="activity-type ' + typeCls + '">' + esc(entry.type) + '</span>' +
+        '<span class="activity-msg">' + esc(entry.message) + '</span>' +
+      '</div>';
+    }).join('');
+  }
+
+  function switchToTab(tabName) {
+    document.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('active'); });
+    document.querySelectorAll('.panel').forEach(function(p) { p.classList.remove('active'); });
+    var tabEl = document.querySelector('.tab[data-tab="' + tabName + '"]');
+    if (tabEl) tabEl.classList.add('active');
+    var panelEl = document.getElementById('panel-' + tabName);
+    if (panelEl) panelEl.classList.add('active');
+    if (tabName === 'hub') { fetchSystemStatus(); fetchActivityLog(); }
+    if (tabName === 'settings') renderSettings();
+  }
+
+  // ── Settings ──
+  function renderSettings() {
+    var cfg = null;
+    fetch('/api/config').then(function(r) { return r.json(); }).then(function(data) {
+      cfg = data;
+      doRenderSettings(cfg);
+    }).catch(function() {
+      document.getElementById('settingsContent').innerHTML = '<div class="empty-state"><p>Failed to load settings</p></div>';
+    });
+  }
+
+  function doRenderSettings(cfg) {
+    var html = '';
+
+    // API Keys section
+    html += '<div class="settings-section">' +
+      '<h3>API Connections</h3>' +
+      '<div class="settings-grid">' +
+        settingInput('POLYMARKET_API_KEY', 'Polymarket API Key', 'CLOB API key for order placement', cfg.secrets.polymarketClob, 'password') +
+        settingInput('POLYMARKET_API_SECRET', 'Polymarket API Secret', 'CLOB API secret', cfg.secrets.polymarketClob, 'password') +
+        settingInput('POLYMARKET_API_PASSPHRASE', 'Polymarket Passphrase', 'CLOB API passphrase', cfg.secrets.polymarketClob, 'password') +
+        settingInput('POLYMARKET_PRIVATE_KEY', 'Wallet Private Key', 'Polygon wallet key for signing txns', cfg.secrets.polymarketPrivateKey, 'password') +
+        settingInput('ANTHROPIC_API_KEY', 'Anthropic API Key', 'Claude LLM for probability estimates', cfg.secrets.anthropicKey, 'password') +
+        settingInput('POLYGON_RPC_URL', 'Polygon RPC URL', 'Alchemy/Infura Polygon endpoint', cfg.secrets.polygonRpc, 'text') +
+        settingInput('TELEGRAM_BOT_TOKEN', 'Telegram Bot Token', 'For alert notifications', cfg.secrets.telegram, 'password') +
+        settingInput('TELEGRAM_CHAT_ID', 'Telegram Chat ID', 'Chat to receive alerts', cfg.secrets.telegram, 'text') +
+      '</div>' +
+      '<div style="margin-top:12px"><button class="btn btn-primary" onclick="saveApiKeys()">Save API Keys</button></div>' +
+    '</div>';
+
+    // Risk Limits
+    html += '<div class="settings-section">' +
+      '<h3>Risk Limits</h3>' +
+      '<div class="settings-grid">' +
+        settingNumInput('MAX_EXPOSURE_PER_MARKET', 'Max Per Market ($)', 'Maximum USDC exposure per single market', cfg.riskLimits.maxExposurePerMarket) +
+        settingNumInput('DAILY_MAX_EXPOSURE', 'Daily Max Exposure ($)', 'Maximum total USDC deployed per day', cfg.riskLimits.dailyMaxExposure) +
+        settingNumInput('MIN_EDGE_THRESHOLD', 'Min Edge Threshold', 'Minimum edge % to consider (0.02 = 2%)', cfg.riskLimits.minEdgeThreshold) +
+        settingNumInput('MIN_DEPTH_USDC', 'Min Depth (USDC)', 'Minimum market depth to trade', cfg.riskLimits.minDepthUsdc) +
+      '</div>' +
+      '<div style="margin-top:12px"><button class="btn btn-primary" onclick="saveRiskLimits()">Save Risk Limits</button></div>' +
+    '</div>';
+
+    // Scan Settings
+    html += '<div class="settings-section">' +
+      '<h3>Scanner Settings</h3>' +
+      '<div class="settings-grid">' +
+        '<div class="setting-item">' +
+          '<label>Market Scan Limit</label>' +
+          '<div class="setting-desc">Number of markets to scan per cycle (no hard cap)</div>' +
+          '<input type="number" id="set_marketLimit" value="200" min="10" max="5000">' +
+        '</div>' +
+        '<div class="setting-item">' +
+          '<label>Refresh Interval (seconds)</label>' +
+          '<div class="setting-desc">Auto-refresh interval for market data</div>' +
+          '<input type="number" id="set_refreshInterval" value="30" min="10" max="300">' +
+        '</div>' +
+        '<div class="setting-item">' +
+          '<label>Scan Mode</label>' +
+          '<div class="setting-desc">How to prioritize markets</div>' +
+          '<select id="set_scanMode">' +
+            '<option value="volume">By Volume (default)</option>' +
+            '<option value="newest">Newest First</option>' +
+            '<option value="ending-soon">Ending Soon</option>' +
+          '</select>' +
+        '</div>' +
+      '</div>' +
+      '<div style="margin-top:12px"><button class="btn btn-primary" onclick="saveScanSettings()">Save Scan Settings</button></div>' +
+    '</div>';
+
+    // Operation Mode
+    html += '<div class="settings-section">' +
+      '<h3>Operation Mode</h3>' +
+      '<div class="settings-grid">' +
+        '<div class="setting-item">' +
+          '<label>Trading Mode</label>' +
+          '<select id="set_observationOnly">' +
+            '<option value="true" ' + (cfg.mode === 'OBSERVATION_ONLY' ? 'selected' : '') + '>Observation Only (safe)</option>' +
+            '<option value="false" ' + (cfg.mode !== 'OBSERVATION_ONLY' ? 'selected' : '') + '>Live Trading</option>' +
+          '</select>' +
+        '</div>' +
+        '<div class="setting-item">' +
+          '<label>Manual Approval</label>' +
+          '<select id="set_manualApproval">' +
+            '<option value="true" selected>Required (recommended)</option>' +
+            '<option value="false">Auto-execute</option>' +
+          '</select>' +
+        '</div>' +
+      '</div>' +
+      '<div style="margin-top:12px"><button class="btn btn-primary" onclick="saveOperationMode()">Save Mode</button></div>' +
+    '</div>';
+
+    document.getElementById('settingsContent').innerHTML = html;
+
+    // Load current scan settings
+    fetch('/api/settings').then(function(r) { return r.json(); }).then(function(s) {
+      var el1 = document.getElementById('set_marketLimit');
+      var el2 = document.getElementById('set_refreshInterval');
+      var el3 = document.getElementById('set_scanMode');
+      if (el1 && s.marketLimit) el1.value = s.marketLimit;
+      if (el2 && s.refreshInterval) el2.value = s.refreshInterval;
+      if (el3 && s.scanMode) el3.value = s.scanMode;
+    }).catch(function() {});
+  }
+
+  function settingInput(envKey, label, desc, isConnected, type) {
+    return '<div class="setting-item">' +
+      '<label>' + label + ' <span class="setting-status ' + (isConnected ? 'connected' : 'missing') + '">' + (isConnected ? 'OK' : 'MISSING') + '</span></label>' +
+      '<div class="setting-desc">' + desc + '</div>' +
+      '<input type="' + type + '" id="set_' + envKey + '" placeholder="Enter ' + label + '...">' +
+    '</div>';
+  }
+
+  function settingNumInput(envKey, label, desc, currentVal) {
+    return '<div class="setting-item">' +
+      '<label>' + label + '</label>' +
+      '<div class="setting-desc">' + desc + '</div>' +
+      '<input type="number" id="set_' + envKey + '" value="' + currentVal + '" step="any">' +
+    '</div>';
+  }
+
+  async function saveApiKeys() {
+    var keys = ['POLYMARKET_API_KEY','POLYMARKET_API_SECRET','POLYMARKET_API_PASSPHRASE','POLYMARKET_PRIVATE_KEY','ANTHROPIC_API_KEY','POLYGON_RPC_URL','TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID'];
+    var updates = {};
+    for (var i = 0; i < keys.length; i++) {
+      var el = document.getElementById('set_' + keys[i]);
+      if (el && el.value.trim()) updates[keys[i]] = el.value.trim();
+    }
+    if (Object.keys(updates).length === 0) { toast('No values to save', 'info'); return; }
+    try {
+      var r = await fetch('/api/founder/update-env', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates),
+      });
+      var data = await r.json();
+      if (data.ok) {
+        toast('Saved ' + data.updated.length + ' key(s). Restart may be needed for some changes.', 'success');
+        // Clear inputs
+        for (var j = 0; j < keys.length; j++) {
+          var el2 = document.getElementById('set_' + keys[j]);
+          if (el2) el2.value = '';
+        }
+        renderSettings();
+        fetchBlockers();
+      } else {
+        toast('Save failed: ' + (data.error || 'Unknown'), 'error');
+      }
+    } catch (e) { toast('Save failed', 'error'); }
+  }
+
+  async function saveRiskLimits() {
+    var updates = {};
+    var el1 = document.getElementById('set_MAX_EXPOSURE_PER_MARKET');
+    var el2 = document.getElementById('set_DAILY_MAX_EXPOSURE');
+    var el3 = document.getElementById('set_MIN_EDGE_THRESHOLD');
+    var el4 = document.getElementById('set_MIN_DEPTH_USDC');
+    if (el1) updates.MAX_EXPOSURE_PER_MARKET = el1.value;
+    if (el2) updates.DAILY_MAX_EXPOSURE = el2.value;
+    if (el3) updates.MIN_EDGE_THRESHOLD = el3.value;
+    if (el4) updates.MIN_DEPTH_USDC = el4.value;
+    try {
+      var r = await fetch('/api/founder/update-env', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates),
+      });
+      var data = await r.json();
+      if (data.ok) { toast('Risk limits saved', 'success'); fetchBlockers(); }
+      else toast('Failed: ' + (data.error || ''), 'error');
+    } catch (e) { toast('Save failed', 'error'); }
+  }
+
+  async function saveScanSettings() {
+    var marketLimit = parseInt(document.getElementById('set_marketLimit')?.value) || 200;
+    var refreshInterval = parseInt(document.getElementById('set_refreshInterval')?.value) || 30;
+    var scanMode = document.getElementById('set_scanMode')?.value || 'volume';
+    try {
+      var r = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ marketLimit: marketLimit, refreshInterval: refreshInterval, scanMode: scanMode }),
+      });
+      var data = await r.json();
+      if (data.ok) {
+        toast('Scan settings saved — limit: ' + marketLimit + ', interval: ' + refreshInterval + 's', 'success');
+        // Update refresh interval
+        if (countdownInterval) clearInterval(countdownInterval);
+        refreshCountdown = refreshInterval;
+        startCountdown();
+      } else toast('Failed', 'error');
+    } catch (e) { toast('Save failed', 'error'); }
+  }
+
+  async function saveOperationMode() {
+    var updates = {};
+    var el1 = document.getElementById('set_observationOnly');
+    var el2 = document.getElementById('set_manualApproval');
+    if (el1) updates.OBSERVATION_ONLY = el1.value;
+    if (el2) updates.MANUAL_APPROVAL_REQUIRED = el2.value;
+    try {
+      var r = await fetch('/api/founder/update-env', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates),
+      });
+      var data = await r.json();
+      if (data.ok) {
+        toast('Mode saved. Restart server for full effect.', 'success');
+        loadConfig();
+      }
+    } catch (e) { toast('Save failed', 'error'); }
+  }
+
   // ── Init ──
   function init() {
     loadConfig();
@@ -2038,6 +3164,11 @@ function dashboardHTML() {
 
     setInterval(fetchHealth, 30000);
     setInterval(fetchBlockers, 30000);
+
+    // Keyboard shortcut: Escape closes modal
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') closeMarketModal();
+    });
   }
 
   init();
@@ -2131,6 +3262,38 @@ async function handleRequest(req, res) {
       return json(res, getConfig());
     }
 
+    // ── System Status & Activity Log ──
+    if (pathname === '/api/system-status' && method === 'GET') {
+      return json(res, getSystemStatus());
+    }
+
+    if (pathname === '/api/activity-log' && method === 'GET') {
+      const limit = parseInt(url.searchParams.get('limit')) || 100;
+      return json(res, { log: activityLog.slice(0, limit), total: activityLog.length });
+    }
+
+    // ── Settings ──
+    if (pathname === '/api/settings' && method === 'GET') {
+      return json(res, state.settings);
+    }
+
+    if (pathname === '/api/settings' && method === 'POST') {
+      const body = await readBody(req);
+      if (body.marketLimit !== undefined) state.settings.marketLimit = Math.max(10, Math.min(5000, parseInt(body.marketLimit) || 200));
+      if (body.refreshInterval !== undefined) state.settings.refreshInterval = Math.max(10, Math.min(300, parseInt(body.refreshInterval) || 30));
+      if (body.scanMode !== undefined && ['volume', 'newest', 'ending-soon'].includes(body.scanMode)) state.settings.scanMode = body.scanMode;
+      if (body.minEdgeDisplay !== undefined) state.settings.minEdgeDisplay = parseFloat(body.minEdgeDisplay) || 0;
+      logActivity('config', 'Settings updated: ' + JSON.stringify(state.settings));
+      return json(res, { ok: true, settings: state.settings });
+    }
+
+    // ── Env file updater ──
+    if (pathname === '/api/founder/update-env' && method === 'POST') {
+      const body = await readBody(req);
+      const result = updateEnvFile(body);
+      return json(res, result, result.ok ? 200 : 400);
+    }
+
     // ── Founder Blocker / Action Queue ──
     if (pathname === '/api/blockers' && method === 'GET') {
       return json(res, getBlockers());
@@ -2147,6 +3310,7 @@ async function handleRequest(req, res) {
       if (!state.founder.completedSteps.includes('capital')) {
         state.founder.completedSteps.push('capital');
       }
+      logActivity('config', 'Fund capital set: $' + size.toLocaleString());
       return json(res, { ok: true, fundSize: size, blockers: getBlockers() });
     }
 
@@ -2155,6 +3319,7 @@ async function handleRequest(req, res) {
       if (!state.founder.completedSteps.includes('risks')) {
         state.founder.completedSteps.push('risks');
       }
+      logActivity('config', 'Risk limits approved');
       return json(res, { ok: true, blockers: getBlockers() });
     }
 
@@ -2169,6 +3334,7 @@ async function handleRequest(req, res) {
         market: market || '',
         timestamp: new Date().toISOString(),
       };
+      logActivity('decision', verdict + ': ' + (market || marketId));
       // If BUY, compute position recommendation
       let position = null;
       if (verdict === 'BUY') {
@@ -2220,6 +3386,7 @@ const PORT = parseInt(process.env.PORT) || 3000;
 const server = http.createServer(handleRequest);
 
 server.listen(PORT, () => {
+  logActivity('system', 'Server started on port ' + PORT);
   console.log('');
   console.log('  ╔══════════════════════════════════════════════╗');
   console.log('  ║   ZVI v1 — Fund Operating System Dashboard   ║');
