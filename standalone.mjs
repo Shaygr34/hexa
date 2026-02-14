@@ -74,7 +74,7 @@ async function fetchOpportunities() {
     const url = `${GAMMA_BASE}/markets?closed=false&limit=50&order=volume24hr&ascending=false`;
     const resp = await fetch(url, {
       headers: { 'Accept': 'application/json', 'User-Agent': 'ZVI-FundOS/1.0' },
-      signal: AbortSignal.timeout(12000),
+      signal: AbortSignal.timeout(4000),
     });
 
     if (!resp.ok) throw new Error(`Gamma API ${resp.status}: ${resp.statusText}`);
@@ -386,6 +386,10 @@ function readBody(req) {
 // ─── Dashboard HTML ──────────────────────────────────────────────────────────
 function dashboardHTML() {
   const cfg = getConfig();
+  const initialBlockers = getBlockers();
+  const initialOpps = getDemoOpportunities();
+  // Embed state directly — page renders with ZERO API calls needed
+  const EMBEDDED_STATE = JSON.stringify({ blockers: initialBlockers, opportunities: initialOpps });
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1476,8 +1480,9 @@ function dashboardHTML() {
   <div class="toast-container" id="toastContainer"></div>
 
 <script>
-  // ── State ──
-  let opportunities = [];
+  // ── Server-embedded state (renders INSTANTLY, no API wait) ──
+  const __INITIAL__ = ${EMBEDDED_STATE};
+  let opportunities = __INITIAL__.opportunities || [];
   let signals = [];
   let thresholds = [];
   let pinnedMarkets = new Set();
@@ -1823,14 +1828,15 @@ function dashboardHTML() {
     }, 1000);
   }
 
-  // ── Blocker / Action Queue State ──
-  let blockerData = null;
-  let founderDecisions = {};
-  let tradingUnlocked = false;
+  // ── Blocker / Action Queue State (pre-loaded from server) ──
+  let blockerData = __INITIAL__.blockers || null;
+  let founderDecisions = blockerData?.founder?.decisions || {};
+  let tradingUnlocked = blockerData?.allClear || false;
 
   async function fetchBlockers() {
     try {
       const r = await fetch('/api/blockers');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
       blockerData = await r.json();
       founderDecisions = blockerData.founder?.decisions || {};
       tradingUnlocked = blockerData.allClear;
@@ -1840,6 +1846,10 @@ function dashboardHTML() {
       if (opportunities.length > 0) renderOpportunities();
     } catch (e) {
       console.error('Blocker fetch error:', e);
+      document.getElementById('aqProgress').textContent = 'Error loading';
+      document.getElementById('aqSteps').innerHTML =
+        '<div style="color:var(--accent-red);font-family:var(--font-mono);font-size:11px;padding:8px;">' +
+        'Failed to load blockers: ' + esc(e.message) + ' — check terminal</div>';
     }
   }
 
@@ -2011,15 +2021,21 @@ function dashboardHTML() {
   }
 
   // ── Init ──
-  async function init() {
+  function init() {
     loadConfig();
-    await fetchBlockers();
-    await fetchOpportunities();
-    fetchSignals();
-    fetchHealth();
+
+    // RENDER IMMEDIATELY from server-embedded state (zero API wait)
+    renderActionQueue();
+    renderFundBar();
+    renderOpportunities();
+
+    // Background refresh — updates if Polymarket is reachable, otherwise keeps demo data
+    fetchBlockers().catch(e => console.error('blockers:', e));
+    fetchOpportunities().catch(e => console.error('opps:', e));
+    fetchSignals().catch(() => {});
+    fetchHealth().catch(() => {});
     startCountdown();
 
-    // Auto-refresh health + blockers every 30s
     setInterval(fetchHealth, 30000);
     setInterval(fetchBlockers, 30000);
   }
