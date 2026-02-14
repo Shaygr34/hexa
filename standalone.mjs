@@ -1621,7 +1621,7 @@ function dashboardHTML() {
           '<span class="confidence-val">' + o.confidence.toFixed(0) + '</span>' +
         '</div></td>' +
         '<td>' + renderVerdictCell(o) + '</td>' +
-        '<td><button class="pin-btn' + (isPinned ? ' pinned' : '') + '" onclick="togglePin(\'' + o.id + '\')">' + (isPinned ? 'Unpin' : 'Pin') + '</button></td>' +
+        '<td><button class="pin-btn' + (isPinned ? ' pinned' : '') + '" onclick="togglePin(\\'' + o.id + '\\')">' + (isPinned ? 'Unpin' : 'Pin') + '</button></td>' +
         '</tr>';
     });
 
@@ -1672,7 +1672,7 @@ function dashboardHTML() {
         '</div>' +
         '<div class="pc-actions">' +
           '<a class="btn" href="' + esc(o.link) + '" target="_blank">View on Polymarket</a>' +
-          '<button class="btn pc-unpin" onclick="togglePin(\'' + o.id + '\')">Unpin</button>' +
+          '<button class="btn pc-unpin" onclick="togglePin(\\'' + o.id + '\\')">Unpin</button>' +
         '</div>' +
       '</div>';
     }).join('');
@@ -1950,8 +1950,8 @@ function dashboardHTML() {
     }
 
     return '<div class="verdict-cell">' +
-      '<button class="verdict-btn vb-buy" onclick="founderDecide(\'' + o.id + '\', \'BUY\', \'' + esc(o.market).replace(/'/g, "\\\\'") + '\')">BUY</button>' +
-      '<button class="verdict-btn vb-pass" onclick="founderDecide(\'' + o.id + '\', \'PASS\', \'' + esc(o.market).replace(/'/g, "\\\\'") + '\')">PASS</button>' +
+      '<button class="verdict-btn vb-buy" onclick="founderDecide(\\'' + o.id + '\\', \\'BUY\\', \\'' + esc(o.market).replace(/'/g, "\\\\'") + '\\')">BUY</button>' +
+      '<button class="verdict-btn vb-pass" onclick="founderDecide(\\'' + o.id + '\\', \\'PASS\\', \\'' + esc(o.market).replace(/'/g, "\\\\'") + '\\')">PASS</button>' +
     '</div>';
   }
 
