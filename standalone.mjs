@@ -1831,6 +1831,7 @@ function dashboardHTML() {
   async function fetchBlockers() {
     try {
       const r = await fetch('/api/blockers');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
       blockerData = await r.json();
       founderDecisions = blockerData.founder?.decisions || {};
       tradingUnlocked = blockerData.allClear;
@@ -1840,6 +1841,10 @@ function dashboardHTML() {
       if (opportunities.length > 0) renderOpportunities();
     } catch (e) {
       console.error('Blocker fetch error:', e);
+      document.getElementById('aqProgress').textContent = 'Error loading';
+      document.getElementById('aqSteps').innerHTML =
+        '<div style="color:var(--accent-red);font-family:var(--font-mono);font-size:11px;padding:8px;">' +
+        'Failed to load blockers: ' + esc(e.message) + ' — check terminal</div>';
     }
   }
 
@@ -2013,8 +2018,9 @@ function dashboardHTML() {
   // ── Init ──
   async function init() {
     loadConfig();
-    await fetchBlockers();
-    await fetchOpportunities();
+    // Fire blockers + opportunities in PARALLEL — neither blocks the other
+    fetchBlockers().catch(e => console.error('blockers:', e));
+    fetchOpportunities().catch(e => console.error('opps:', e));
     fetchSignals();
     fetchHealth();
     startCountdown();
