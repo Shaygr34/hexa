@@ -972,6 +972,85 @@ async function runDiagnostics() {
   return results;
 }
 
+// ── Test Endpoints ──
+async function testPolymarketAuth() {
+  const start = Date.now();
+  try {
+    const gammaUrl = process.env.POLYMARKET_GAMMA_URL || 'https://gamma-api.polymarket.com';
+    const resp = await httpGet(`${gammaUrl}/markets?limit=1`);
+    const latency = Date.now() - start;
+    if (Array.isArray(resp) && resp.length > 0) {
+      return { ok: true, latency, message: `Connected (${latency}ms) — ${resp[0].question?.slice(0, 60) || 'market data received'}` };
+    }
+    return { ok: false, latency, message: 'Unexpected response format' };
+  } catch (e) { return { ok: false, latency: Date.now() - start, message: e.message }; }
+}
+
+async function testLLMApi(provider) {
+  const start = Date.now();
+  try {
+    if (provider === 'anthropic' || (!provider && process.env.ANTHROPIC_API_KEY)) {
+      if (!process.env.ANTHROPIC_API_KEY) return { ok: false, message: 'ANTHROPIC_API_KEY not set' };
+      const resp = await httpPost('https://api.anthropic.com/v1/messages', {
+        model: 'claude-sonnet-4-5-20250929', max_tokens: 20,
+        messages: [{ role: 'user', content: 'Reply with just the word "pong"' }],
+      }, { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' });
+      const latency = Date.now() - start;
+      const text = resp.content?.[0]?.text || '';
+      if (resp.error) return { ok: false, latency, message: resp.error.message || 'API error', provider: 'anthropic' };
+      return { ok: true, latency, message: `Anthropic OK (${latency}ms): "${text.slice(0, 30)}"`, provider: 'anthropic' };
+    }
+    if (provider === 'openai' || (!provider && process.env.OPENAI_API_KEY)) {
+      if (!process.env.OPENAI_API_KEY) return { ok: false, message: 'OPENAI_API_KEY not set' };
+      const resp = await httpPost('https://api.openai.com/v1/chat/completions', {
+        model: 'gpt-4o-mini', max_tokens: 20,
+        messages: [{ role: 'user', content: 'Reply with just the word "pong"' }],
+      }, { 'Authorization': 'Bearer ' + process.env.OPENAI_API_KEY });
+      const latency = Date.now() - start;
+      const text = resp.choices?.[0]?.message?.content || '';
+      if (resp.error) return { ok: false, latency, message: resp.error.message || 'API error', provider: 'openai' };
+      return { ok: true, latency, message: `OpenAI OK (${latency}ms): "${text.slice(0, 30)}"`, provider: 'openai' };
+    }
+    if (provider === 'xai' || (!provider && process.env.XAI_API_KEY)) {
+      if (!process.env.XAI_API_KEY) return { ok: false, message: 'XAI_API_KEY not set' };
+      const resp = await httpPost('https://api.x.ai/v1/chat/completions', {
+        model: 'grok-2-latest', max_tokens: 20,
+        messages: [{ role: 'user', content: 'Reply with just the word "pong"' }],
+      }, { 'Authorization': 'Bearer ' + process.env.XAI_API_KEY });
+      const latency = Date.now() - start;
+      const text = resp.choices?.[0]?.message?.content || '';
+      if (resp.error) return { ok: false, latency, message: resp.error.message || 'API error', provider: 'xai' };
+      return { ok: true, latency, message: `xAI OK (${latency}ms): "${text.slice(0, 30)}"`, provider: 'xai' };
+    }
+    return { ok: false, message: 'No LLM API key configured' };
+  } catch (e) { return { ok: false, latency: Date.now() - start, message: e.message }; }
+}
+
+async function testPolygonRpc() {
+  const start = Date.now();
+  if (!process.env.POLYGON_RPC_URL) return { ok: false, message: 'POLYGON_RPC_URL not set' };
+  try {
+    const resp = await httpPost(process.env.POLYGON_RPC_URL, { jsonrpc: '2.0', method: 'eth_blockNumber', params: [], id: 1 });
+    const latency = Date.now() - start;
+    if (resp.result) {
+      const block = parseInt(resp.result, 16);
+      return { ok: true, latency, message: `Connected (${latency}ms) — Block #${block.toLocaleString()}`, blockNumber: block };
+    }
+    return { ok: false, latency, message: resp.error?.message || 'Bad response' };
+  } catch (e) { return { ok: false, latency: Date.now() - start, message: e.message }; }
+}
+
+async function testClobAuth() {
+  const start = Date.now();
+  if (!process.env.POLYMARKET_API_KEY) return { ok: false, message: 'POLYMARKET_API_KEY not set' };
+  try {
+    const clobUrl = process.env.POLYMARKET_CLOB_URL || 'https://clob.polymarket.com';
+    const resp = await httpGet(`${clobUrl}/time`);
+    const latency = Date.now() - start;
+    return { ok: true, latency, message: `CLOB reachable (${latency}ms)` };
+  } catch (e) { return { ok: false, latency: Date.now() - start, message: e.message }; }
+}
+
 function getBlockersForStrategy(strategyType) {
   const d = store.diagnostics.results;
   const blockers = [];
@@ -1209,6 +1288,134 @@ function getSystemStatus() {
   };
 }
 
+// ── System Report Generator ──
+function generateSystemReport() {
+  const cfg = getConfig();
+  const blockers = getBlockers();
+  const status = getSystemStatus();
+  const report = { generated: new Date().toISOString(), sections: [] };
+
+  // Connections
+  const connItems = [];
+  connItems.push({ name: 'Polymarket Gamma API', status: store.diagnostics.results?.polymarketApi?.status || 'unchecked', detail: store.diagnostics.results?.polymarketApi?.message || 'Run diagnostics' });
+  connItems.push({ name: 'CLOB Auth', status: cfg.secrets.polymarketClob ? 'configured' : 'missing', detail: cfg.secrets.polymarketClob ? 'Key present' : 'POLYMARKET_API_KEY not set' });
+  connItems.push({ name: 'Wallet', status: cfg.secrets.polymarketPrivateKey ? 'configured' : 'missing', detail: cfg.secrets.polymarketPrivateKey ? 'Key present' : 'POLYMARKET_PRIVATE_KEY not set' });
+  connItems.push({ name: 'Polygon RPC', status: cfg.secrets.polygonRpc ? 'configured' : 'missing', detail: store.diagnostics.results?.polygonRpc?.message || 'Not tested' });
+  connItems.push({ name: 'Anthropic', status: cfg.secrets.anthropicKey ? 'configured' : 'missing', detail: cfg.secrets.anthropicKey ? 'Key present' : 'Not set' });
+  connItems.push({ name: 'xAI', status: cfg.secrets.xaiKey ? 'configured' : 'missing', detail: cfg.secrets.xaiKey ? 'Key present' : 'Not set' });
+  report.sections.push({ title: 'Connections', items: connItems });
+
+  // Running agents
+  const agentItems = store.agents.map(a => ({
+    name: `${a.name} (${a.strategyType})`, status: a.status,
+    detail: `Scanned: ${a.stats.scanned} | Opps: ${a.stats.opportunities} | Last: ${a.health.lastRunAt ? new Date(a.health.lastRunAt).toLocaleTimeString() : 'never'}`,
+  }));
+  if (agentItems.length === 0) agentItems.push({ name: 'No agents', status: 'missing', detail: 'Create agents in the Agents tab' });
+  report.sections.push({ title: 'Agents', items: agentItems });
+
+  // Last scan
+  const scanItems = [];
+  const cache = store.marketCache;
+  scanItems.push({ name: 'Markets cached', status: cache.data.length > 0 ? 'ok' : 'empty', detail: `${cache.data.length} markets, fetched ${cache.fetchedAt ? Math.round((Date.now() - cache.fetchedAt) / 1000) + 's ago' : 'never'}` });
+  scanItems.push({ name: 'Data source', status: status.dataSource === 'live' ? 'ok' : 'demo', detail: status.dataSource === 'live' ? 'Live Polymarket data' : 'Demo/fallback data' });
+  scanItems.push({ name: 'Total scans', status: 'info', detail: store.totalScans.toString() });
+  const highEdge = cache.data.filter(m => m.edge > 1).length;
+  scanItems.push({ name: 'High-edge opportunities', status: highEdge > 0 ? 'ok' : 'info', detail: `${highEdge} markets with >1% edge` });
+  report.sections.push({ title: 'Last Scan', items: scanItems });
+
+  // Top blockers
+  const topBlockers = [];
+  if (!cfg.secrets.polymarketClob) topBlockers.push({ name: 'Add Polymarket CLOB API keys', status: 'blocked', detail: 'Required for live trading' });
+  if (!cfg.secrets.polymarketPrivateKey) topBlockers.push({ name: 'Connect wallet private key', status: 'blocked', detail: 'Required for signing transactions' });
+  if (!store.founder.capitalAllocated) topBlockers.push({ name: 'Set fund capital allocation', status: 'action', detail: 'Confirm how much USDC to allocate' });
+  if (!store.founder.risksApproved) topBlockers.push({ name: 'Approve risk limits', status: 'action', detail: 'Review and approve position limits' });
+  if (store.agents.length === 0) topBlockers.push({ name: 'Create strategy agents', status: 'action', detail: 'Deploy at least one agent to start scanning' });
+  if (!cfg.secrets.anthropicKey && !cfg.secrets.openaiKey) topBlockers.push({ name: 'Add LLM API key', status: 'info', detail: 'Needed for LLM Probability and Sentiment strategies' });
+  report.sections.push({ title: 'Top Blockers', items: topBlockers.slice(0, 5) });
+
+  return report;
+}
+
+// ── Founder Console Chat ──
+async function founderConsoleChat(question) {
+  const q = question.toLowerCase().trim();
+  const cfg = getConfig();
+  const status = getSystemStatus();
+
+  // Deterministic answers for common questions
+  if (q.includes('what') && q.includes('missing')) {
+    const missing = [];
+    if (!cfg.secrets.polymarketClob) missing.push('Polymarket CLOB API keys (POLYMARKET_API_KEY, POLYMARKET_API_SECRET, POLYMARKET_API_PASSPHRASE)');
+    if (!cfg.secrets.polymarketPrivateKey) missing.push('Wallet private key (POLYMARKET_PRIVATE_KEY)');
+    if (!cfg.secrets.polygonRpc) missing.push('Polygon RPC URL (POLYGON_RPC_URL)');
+    if (!cfg.secrets.anthropicKey && !cfg.secrets.openaiKey) missing.push('LLM API key (ANTHROPIC_API_KEY or OPENAI_API_KEY)');
+    if (!store.founder.capitalAllocated) missing.push('Capital allocation (set in Action Queue step 3)');
+    if (!store.founder.risksApproved) missing.push('Risk limits approval (Action Queue step 4)');
+    return { answer: missing.length > 0 ? `Missing items:\n${missing.map((m, i) => `${i + 1}. ${m}`).join('\n')}` : 'All prerequisites are configured! You\'re ready to trade.', source: 'system' };
+  }
+
+  if (q.includes('negrisk') || q.includes('neg risk') || q.includes('neg-risk')) {
+    const blockers = getBlockersForStrategy('negrisk_arb');
+    const agents = store.agents.filter(a => a.strategyType === 'negrisk_arb');
+    const nr = store.marketCache.data.filter(m => m.negRisk);
+    return { answer: `NegRisk Arbitrage Status:\n- ${agents.length} agent(s) running\n- ${nr.length} NegRisk markets in cache\n- Blockers: ${blockers.length > 0 ? blockers.join('; ') : 'None'}\n\nThis strategy identifies multi-outcome markets where the sum of outcome prices deviates from 1.0, creating arbitrage opportunities.${agents.length === 0 ? '\n\nAction: Create a NegRisk agent in the Agents tab to start scanning.' : ''}`, source: 'system' };
+  }
+
+  if (q.includes('llm') || q.includes('probability') || q.includes('mispricing')) {
+    const blockers = getBlockersForStrategy('llm_probability');
+    const agents = store.agents.filter(a => a.strategyType === 'llm_probability');
+    return { answer: `LLM Probability Status:\n- ${agents.length} agent(s) running\n- LLM available: ${cfg.secrets.anthropicKey ? 'Anthropic' : cfg.secrets.openaiKey ? 'OpenAI' : 'NONE'}\n- Blockers: ${blockers.length > 0 ? blockers.join('; ') : 'None'}\n\nThis strategy asks LLMs to estimate true probabilities and compares to market prices.${!cfg.secrets.anthropicKey && !cfg.secrets.openaiKey ? '\n\nAction: Add ANTHROPIC_API_KEY or OPENAI_API_KEY in Settings.' : ''}`, source: 'system' };
+  }
+
+  if (q.includes('sentiment') || q.includes('headline')) {
+    const agents = store.agents.filter(a => a.strategyType === 'sentiment');
+    return { answer: `Sentiment Analysis Status:\n- ${agents.length} agent(s)\n- Headlines loaded: ${store.headlines.length}\n- LLM for analysis: ${cfg.secrets.xaiKey ? 'xAI/Grok' : cfg.secrets.anthropicKey ? 'Anthropic' : 'Keyword matching (no LLM key)'}\n\nPaste headlines in the Sentiment tab to analyze market impact.`, source: 'system' };
+  }
+
+  if (q.includes('whale')) {
+    return { answer: `Whale Watch Status:\n- Tracked wallets: ${store.whaleWallets.length}\n- Events logged: ${store.whaleEvents.length}\n- ${store.whaleWallets.length === 0 ? 'Add wallet addresses in the Whale Watch tab to start tracking.' : 'Monitoring ' + store.whaleWallets.map(w => w.alias).join(', ')}`, source: 'system' };
+  }
+
+  if (q.includes('status') || q.includes('summary') || q.includes('overview')) {
+    return { answer: `System Status:\n- Uptime: ${status.uptimeFormatted}\n- Mode: ${status.mode}\n- Data: ${status.dataSource}\n- Markets: ${status.marketsInCache}\n- Agents: ${status.agentsCount} (${store.agents.filter(a => a.status === 'running').length} running)\n- Pending approvals: ${status.pendingApprovals}\n- Kill switch: ${status.killSwitch ? 'ON' : 'OFF'}\n- Fund: $${status.founder.fundSize.toLocaleString()} (deployed: $${status.founder.capitalDeployed.toLocaleString()})`, source: 'system' };
+  }
+
+  if (q.includes('no opportunities') || q.includes('no opps') || q.includes('why are no')) {
+    const reasons = [];
+    if (status.dataSource === 'demo') reasons.push('Using demo data — Polymarket API may be unreachable');
+    if (store.agents.length === 0) reasons.push('No agents created — create agents to scan for opportunities');
+    if (store.agents.every(a => a.status === 'paused')) reasons.push('All agents are paused');
+    if (store.killSwitch) reasons.push('Kill switch is ON — all agents halted');
+    if (store.totalScans === 0) reasons.push('No scans completed yet — wait for first scan cycle');
+    return { answer: reasons.length > 0 ? `Possible reasons:\n${reasons.map((r, i) => `${i + 1}. ${r}`).join('\n')}` : 'Agents are running and scanning. Opportunities appear when edge > minEdge threshold. Try lowering the min edge in agent config or wait for market conditions to change.', source: 'system' };
+  }
+
+  if (q === 'help' || q === '?') {
+    return { answer: 'Ask me about:\n- "What\'s missing?" — see unfilled prerequisites\n- "NegRisk status" — NegRisk arb strategy details\n- "LLM status" — LLM probability strategy details\n- "Why are no opportunities showing?" — debug empty results\n- "System status" — overall system summary\n- "Last scan" — latest scan results\n- Or any question about the system state', source: 'system' };
+  }
+
+  if (q.includes('last scan') || q.includes('scan result')) {
+    const cache = store.marketCache;
+    const highEdge = cache.data.filter(m => m.edge > 1);
+    return { answer: `Last Scan:\n- ${cache.data.length} markets cached\n- Source: ${status.dataSource}\n- Fetched: ${cache.fetchedAt ? Math.round((Date.now() - cache.fetchedAt) / 1000) + 's ago' : 'never'}\n- High-edge (>1%): ${highEdge.length}\n- Top 3:${highEdge.slice(0, 3).map(m => `\n  - ${m.market.slice(0, 50)}: ${m.edge.toFixed(2)}%`).join('') || '\n  (none)'}`, source: 'system' };
+  }
+
+  // If LLM available, use it for unknown questions
+  if (process.env.ANTHROPIC_API_KEY) {
+    try {
+      const ctx = `System status: ${JSON.stringify({ mode: status.mode, uptime: status.uptimeFormatted, agents: status.agentsCount, markets: status.marketsInCache, killSwitch: status.killSwitch, dataSource: status.dataSource, pendingApprovals: status.pendingApprovals, secrets: cfg.secrets, founder: status.founder })}`;
+      const resp = await httpPost('https://api.anthropic.com/v1/messages', {
+        model: 'claude-sonnet-4-5-20250929', max_tokens: 300,
+        system: 'You are ZVI, a fund operating system assistant. Answer the founder\'s question about the system using the provided runtime state. Be concise and actionable. Current state: ' + ctx,
+        messages: [{ role: 'user', content: question }],
+      }, { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' });
+      return { answer: resp.content?.[0]?.text || 'No response', source: 'llm' };
+    } catch (e) { return { answer: `LLM unavailable: ${e.message}\n\nType "help" for built-in questions.`, source: 'error' }; }
+  }
+
+  return { answer: `I don't have enough context for that question. Try:\n- "What's missing?"\n- "System status"\n- "NegRisk status"\n- "Why are no opportunities showing?"\n- "help" for full list`, source: 'system' };
+}
+
 // ── .env.local updater ──
 function updateEnvFile(updates) {
   const ALLOWED = new Set([
@@ -1260,11 +1467,17 @@ function readBody(req) {
 // DASHBOARD HTML
 // ═══════════════════════════════════════════════════════════════════════════════
 
+function redactKey(val) {
+  if (!val || val.length < 8) return val ? '***' : '';
+  return val.slice(0, 4) + '...' + val.slice(-4);
+}
+
 function dashboardHTML() {
   const cfg = getConfig();
   const initialBlockers = getBlockers();
   const initialOpps = getDemoOpportunities();
-  const EMBEDDED = JSON.stringify({ blockers: initialBlockers, opportunities: initialOpps, agents: store.agents, approvals: store.approvalsQueue.filter(a => a.status === 'pending'), killSwitch: store.killSwitch }).replace(/<\//g, '<\\/');
+  const initialReport = generateSystemReport();
+  const EMBEDDED = JSON.stringify({ blockers: initialBlockers, opportunities: initialOpps, agents: store.agents, approvals: store.approvalsQueue.filter(a => a.status === 'pending'), killSwitch: store.killSwitch, report: initialReport }).replace(/<\//g, '<\\/');
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1273,6 +1486,15 @@ function dashboardHTML() {
 <title>ZVI v1 — Fund Operating System</title>
 <style>
 :root{--bg0:#0a0a0f;--bg1:#0f0f18;--bg2:#12121a;--bg3:#1a1a2e;--bd:#2a2a3e;--bd2:#3b3b55;--t1:#e4e4ef;--t2:#8888a0;--t3:#5a5a72;--blue:#6366f1;--cyan:#06b6d4;--green:#22c55e;--yellow:#eab308;--red:#ef4444;--purple:#8b5cf6;--mono:'SF Mono','Fira Code','JetBrains Mono',monospace;--sans:-apple-system,BlinkMacSystemFont,'Inter','Segoe UI',sans-serif}
+body.hexa-light{--bg0:#faf9f6;--bg1:#ffffff;--bg2:#f5f3ef;--bg3:#ebe8e2;--bd:#d4d0c8;--bd2:#c5c0b6;--t1:#1a1a1a;--t2:#555550;--t3:#8a8680;--blue:#2d6a4f;--cyan:#2d6a4f;--green:#2d6a4f;--yellow:#b8860b;--red:#c0392b;--purple:#6a4c93}
+body.hexa-light .topbar{background:linear-gradient(180deg,#f5f3ef,#ffffff);border-bottom-color:var(--bd)}
+body.hexa-light .logo{background:linear-gradient(135deg,#2d6a4f,#40916c);-webkit-background-clip:text}
+body.hexa-light .tabs{background:#fff}
+body.hexa-light .tab.active{color:#2d6a4f;border-bottom-color:#2d6a4f}
+body.hexa-light .aq{background:linear-gradient(180deg,rgba(45,106,79,.04),transparent)}
+body.hexa-light .commander{background:#fff}
+body.hexa-light ::-webkit-scrollbar-track{background:#faf9f6}
+body.hexa-light ::-webkit-scrollbar-thumb{background:#d4d0c8}
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:var(--bg0);color:var(--t1);font-family:var(--sans);font-size:14px;line-height:1.5;overflow-x:hidden}
 ::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-track{background:var(--bg0)}::-webkit-scrollbar-thumb{background:var(--bd);border-radius:3px}
@@ -1428,6 +1650,42 @@ td{padding:8px 12px;vertical-align:middle}
 .act-msg{color:var(--t2);font-size:11px}
 @media(max-width:768px){.topbar{padding:0 10px;flex-wrap:wrap;height:auto;padding:8px 10px;gap:6px}.tabs{padding:0 10px}.tab{padding:8px 10px;font-size:11px}.content{padding:10px}.ss{grid-template-columns:repeat(2,1fr)}.mn{max-width:180px}td,thead th{padding:6px 8px}.commander{padding:6px 10px}}
 body{padding-bottom:50px}
+.theme-toggle{padding:4px 10px;border-radius:4px;font-family:var(--mono);font-size:10px;cursor:pointer;border:1px solid var(--bd);background:var(--bg2);color:var(--t2);transition:all .15s}.theme-toggle:hover{border-color:var(--green);color:var(--green)}
+.simple-toggle{padding:4px 10px;border-radius:4px;font-family:var(--mono);font-size:10px;cursor:pointer;border:1px solid var(--bd);background:var(--bg2);color:var(--t2);transition:all .15s}.simple-toggle:hover{border-color:var(--cyan);color:var(--cyan)}.simple-toggle.active{border-color:var(--cyan);color:var(--cyan);background:rgba(6,182,212,.1)}
+.wizard-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:600;display:flex;align-items:center;justify-content:center;animation:fi .15s}
+.wizard{background:var(--bg1);border:1px solid var(--bd);border-radius:16px;width:92%;max-width:600px;max-height:85vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.wizard-h{padding:20px 24px 0;display:flex;justify-content:space-between;align-items:flex-start}
+.wizard-h h2{font-size:18px;font-weight:700;line-height:1.3}
+.wizard-h .step-num{font-family:var(--mono);font-size:10px;color:var(--cyan);display:block;margin-bottom:4px;text-transform:uppercase;letter-spacing:1px}
+.wizard-body{padding:20px 24px}
+.wizard-section{margin-bottom:18px}
+.wizard-section h4{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--cyan);font-family:var(--mono);margin-bottom:8px}
+.wizard-section p{font-size:13px;color:var(--t2);line-height:1.7}
+.wizard-field{display:flex;flex-direction:column;gap:4px;margin-bottom:10px}
+.wizard-field label{font-size:10px;font-family:var(--mono);color:var(--t3);text-transform:uppercase;letter-spacing:.5px}
+.wizard-field input,.wizard-field select{padding:8px 12px;background:var(--bg0);border:1px solid var(--bd);border-radius:6px;color:var(--t1);font-family:var(--mono);font-size:12px;outline:none;transition:border .15s}
+.wizard-field input:focus{border-color:var(--cyan)}
+.wizard-footer{padding:16px 24px;border-top:1px solid var(--bd);display:flex;gap:8px;justify-content:flex-end;align-items:center}
+.wizard-footer .test-result{flex:1;font-family:var(--mono);font-size:11px;color:var(--t3)}
+.test-ok{color:var(--green)!important}.test-fail{color:var(--red)!important}
+.console-wrap{display:flex;flex-direction:column;height:calc(100vh - 280px);min-height:400px}
+.console-messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
+.console-msg{padding:10px 14px;border-radius:10px;font-size:13px;line-height:1.6;max-width:85%;white-space:pre-wrap;font-family:var(--sans)}
+.console-msg.user{background:rgba(99,102,241,.15);border:1px solid rgba(99,102,241,.25);align-self:flex-end;color:var(--t1)}
+.console-msg.system{background:var(--bg2);border:1px solid var(--bd);align-self:flex-start;color:var(--t2);font-family:var(--mono);font-size:12px}
+.console-msg.llm{background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.2);align-self:flex-start;color:var(--t2)}
+.console-input{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--bd);background:var(--bg2);border-radius:0 0 10px 10px}
+.console-input input{flex:1;padding:10px 14px;background:var(--bg0);border:1px solid var(--bd);border-radius:8px;color:var(--t1);font-size:13px;outline:none;font-family:var(--sans)}
+.console-input input:focus{border-color:var(--cyan)}
+.report-grid{display:grid;gap:14px}
+.report-section{background:var(--bg2);border:1px solid var(--bd);border-radius:10px;padding:16px}
+.report-section h4{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--blue);font-family:var(--mono);margin-bottom:10px}
+.report-item{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid rgba(42,53,85,.2);font-size:12px}
+.report-item:last-child{border-bottom:none}
+.ri-name{color:var(--t1)}.ri-detail{color:var(--t3);font-family:var(--mono);font-size:10px;text-align:right;max-width:60%}
+.onboard-hero{text-align:center;padding:40px 20px 30px;max-width:600px;margin:0 auto}
+.onboard-hero h1{font-size:28px;font-weight:700;margin-bottom:8px;background:linear-gradient(135deg,var(--blue),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.onboard-hero p{font-size:15px;color:var(--t2);line-height:1.7}
 </style>
 </head>
 <body>
@@ -1435,6 +1693,8 @@ body{padding-bottom:50px}
   <div class="topbar-left"><div><div class="logo">ZVI v1</div><div class="logo-sub">Fund Operating System</div></div></div>
   <div class="topbar-right">
     <div class="secret-badges" id="secBadges"></div>
+    <button class="simple-toggle" id="viewToggle" onclick="toggleView()">Simple</button>
+    <button class="theme-toggle" id="themeBtn" onclick="toggleTheme()">Hexa Light</button>
     <button class="kill-btn" id="killBtn" onclick="toggleKillSwitch()">KILL SWITCH</button>
     <div class="mode-badge ${cfg.mode === 'OBSERVATION_ONLY' ? 'mode-obs' : 'mode-live'}" id="modeBadge">${cfg.mode === 'OBSERVATION_ONLY' ? 'OBSERVE' : 'LIVE'}</div>
   </div>
@@ -1448,7 +1708,7 @@ body{padding-bottom:50px}
   <div class="tab" data-tab="llm">LLM Probability</div>
   <div class="tab" data-tab="sentiment">Sentiment</div>
   <div class="tab" data-tab="whales">Whale Watch</div>
-  <div class="tab" data-tab="hub">Explain Hub</div>
+  <div class="tab" data-tab="hub">Founder Console</div>
   <div class="tab" data-tab="health">Health</div>
   <div class="tab" data-tab="settings">Settings</div>
 </div>
@@ -1489,7 +1749,15 @@ body{padding-bottom:50px}
     <h4 style="font-size:12px;color:var(--t2);margin-bottom:8px">Recent Whale Events</h4>
     <div id="whaleEvents" class="tw" style="max-height:400px;overflow-y:auto"></div>
   </div>
-  <div class="panel" id="panel-hub"><div class="hub-grid" id="hubGrid"></div></div>
+  <div class="panel" id="panel-hub">
+    <div style="display:flex;gap:8px;margin-bottom:14px"><button class="btn btn-p btn-sm" id="hubTabChat" onclick="switchHubTab('chat')" style="border-bottom:2px solid var(--cyan)">Console Chat</button><button class="btn btn-sm" id="hubTabReport" onclick="switchHubTab('report')">System Report</button><button class="btn btn-sm" id="hubTabActivity" onclick="switchHubTab('activity')">Activity</button></div>
+    <div id="hubChat" class="console-wrap" style="background:var(--bg2);border:1px solid var(--bd);border-radius:10px">
+      <div class="console-messages" id="consoleMessages"><div class="console-msg system">Welcome to the Founder Console. Ask me anything about your system.\\nTry: "What's missing?" or "NegRisk status" or "help"</div></div>
+      <div class="console-input"><input type="text" id="consoleInput" placeholder="Ask about your system..." onkeydown="if(event.key==='Enter')sendConsoleMsg()"><button class="btn btn-p" onclick="sendConsoleMsg()">Ask</button></div>
+    </div>
+    <div id="hubReport" style="display:none"><div class="report-grid" id="reportGrid"></div></div>
+    <div id="hubActivity" style="display:none"><div class="hub-grid" id="hubGrid"></div></div>
+  </div>
   <div class="panel" id="panel-health">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="font-size:15px">System Health & Diagnostics</h3><button class="btn btn-p btn-sm" onclick="runDiag()">Run Diagnostics</button></div>
     <div id="diagGrid"></div>
@@ -1516,7 +1784,7 @@ document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () =>
   document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
   t.classList.add('active');
   document.getElementById('panel-' + t.dataset.tab)?.classList.add('active');
-  if (t.dataset.tab === 'hub') { fetchSysStatus(); fetchActLog(); }
+  if (t.dataset.tab === 'hub') { switchHubTab('chat'); }
   if (t.dataset.tab === 'settings') renderSettings();
   if (t.dataset.tab === 'agents') fetchAgents();
   if (t.dataset.tab === 'approvals') fetchApprovals();
@@ -1595,20 +1863,15 @@ function renderAQ(){
   if(allClear){document.getElementById('aqSteps').innerHTML='<div style="display:flex;align-items:center;gap:8px;padding:8px 14px;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.25);border-radius:8px;font-family:var(--mono);font-size:11px;color:var(--green);font-weight:600">ALL SYSTEMS GO — Ready for trading decisions</div>';return;}
   document.getElementById('aqSteps').innerHTML=bs.map((b,i)=>{
     let sc='step-locked';if(b.status==='done')sc='step-done';else if(b.status==='blocked')sc=i===cs-1?'step-blocked step-current':'step-blocked';else if(b.status==='action-needed')sc=i===cs-1?'step-current':'';else if(b.status==='ready')sc='step-current';
-    let act='';const exp=expandedStep===b.id;
-    if(b.status!=='done'&&b.status!=='locked'){
-      if(b.id==='api-keys'){if(exp)act='<div class="aq-expanded"><div class="aq-row"><label>Key</label><input type="password" id="aq_k" placeholder="API Key"></div><div class="aq-row"><label>Secret</label><input type="password" id="aq_s" placeholder="Secret"></div><div class="aq-row"><label>Pass</label><input type="password" id="aq_p" placeholder="Passphrase"></div><div style="margin-top:6px"><button class="btn btn-p btn-sm" onclick="event.stopPropagation();saveAqKeys()">Save</button></div></div>';else if(b.missing?.length)act='<div class="aq-missing">Missing: '+b.missing.join(', ')+'</div>';}
-      else if(b.id==='wallet'){if(exp)act='<div class="aq-expanded"><div class="aq-row"><label>Key</label><input type="password" id="aq_w" placeholder="Private key"></div><div style="margin-top:6px"><button class="btn btn-p btn-sm" onclick="event.stopPropagation();saveAqWallet()">Save</button></div></div>';else if(b.missing?.length)act='<div class="aq-missing">Missing: '+b.missing.join(', ')+'</div>';}
-      else if(b.id==='capital'){act='<div class="aq-row" style="margin-top:4px"><label>$</label><input type="number" id="aqCap" value="'+(blockerData.founder?.fundSize||6000)+'" min="100" onclick="event.stopPropagation()"><button class="btn btn-p btn-sm" onclick="event.stopPropagation();setCap()">Confirm</button></div>';}
-      else if(b.id==='risks'){act='<div style="margin-top:4px"><button class="btn btn-p btn-sm" onclick="event.stopPropagation();approveRisks()">Approve Limits</button></div>';}
-    }
-    const clk=b.status!=='done'&&b.status!=='locked'?' onclick="toggleExp(\\''+b.id+'\\')"':'';
-    return '<div class="aq-step '+sc+'"'+clk+'><div class="aq-num">'+(b.status==='done'?'>':i+1)+'</div><div class="aq-step-title">'+esc(b.title)+'</div><div class="aq-step-desc">'+esc(b.desc)+'</div>'+act+'</div>';
+    let statusLine='';
+    if(b.status==='done')statusLine='<div style="font-size:9px;color:var(--green);font-family:var(--mono);margin-top:4px">Verified</div>';
+    else if(b.missing?.length)statusLine='<div class="aq-missing">Missing: '+b.missing.join(', ')+'</div>';
+    else if(b.status==='action-needed')statusLine='<div style="font-size:9px;color:var(--yellow);font-family:var(--mono);margin-top:4px">Action needed</div>';
+    const clk=b.status!=='done'&&b.status!=='locked'?' onclick="openWizard(\\''+b.id+'\\')"':'';
+    return '<div class="aq-step '+sc+'"'+clk+'><div class="aq-num">'+(b.status==='done'?'>':i+1)+'</div><div class="aq-step-title">'+esc(b.title)+'</div><div class="aq-step-desc">'+esc(b.desc)+'</div>'+statusLine+'</div>';
   }).join('');
 }
-function toggleExp(id){expandedStep=expandedStep===id?null:id;renderAQ();}
-async function saveAqKeys(){const u={};const k=document.getElementById('aq_k'),s=document.getElementById('aq_s'),p=document.getElementById('aq_p');if(k?.value.trim())u.POLYMARKET_API_KEY=k.value.trim();if(s?.value.trim())u.POLYMARKET_API_SECRET=s.value.trim();if(p?.value.trim())u.POLYMARKET_API_PASSPHRASE=p.value.trim();if(!Object.keys(u).length){toast('Enter keys','error');return;}try{const r=await post('/api/founder/update-env',u);if(r.ok){toast('Saved','success');expandedStep=null;fetchBlockers();}}catch(e){toast('Failed','error');}}
-async function saveAqWallet(){const el=document.getElementById('aq_w');if(!el?.value.trim()){toast('Enter key','error');return;}try{const r=await post('/api/founder/update-env',{POLYMARKET_PRIVATE_KEY:el.value.trim()});if(r.ok){toast('Saved','success');expandedStep=null;fetchBlockers();}}catch(e){toast('Failed','error');}}
+function toggleExp(id){openWizard(id);}
 async function setCap(){const v=parseInt(document.getElementById('aqCap')?.value);if(!v||v<100){toast('Min $100','error');return;}try{const r=await post('/api/founder/set-capital',{fundSize:v});if(r.ok){blockerData=r.blockers;toast('Fund: $'+v.toLocaleString(),'success');renderAQ();renderFundBar();}}catch(e){toast('Failed','error');}}
 async function approveRisks(){try{const r=await post('/api/founder/approve-risks',{});if(r.ok){blockerData=r.blockers;tradingUnlocked=r.blockers.allClear;toast('Risks approved','success');renderAQ();if(opps.length)renderOpps();}}catch(e){toast('Failed','error');}}
 function renderFundBar(){const b=document.getElementById('fundBar');if(!blockerData?.founder?.capitalAllocated){b.style.display='none';return;}const f=blockerData.founder,rem=f.fundSize-f.capitalDeployed;b.style.display='flex';b.innerHTML='<div class="fb-i"><span class="fb-l">Fund:</span><span class="fb-v">$'+f.fundSize.toLocaleString()+'</span></div><div class="fb-i"><span class="fb-l">Deployed:</span><span class="fb-v" style="color:var(--yellow)">$'+f.capitalDeployed.toLocaleString()+'</span></div><div class="fb-i"><span class="fb-l">Remaining:</span><span class="fb-v" style="color:'+(rem>f.fundSize*.3?'var(--green)':'var(--red)')+'">$'+rem.toLocaleString()+'</span></div>';}
@@ -1682,7 +1945,27 @@ async function removeWhale(addr){try{await post('/api/whales/remove',{address:ad
 // Health + Diagnostics
 async function runDiag(){try{const d=await api('/api/diagnostics');renderDiag(d.results||{});}catch(e){}}
 function renderDiag(r){
-  document.getElementById('diagGrid').innerHTML='<div class="tw" style="margin-bottom:10px">'+Object.entries(r).map(([k,v])=>'<div class="diag-item"><span class="diag-name">'+esc(k)+'</span><div><span class="diag-status ds-'+(v.status||'unknown')+'">'+esc(v.status||'?')+'</span> <span style="font-size:10px;color:var(--t3);margin-left:6px">'+esc(v.message||'')+'</span></div></div>').join('')+'</div>';
+  const testBtns={polymarketApi:'testPolymarket',polygonRpc:'testPolygon',clobAuth:'testClob',anthropic:'testLLMAnthropic',openai:'testLLMOpenAI',xai:'testLLMXAI'};
+  document.getElementById('diagGrid').innerHTML='<div class="tw" style="margin-bottom:10px">'+Object.entries(r).map(([k,v])=>{
+    const tb=testBtns[k];
+    return '<div class="diag-item"><span class="diag-name">'+esc(k)+'</span><div style="display:flex;align-items:center;gap:8px"><span class="diag-status ds-'+(v.status||'unknown')+'">'+esc(v.status||'?')+'</span><span style="font-size:10px;color:var(--t3)">'+esc(v.message||'')+'</span>'+(tb?'<button class="btn btn-sm" onclick="diagTest(\\''+k+'\\',\\''+tb+'\\',this)">Test</button>':'')+'</div></div>';
+  }).join('')+'</div>';
+}
+async function diagTest(key,fn,btn){
+  btn.textContent='Testing...';btn.disabled=true;
+  try{
+    let r;
+    if(fn==='testPolymarket')r=await post('/api/test/polymarket',{});
+    else if(fn==='testPolygon')r=await post('/api/test/polygon',{});
+    else if(fn==='testClob')r=await post('/api/test/clob',{});
+    else if(fn==='testLLMAnthropic')r=await post('/api/test/llm',{provider:'anthropic'});
+    else if(fn==='testLLMOpenAI')r=await post('/api/test/llm',{provider:'openai'});
+    else if(fn==='testLLMXAI')r=await post('/api/test/llm',{provider:'xai'});
+    btn.textContent=r.ok?'OK ('+r.latency+'ms)':'FAIL';
+    btn.style.color=r.ok?'var(--green)':'var(--red)';
+    toast(r.ok?key+': '+r.message:key+': '+r.message,r.ok?'success':'error');
+  }catch(e){btn.textContent='Error';btn.style.color='var(--red)';toast('Test failed: '+e.message,'error');}
+  btn.disabled=false;
 }
 async function fetchAgentHealth(){try{const d=await api('/api/health');const ag=d.agents||{};document.getElementById('healthGrid').innerHTML=Object.entries(ag).map(([n,i])=>{const ago=Math.round((Date.now()-i.lastSeen)/1000);return '<div class="agent-card" style="margin-bottom:8px"><div class="ac-h"><span class="ac-name">'+esc(n)+'</span><span class="status-pill st-'+(i.status||'idle')+'">'+(i.status||'?')+'</span></div><div style="font-size:11px;color:var(--t3);font-family:var(--mono)">Last seen: '+ago+'s ago | Interval: '+(i.interval/1000)+'s</div></div>';}).join('');}catch(e){}}
 
@@ -1717,6 +2000,165 @@ async function saveMode(){const el=document.getElementById('set_mode');if(el)try
 // Commander
 async function runCmd(){const inp=document.getElementById('cmdInput'),txt=inp.value.trim();if(!txt)return;inp.value='';document.getElementById('cmdOut').textContent='Running...';try{const r=await post('/api/command',{text:txt});document.getElementById('cmdOut').textContent=r.message||r.error||'Done';if(r.type==='created'||r.type==='kill')fetchAgents();}catch(e){document.getElementById('cmdOut').textContent='Error';}}
 
+// Theme toggle
+let currentTheme = localStorage.getItem('zvi-theme') || 'dark';
+let simpleView = localStorage.getItem('zvi-view') === 'simple';
+function toggleTheme(){
+  currentTheme = currentTheme === 'dark' ? 'light' : 'dark';
+  document.body.classList.toggle('hexa-light', currentTheme === 'light');
+  document.getElementById('themeBtn').textContent = currentTheme === 'light' ? 'Terminal Dark' : 'Hexa Light';
+  localStorage.setItem('zvi-theme', currentTheme);
+}
+function toggleView(){
+  simpleView = !simpleView;
+  document.getElementById('viewToggle').textContent = simpleView ? 'Advanced' : 'Simple';
+  document.getElementById('viewToggle').classList.toggle('active', simpleView);
+  localStorage.setItem('zvi-view', simpleView ? 'simple' : 'advanced');
+  renderOpps();
+}
+function applyTheme(){
+  if(currentTheme==='light')document.body.classList.add('hexa-light');
+  document.getElementById('themeBtn').textContent=currentTheme==='light'?'Terminal Dark':'Hexa Light';
+  if(simpleView){document.getElementById('viewToggle').textContent='Advanced';document.getElementById('viewToggle').classList.add('active');}
+}
+
+// Wizard modals for Action Queue
+function openWizard(stepId){
+  const wizards={
+    'api-keys':{
+      num:'Step 1 of 5',title:'Connect API Keys',
+      what:'Configure your Polymarket CLOB API credentials so ZVI can read markets and submit orders.',
+      why:'Without CLOB API keys, ZVI can only read public market data via Gamma. To view your positions and execute trades, you need authenticated CLOB access.',
+      steps:['Go to <a href="https://polymarket.com" target="_blank" style="color:var(--cyan)">polymarket.com</a> and log in','Navigate to Settings > API Keys','Generate a new API key pair','Copy the Key, Secret, and Passphrase below'],
+      fields:[{id:'wiz_api_key',label:'API Key',type:'password',placeholder:'Your Polymarket API Key',env:'POLYMARKET_API_KEY'},{id:'wiz_api_secret',label:'API Secret',type:'password',placeholder:'Your Polymarket API Secret',env:'POLYMARKET_API_SECRET'},{id:'wiz_api_pass',label:'Passphrase',type:'password',placeholder:'Your Polymarket Passphrase',env:'POLYMARKET_API_PASSPHRASE'}],
+      testBtn:'Test Polymarket',testFn:'testPolymarket',
+      defaults:'The public Gamma API (gamma-api.polymarket.com) works without keys for market data. CLOB keys are only required for authenticated actions.',
+    },
+    'wallet':{
+      num:'Step 2 of 5',title:'Connect Wallet',
+      what:'Add your Polygon wallet private key for signing transactions on-chain.',
+      why:'Live trading on Polymarket requires signing transactions with a wallet key. In OBSERVE mode, this is optional but enables balance checking.',
+      steps:['Export your private key from MetaMask or your wallet provider','This should be the wallet funded with USDC on Polygon','Ensure the wallet has some MATIC for gas fees','Paste the key below (stored in .env.local, never logged)'],
+      fields:[{id:'wiz_wallet',label:'Private Key',type:'password',placeholder:'0x... (64 hex chars)',env:'POLYMARKET_PRIVATE_KEY'}],
+      testBtn:null,
+      defaults:'Key is validated as a 64-character hex string. Stored in .env.local on disk. Never printed in logs or UI (redacted to first/last 4 chars).',
+    },
+    'capital':{
+      num:'Step 3 of 5',title:'Fund Capital Allocation',
+      what:'Set how much USDC you want ZVI to manage. This is a bookkeeping limit, not a transfer.',
+      why:'Position sizing uses Kelly Criterion relative to your fund size. Setting this correctly prevents over-allocation and enables proper risk management.',
+      steps:['Enter the total USDC amount you want to allocate','This should match your actual wallet USDC balance','Start small (recommended: $1,000-$5,000 for initial testing)','You can adjust this anytime in Settings'],
+      fields:[{id:'wiz_capital',label:'Fund Size (USDC)',type:'number',placeholder:'6000',env:'_capital'}],
+      testBtn:null,
+      defaults:'Default fund size: $6,000. Max per-market exposure: $500. Daily max: $2,000. All configurable in Settings > Risk Limits.',
+    },
+    'risks':{
+      num:'Step 4 of 5',title:'Approve Risk Limits',
+      what:'Review and approve the position sizing limits that constrain all trading activity.',
+      why:'Risk limits are the safety guardrails. No trade can exceed these limits even if an agent requests it. Combined with OBSERVE mode and Kill Switch, this creates a multi-layer safety system.',
+      steps:['Review the current risk limits below','Adjust if needed in Settings > Risk Limits','Click "Approve Limits" to unlock the approvals workflow','You can always re-review limits later'],
+      fields:[],
+      testBtn:null,
+      defaults:'Conservative defaults: $500/market, $2,000/day, 2% min edge, $100 min liquidity. OBSERVE mode is ON by default — no trades execute without your explicit switch to LIVE.',
+    },
+    'trade':{
+      num:'Step 5 of 5',title:'Approvals & Decisions',
+      what:'Once the above steps are complete, strategy agents will surface opportunities for your review.',
+      why:'ZVI never auto-executes in this phase. Every potential trade flows through the Approval Queue where you can approve, reject, or pass. You are the final decision-maker.',
+      steps:['Agents scan markets and find opportunities','Qualifying opportunities appear in the Approval Queue tab','You review each with full explainability (math, assumptions, risks)','Approve to simulate/execute, or Reject/Pass to skip'],
+      fields:[],
+      testBtn:null,
+      defaults:'In OBSERVE mode: approved trades are simulated only. Switch to LIVE mode + enable agent allowLive to execute real orders. Kill Switch halts everything instantly.',
+    },
+  };
+  const w=wizards[stepId];if(!w)return;
+  const fieldsHtml=w.fields.map(f=>'<div class="wizard-field"><label>'+f.label+'</label><input type="'+f.type+'" id="'+f.id+'" placeholder="'+f.placeholder+'"></div>').join('');
+  const stepsHtml=w.steps.map((s,i)=>'<div style="display:flex;gap:8px;align-items:flex-start;margin-bottom:6px"><span style="font-family:var(--mono);font-size:11px;color:var(--cyan);min-width:18px">'+(i+1)+'.</span><span style="font-size:12px;color:var(--t2)">'+s+'</span></div>').join('');
+  let riskHtml='';
+  if(stepId==='risks'&&blockerData){
+    const rl=blockerData.blockers?.find(b=>b.id==='risks');
+    if(rl?.limits)riskHtml='<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:10px 0">'+Object.entries(rl.limits).map(([k,v])=>'<div style="padding:6px 8px;background:rgba(0,0,0,.15);border-radius:4px"><div style="font-size:8px;color:var(--t3);font-family:var(--mono);text-transform:uppercase">'+k.replace(/([A-Z])/g,' $1').trim()+'</div><div style="font-size:14px;font-weight:700;font-family:var(--mono)">'+v+'</div></div>').join('')+'</div>';
+  }
+  document.getElementById('marketModal').innerHTML='<div class="wizard-overlay" onclick="closeModal(event)"><div class="wizard" onclick="event.stopPropagation()"><div class="wizard-h"><div><span class="step-num">'+w.num+'</span><h2>'+w.title+'</h2></div><button class="modal-x" onclick="closeModal()">X</button></div><div class="wizard-body"><div class="wizard-section"><h4>What is this?</h4><p>'+w.what+'</p></div><div class="wizard-section"><h4>Why is it needed?</h4><p>'+w.why+'</p></div><div class="wizard-section"><h4>Steps</h4>'+stepsHtml+'</div>'+(fieldsHtml?'<div class="wizard-section"><h4>Configure</h4>'+fieldsHtml+'</div>':'')+riskHtml+'<div class="wizard-section"><h4>Defaults & Safety</h4><p style="font-size:11px;color:var(--t3);font-family:var(--mono)">'+w.defaults+'</p></div></div><div class="wizard-footer"><span class="test-result" id="wizTestResult"></span>'+(w.testBtn?'<button class="btn btn-sm" onclick="wizTest(\\''+w.testFn+'\\')">'+w.testBtn+'</button>':'')+(stepId==='risks'?'<button class="btn btn-g" onclick="wizApproveRisks()">Approve Limits</button>':'')+(stepId==='capital'?'<button class="btn btn-g" onclick="wizSetCapital()">Confirm Fund Size</button>':'')+(w.fields.length>0&&stepId!=='capital'?'<button class="btn btn-p" onclick="wizSaveFields(\\''+stepId+'\\')">Save</button>':'')+'</div></div></div>';
+}
+
+async function wizTest(fn){
+  const el=document.getElementById('wizTestResult');el.textContent='Testing...';el.className='test-result';
+  try{
+    let r;
+    if(fn==='testPolymarket')r=await post('/api/test/polymarket',{});
+    else if(fn==='testLLM')r=await post('/api/test/llm',{});
+    else if(fn==='testPolygon')r=await post('/api/test/polygon',{});
+    else if(fn==='testClob')r=await post('/api/test/clob',{});
+    el.textContent=r.ok?r.message:('FAIL: '+r.message);
+    el.className='test-result '+(r.ok?'test-ok':'test-fail');
+  }catch(e){el.textContent='Error: '+e.message;el.className='test-result test-fail';}
+}
+
+async function wizSaveFields(stepId){
+  const u={};
+  if(stepId==='api-keys'){
+    ['wiz_api_key:POLYMARKET_API_KEY','wiz_api_secret:POLYMARKET_API_SECRET','wiz_api_pass:POLYMARKET_API_PASSPHRASE'].forEach(pair=>{
+      const[id,env]=pair.split(':');const el=document.getElementById(id);if(el?.value.trim())u[env]=el.value.trim();
+    });
+  }else if(stepId==='wallet'){
+    const el=document.getElementById('wiz_wallet');if(el?.value.trim())u.POLYMARKET_PRIVATE_KEY=el.value.trim();
+  }
+  if(!Object.keys(u).length){toast('Enter values first','error');return;}
+  try{const r=await post('/api/founder/update-env',u);if(r.ok){toast('Saved '+r.updated.length+' key(s)','success');closeModal();fetchBlockers();}}catch(e){toast('Failed: '+e.message,'error');}
+}
+
+async function wizSetCapital(){
+  const v=parseInt(document.getElementById('wiz_capital')?.value);
+  if(!v||v<100){toast('Minimum $100','error');return;}
+  try{const r=await post('/api/founder/set-capital',{fundSize:v});if(r.ok){blockerData=r.blockers;toast('Fund size: $'+v.toLocaleString(),'success');closeModal();renderAQ();renderFundBar();}}catch(e){toast('Failed','error');}
+}
+
+async function wizApproveRisks(){
+  try{const r=await post('/api/founder/approve-risks',{});if(r.ok){blockerData=r.blockers;tradingUnlocked=r.blockers.allClear;toast('Risk limits approved','success');closeModal();renderAQ();if(opps.length)renderOpps();}}catch(e){toast('Failed','error');}
+}
+
+// Founder Console
+function switchHubTab(tab){
+  document.getElementById('hubChat').style.display=tab==='chat'?'flex':'none';
+  document.getElementById('hubReport').style.display=tab==='report'?'block':'none';
+  document.getElementById('hubActivity').style.display=tab==='activity'?'block':'none';
+  ['hubTabChat','hubTabReport','hubTabActivity'].forEach(id=>{const el=document.getElementById(id);if(el){el.className='btn btn-sm';el.style.borderBottom='';}});
+  const active=document.getElementById('hubTab'+tab.charAt(0).toUpperCase()+tab.slice(1));
+  if(active){active.className='btn btn-p btn-sm';active.style.borderBottom='2px solid var(--cyan)';}
+  if(tab==='report')fetchSystemReport();
+  if(tab==='activity'){fetchSysStatus();fetchActLog();}
+}
+
+async function sendConsoleMsg(){
+  const inp=document.getElementById('consoleInput');const q=inp.value.trim();if(!q)return;inp.value='';
+  const msgs=document.getElementById('consoleMessages');
+  msgs.innerHTML+='<div class="console-msg user">'+esc(q)+'</div>';
+  msgs.innerHTML+='<div class="console-msg system" id="consoleLoading" style="opacity:.5">Thinking...</div>';
+  msgs.scrollTop=msgs.scrollHeight;
+  try{
+    const r=await post('/api/console',{question:q});
+    const loading=document.getElementById('consoleLoading');if(loading)loading.remove();
+    msgs.innerHTML+='<div class="console-msg '+(r.source||'system')+'">'+esc(r.answer||'No response')+'</div>';
+    msgs.scrollTop=msgs.scrollHeight;
+  }catch(e){
+    const loading=document.getElementById('consoleLoading');if(loading)loading.remove();
+    msgs.innerHTML+='<div class="console-msg system test-fail">Error: '+esc(e.message)+'</div>';
+  }
+}
+
+async function fetchSystemReport(){
+  try{
+    const r=await api('/api/system-report');
+    const grid=document.getElementById('reportGrid');
+    if(!r.sections){grid.innerHTML='<div class="empty"><p>Failed to load report</p></div>';return;}
+    grid.innerHTML='<div style="font-size:10px;color:var(--t3);font-family:var(--mono);margin-bottom:8px">Generated: '+new Date(r.generated).toLocaleString()+'</div>'+
+      r.sections.map(s=>'<div class="report-section"><h4>'+esc(s.title)+'</h4>'+
+        s.items.map(i=>'<div class="report-item"><div class="ri-name"><span class="diag-status ds-'+(i.status||'unknown')+'" style="margin-right:6px">'+esc(i.status||'?')+'</span>'+esc(i.name)+'</div><div class="ri-detail">'+esc(i.detail)+'</div></div>').join('')+
+      '</div>').join('');
+  }catch(e){document.getElementById('reportGrid').innerHTML='<div class="empty"><p>Failed: '+esc(e.message)+'</p></div>';}
+}
+
 // Countdown
 function startCountdown(){if(countdownInterval)clearInterval(countdownInterval);refreshCountdown=30;countdownInterval=setInterval(()=>{refreshCountdown--;const el=document.getElementById('rTimer');if(el)el.textContent=refreshCountdown+'s';if(refreshCountdown<=0){refreshCountdown=30;fetchOpps();}},1000);}
 
@@ -1724,7 +2166,7 @@ function startCountdown(){if(countdownInterval)clearInterval(countdownInterval);
 window.onerror=function(msg,src,line,col,err){document.getElementById('oppTable').innerHTML='<div class="empty" style="color:var(--red)"><p>JS Error: '+msg+'</p><p style="font-size:10px">'+src+':'+line+':'+col+'</p></div>';};
 function init(){
   try{
-    loadCfg();renderAQ();renderFundBar();renderOpps();
+    applyTheme();loadCfg();renderAQ();renderFundBar();renderOpps();
     fetchBlockers().catch(()=>{});fetchOpps().catch(()=>{});startCountdown();
     setInterval(fetchBlockers,30000);setInterval(()=>{agents.length&&fetchAgents();},30000);
     setTimeout(()=>api('/api/diagnostics').catch(()=>{}),2000);
@@ -1880,6 +2322,35 @@ async function handleRequest(req, res) {
     if (pathname === '/api/diagnostics' && method === 'GET') {
       const results = await runDiagnostics();
       return jsonResp(res, { results, lastRun: store.diagnostics.lastRun });
+    }
+
+    // Test endpoints
+    if (pathname === '/api/test/polymarket' && method === 'POST') {
+      const result = await testPolymarketAuth();
+      return jsonResp(res, result);
+    }
+    if (pathname === '/api/test/llm' && method === 'POST') {
+      const body = await readBody(req).catch(() => ({}));
+      const result = await testLLMApi(body.provider);
+      return jsonResp(res, result);
+    }
+    if (pathname === '/api/test/polygon' && method === 'POST') {
+      const result = await testPolygonRpc();
+      return jsonResp(res, result);
+    }
+    if (pathname === '/api/test/clob' && method === 'POST') {
+      const result = await testClobAuth();
+      return jsonResp(res, result);
+    }
+
+    // Founder Console
+    if (pathname === '/api/console' && method === 'POST') {
+      const body = await readBody(req);
+      const result = await founderConsoleChat(body.question || '');
+      return jsonResp(res, result);
+    }
+    if (pathname === '/api/system-report' && method === 'GET') {
+      return jsonResp(res, generateSystemReport());
     }
 
     // Commander
