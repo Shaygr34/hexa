@@ -70,6 +70,8 @@ const store = {
     riskManager: { lastSeen: Date.now(), status: 'idle', interval: 120000 },
   },
   killSwitch: false,
+  demoAutoApprove: false,
+  demoAutoApproveStats: { approved: 0, rejected: 0, lastRunAt: null, startedAt: null },
   totalScans: 0,
   totalMarketsScanned: 0,
   pinnedMarkets: [],
@@ -167,6 +169,81 @@ function executeDemoTrade(approval) {
   return exec;
 }
 
+// ── Demo Auto-Approve Loop ──
+let demoAutoApproveTimer = null;
+const DEMO_AUTO_APPROVE_INTERVAL = 15000; // 15 seconds
+
+function demoAutoApproveLoop() {
+  if (!store.demoAutoApprove || store.killSwitch) return;
+
+  const pending = store.approvalsQueue.filter(a => a.status === 'pending');
+  if (pending.length === 0) return;
+
+  let approved = 0, skipped = 0;
+  for (const item of pending) {
+    // Validate: must have positive expected edge or be from a qualifying strategy
+    const edge = item.expectedEdge || item.payload?.edgePct || item.payload?.netEdge || 0;
+    const agent = store.agents.find(a => a.id === item.agentId);
+    if (!agent || agent.status !== 'running') { skipped++; continue; }
+
+    // Skip if edge is negative or zero (not a valid trade)
+    if (edge <= 0 && item.payload?.action !== 'SENTIMENT_ALERT' && item.payload?.action !== 'WHALE_ALERT') {
+      skipped++;
+      continue;
+    }
+
+    // Skip if max open positions reached
+    const openCount = Object.keys(store.positions).length;
+    if (openCount >= (getRiskLimits().maxOpenPositions || 20)) { skipped++; continue; }
+
+    // Auto-approve: execute as demo trade
+    item.status = 'approved';
+    item.autoApproved = true;
+    item.approvedAt = new Date().toISOString();
+    audit('info', 'demo_auto_approved', { id: item.id, edge, agentId: item.agentId, rationale: item.rationale });
+    logActivity('decision', 'AUTO-APPROVED (demo): ' + (item.payload?.title || item.rationale || '').slice(0, 60));
+
+    // Execute demo trade (never real, regardless of config)
+    if (item.payload) {
+      const exec = executeDemoTrade(item);
+      item.execution = exec;
+    }
+
+    if (agent) agent.stats.approvalsPending = Math.max(0, (agent.stats.approvalsPending || 0) - 1);
+    approved++;
+    store.demoAutoApproveStats.approved++;
+  }
+
+  if (approved > 0 || skipped > 0) {
+    store.demoAutoApproveStats.lastRunAt = new Date().toISOString();
+    audit('info', 'demo_auto_approve_tick', { approved, skipped, pendingRemaining: store.approvalsQueue.filter(a => a.status === 'pending').length });
+    markDirty();
+  }
+}
+
+function startDemoAutoApprove() {
+  if (demoAutoApproveTimer) return;
+  store.demoAutoApprove = true;
+  store.demoAutoApproveStats.startedAt = new Date().toISOString();
+  demoAutoApproveTimer = setInterval(demoAutoApproveLoop, DEMO_AUTO_APPROVE_INTERVAL);
+  // Run immediately
+  setTimeout(demoAutoApproveLoop, 1000);
+  logActivity('system', 'DEMO AUTO-APPROVE MODE ENABLED — all qualifying recommendations will be auto-executed as demo trades');
+  audit('warn', 'demo_auto_approve_enabled', {});
+  markDirty();
+}
+
+function stopDemoAutoApprove() {
+  if (demoAutoApproveTimer) {
+    clearInterval(demoAutoApproveTimer);
+    demoAutoApproveTimer = null;
+  }
+  store.demoAutoApprove = false;
+  logActivity('system', 'Demo auto-approve mode DISABLED');
+  audit('info', 'demo_auto_approve_disabled', { stats: store.demoAutoApproveStats });
+  markDirty();
+}
+
 function markToMarket() {
   const markets = store.marketCache.data;
   let totalUnrealized = 0;
@@ -230,6 +307,7 @@ function saveState() {
       auditLog: store.auditLog.slice(-500), whaleWallets: store.whaleWallets,
       founder: store.founder, settings: store.settings,
       pinnedMarkets: store.pinnedMarkets, killSwitch: store.killSwitch,
+      demoAutoApprove: store.demoAutoApprove, demoAutoApproveStats: store.demoAutoApproveStats,
       findingsRing: {
         negrisk_arb: (store.findingsRing.negrisk_arb || []).slice(-50),
         llm_probability: (store.findingsRing.llm_probability || []).slice(-50),
@@ -260,6 +338,8 @@ function loadState() {
     if (data.settings) Object.assign(store.settings, data.settings);
     if (data.pinnedMarkets) store.pinnedMarkets = data.pinnedMarkets;
     if (data.killSwitch !== undefined) store.killSwitch = data.killSwitch;
+    if (data.demoAutoApprove !== undefined) store.demoAutoApprove = data.demoAutoApprove;
+    if (data.demoAutoApproveStats) Object.assign(store.demoAutoApproveStats, data.demoAutoApproveStats);
     if (data.findingsRing) Object.assign(store.findingsRing, data.findingsRing);
     if (data.proposalsRing) store.proposalsRing = data.proposalsRing;
     if (data.manualProbabilities) store.manualProbabilities = data.manualProbabilities;
@@ -2276,6 +2356,8 @@ function getConfig() {
     mode: process.env.OBSERVATION_ONLY === 'true' ? 'OBSERVATION_ONLY' : 'LIVE',
     autoExec: process.env.AUTO_EXEC === 'true',
     killSwitch: store.killSwitch,
+    demoAutoApprove: store.demoAutoApprove,
+    demoAutoApproveStats: store.demoAutoApproveStats,
     manualApproval: process.env.MANUAL_APPROVAL_REQUIRED !== 'false',
     secrets: {
       polygonRpc: !!process.env.POLYGON_RPC_URL,
@@ -2397,7 +2479,8 @@ function getSystemStatus() {
     marketsInCache: store.marketCache.data.length,
     dataSource: store.agentHeartbeats.scanner.status === 'demo' ? 'demo' : 'live',
     secrets: cfg.secrets, riskLimits: cfg.riskLimits, settings: store.settings,
-    killSwitch: store.killSwitch, agentsCount: store.agents.length,
+    killSwitch: store.killSwitch, demoAutoApprove: store.demoAutoApprove, demoAutoApproveStats: store.demoAutoApproveStats,
+    agentsCount: store.agents.length,
     pendingApprovals: store.approvalsQueue.filter(a => a.status === 'pending').length,
     founder: {
       capitalAllocated: store.founder.capitalAllocated, fundSize: store.founder.fundSize,
@@ -2738,6 +2821,7 @@ body{background:var(--bg0);color:var(--t1);font-family:var(--sans);font-size:14p
 .mode-obs{background:rgba(245,158,11,.15);color:var(--yellow);border:1px solid rgba(245,158,11,.3)}
 .mode-live{background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.3);animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{border-color:rgba(239,68,68,.3)}50%{border-color:rgba(239,68,68,.7)}}
+@keyframes demoPulse{0%,100%{border-color:rgba(234,179,8,.3)}50%{border-color:rgba(234,179,8,.7)}}
 .secret-badges{display:flex;gap:6px}
 .secret-badge{display:flex;align-items:center;gap:4px;padding:3px 8px;border-radius:3px;font-size:10px;font-family:var(--mono);background:var(--bg2);border:1px solid var(--bd)}
 .dot{width:6px;height:6px;border-radius:50%}.dot-g{background:var(--green);box-shadow:0 0 4px var(--green)}.dot-r{background:var(--red);box-shadow:0 0 4px var(--red)}
@@ -2947,7 +3031,13 @@ body{padding-bottom:50px}
 </div>
 <div class="content">
   <div class="panel active" id="panel-home">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="font-size:15px">Founder Decision Dashboard</h3><button class="btn btn-p btn-sm" onclick="loadHomepage()">Refresh</button></div>
+    <div id="demoModeBanner" style="display:none;padding:10px 16px;background:linear-gradient(135deg,rgba(234,179,8,.12),rgba(234,179,8,.04));border:1px solid rgba(234,179,8,.3);border-radius:8px;margin-bottom:14px;animation:demoPulse 2s infinite">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div><span style="font-size:13px;font-weight:700;color:var(--yellow);font-family:var(--mono)">DEMO AUTO-APPROVE ACTIVE</span><span style="font-size:11px;color:var(--t2);margin-left:12px" id="demoModeSubtext">All qualifying recommendations auto-execute as demo trades</span></div>
+        <div style="display:flex;align-items:center;gap:10px"><span id="demoModeStats" style="font-size:10px;font-family:var(--mono);color:var(--t3)"></span><button class="btn btn-r btn-sm" onclick="toggleDemoMode()">Stop</button></div>
+      </div>
+    </div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="font-size:15px">Founder Decision Dashboard</h3><div style="display:flex;gap:8px;align-items:center"><button class="btn btn-sm" id="demoModeBtn" onclick="toggleDemoMode()" style="background:rgba(234,179,8,.15);color:var(--yellow);border:1px solid rgba(234,179,8,.3)">Demo Mode: OFF</button><button class="btn btn-p btn-sm" onclick="loadHomepage()">Refresh</button></div></div>
     <div class="ss" id="homeSummary"></div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px" id="homeGrid">
       <div id="homeAgents" class="tw" style="padding:14px"><div class="th-title" style="margin-bottom:8px">Active Agents</div><div style="color:var(--t3);font-size:11px">Loading...</div></div>
@@ -3089,6 +3179,7 @@ async function loadCfg() {
     const badges=[{k:'polymarketGamma',l:'Polymarket'},{k:'anthropicKey',l:'Anthropic'},{k:'polygonRpc',l:'Polygon'},{k:'xaiKey',l:'xAI'}];
     document.getElementById('secBadges').innerHTML = badges.map(b=>'<div class="secret-badge"><span class="dot '+(c.secrets[b.k]?'dot-g':'dot-r')+'"></span>'+b.l+'</div>').join('');
     if(c.killSwitch){killSwitch=true;document.getElementById('killBtn').classList.add('active');}
+    if(c.demoAutoApprove){demoModeActive=true;updateDemoModeUI();if(c.demoAutoApproveStats)updateDemoModeStats(c.demoAutoApproveStats);}
   } catch(e){}
 }
 
@@ -3098,6 +3189,38 @@ async function toggleKillSwitch(){
   try { const r = await post('/api/kill-switch', {active:newState});
     if(r.ok){killSwitch=newState;document.getElementById('killBtn').classList.toggle('active',newState);toast(newState?'KILL SWITCH ON':'Kill switch off',newState?'error':'success');}
   } catch(e){toast('Failed','error');}
+}
+
+// Demo Auto-Approve Mode
+let demoModeActive = false;
+async function toggleDemoMode() {
+  const newState = !demoModeActive;
+  if (newState && !confirm('Enable DEMO AUTO-APPROVE?\\n\\nAll qualifying agent recommendations will be automatically executed as simulated demo trades.\\n\\nNo real money is involved. Continue?')) return;
+  try {
+    const r = await post('/api/demo-mode', { active: newState });
+    if (r.ok !== undefined) {
+      demoModeActive = r.active;
+      updateDemoModeUI();
+      toast(demoModeActive ? 'DEMO AUTO-APPROVE ON' : 'Demo auto-approve off', demoModeActive ? 'success' : 'info');
+      loadHomepage();
+    }
+  } catch(e) { toast('Failed: ' + e.message, 'error'); }
+}
+function updateDemoModeUI() {
+  const banner = document.getElementById('demoModeBanner');
+  const btn = document.getElementById('demoModeBtn');
+  if (banner) banner.style.display = demoModeActive ? 'block' : 'none';
+  if (btn) {
+    btn.textContent = demoModeActive ? 'Demo Mode: ON' : 'Demo Mode: OFF';
+    btn.style.background = demoModeActive ? 'rgba(234,179,8,.3)' : 'rgba(234,179,8,.15)';
+    btn.style.fontWeight = demoModeActive ? '700' : '400';
+  }
+}
+function updateDemoModeStats(stats) {
+  const el = document.getElementById('demoModeStats');
+  if (el && stats) {
+    el.textContent = 'approved: ' + (stats.approved || 0) + ' | last: ' + (stats.lastRunAt ? new Date(stats.lastRunAt).toLocaleTimeString() : 'never');
+  }
 }
 
 // Opportunities
@@ -3764,6 +3887,12 @@ async function loadHomepage() {
     // Ledger
     const ledger = await api('/api/ledger');
     document.getElementById('homeLedger').innerHTML = '<div class="th-title" style="margin-bottom:8px">Recent Trades (Demo)</div>' + (ledger.ledger.length ? ledger.ledger.slice(0,8).map(t => '<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--bd);font-size:10px;font-family:var(--mono)"><span style="color:var(--cyan)">'+(t.side||'?')+'</span><span style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc((t.marketTitle||'').slice(0,30))+'</span><span>$'+(t.size||0).toFixed(0)+'</span><span style="color:var(--t3)">'+new Date(t.ts).toLocaleTimeString()+'</span></div>').join('') : '<div style="color:var(--t3);font-size:11px">No demo trades yet. Approve opportunities to simulate.</div>');
+    // Demo mode state
+    if (d.demoAutoApprove !== undefined) {
+      demoModeActive = d.demoAutoApprove;
+      updateDemoModeUI();
+      if (d.demoAutoApproveStats) updateDemoModeStats(d.demoAutoApproveStats);
+    }
   } catch(e) { console.error('[home]', e); }
 }
 
@@ -3811,7 +3940,7 @@ function init(){
     applyTheme();loadCfg();renderAQ();renderFundBar();
     fetchBlockers().catch(()=>{});fetchOpps().catch(()=>{});startCountdown();
     loadHomepage().catch(()=>{});
-    setInterval(fetchBlockers,30000);setInterval(()=>{agents.length&&fetchAgents();},30000);
+    setInterval(fetchBlockers,30000);setInterval(()=>{agents.length&&fetchAgents();},30000);setInterval(()=>{if(demoModeActive)loadHomepage().catch(()=>{});},20000);
     setTimeout(()=>api('/api/diagnostics').catch(()=>{}),2000);
   }catch(e){
     console.error('[init]',e);
@@ -3987,6 +4116,21 @@ async function handleRequest(req, res) {
       logActivity('system', store.killSwitch ? 'KILL SWITCH ACTIVATED' : 'Kill switch off');
       markDirty();
       return jsonResp(res, { ok: true, killSwitch: store.killSwitch });
+    }
+
+    // Demo Auto-Approve Mode
+    if (pathname === '/api/demo-mode' && method === 'GET') {
+      return jsonResp(res, { active: store.demoAutoApprove, stats: store.demoAutoApproveStats });
+    }
+    if (pathname === '/api/demo-mode' && method === 'POST') {
+      const body = await readBody(req);
+      const enable = !!body.active;
+      if (enable && !store.demoAutoApprove) {
+        startDemoAutoApprove();
+      } else if (!enable && store.demoAutoApprove) {
+        stopDemoAutoApprove();
+      }
+      return jsonResp(res, { ok: true, active: store.demoAutoApprove, stats: store.demoAutoApproveStats });
     }
 
     // Headlines
@@ -4202,6 +4346,7 @@ async function handleRequest(req, res) {
         costBurn: { today: costToday.total, lastHour: costHour.total, dailyCap: store.costBudgets.globalDailyCap, forecastEOD: costHour.total * 24 },
         marketCoverage: { cached: store.marketCache.data.length, universe: store.marketUniverse.totalUnique, tiersA: store.marketUniverse.tiers.A.length, tiersB: store.marketUniverse.tiers.B.length, tiersC: store.marketUniverse.tiers.C.length, lastScan: store.marketCache.fetchedAt ? new Date(store.marketCache.fetchedAt).toISOString() : null },
         health: { scanner: store.agentHeartbeats.scanner, killSwitch: store.killSwitch, uptime: Math.round((Date.now() - STARTUP_TIME) / 1000) },
+        demoAutoApprove: store.demoAutoApprove, demoAutoApproveStats: store.demoAutoApproveStats,
       });
     }
     if (pathname === '/api/strategy-params' && method === 'POST') {
@@ -4234,6 +4379,11 @@ server.listen(PORT, () => {
   logActivity('system', 'Server started on port ' + PORT);
   autoBootstrap();
   startAgentScheduler();
+  // Resume demo auto-approve if it was active before restart
+  if (store.demoAutoApprove) {
+    startDemoAutoApprove();
+    console.log('  [demo] Auto-approve mode resumed from saved state');
+  }
   // Auto-run diagnostics + first agent scan
   setTimeout(() => runDiagnostics().catch(() => {}), 3000);
   setTimeout(() => runAllAgents().catch(() => {}), 5000);
@@ -4244,7 +4394,7 @@ server.listen(PORT, () => {
   console.log(`  ║   http://localhost:${PORT}                                    ║`);
   console.log('  ║   Mode: ' + (process.env.OBSERVATION_ONLY === 'true' ? 'OBSERVATION ONLY' : 'LIVE') + '                                         ║');
   console.log('  ║   Strategies: NegRisk Arb | LLM Prob | Sentiment | Whales  ║');
-  console.log('  ║   Agents: ' + store.agents.length + ' loaded | Kill Switch: ' + (store.killSwitch ? 'ON' : 'OFF') + '                       ║');
+  console.log('  ║   Agents: ' + store.agents.length + ' loaded | Kill: ' + (store.killSwitch ? 'ON' : 'OFF') + ' | Demo Auto: ' + (store.demoAutoApprove ? 'ON' : 'OFF') + '      ║');
   console.log('  ╚══════════════════════════════════════════════════════════════╝');
   console.log('');
   console.log('  Keys: Polygon=' + (process.env.POLYGON_RPC_URL ? 'YES' : 'NO') + ' Anthropic=' + (process.env.ANTHROPIC_API_KEY ? 'YES' : 'NO') + ' Polymarket=' + (process.env.POLYMARKET_API_KEY ? 'YES' : 'NO') + ' xAI=' + (process.env.XAI_API_KEY ? 'YES' : 'NO'));
