@@ -7,6 +7,7 @@ data/
 .env
 .env.local
 .env.production
+zvi_state.json
 *.log
 .DS_Store
 .env.local
