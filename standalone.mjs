@@ -1159,6 +1159,7 @@ async function parseCommand(text) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function getConfig() {
+  const redact = (v) => { if (!v || v.length < 8) return v ? '***' : ''; return v.slice(0, 4) + '...' + v.slice(-4); };
   return {
     mode: process.env.OBSERVATION_ONLY === 'true' ? 'OBSERVATION_ONLY' : 'LIVE',
     autoExec: process.env.AUTO_EXEC === 'true',
@@ -1167,12 +1168,22 @@ function getConfig() {
     secrets: {
       polygonRpc: !!process.env.POLYGON_RPC_URL,
       anthropicKey: !!process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_API_KEY.length > 10,
-      polymarketGamma: !!process.env.POLYMARKET_GAMMA_URL || true, // default URL works
+      polymarketGamma: !!process.env.POLYMARKET_GAMMA_URL || true,
       polymarketClob: !!process.env.POLYMARKET_API_KEY,
       polymarketPrivateKey: !!process.env.POLYMARKET_PRIVATE_KEY,
       openaiKey: !!process.env.OPENAI_API_KEY,
       xaiKey: !!process.env.XAI_API_KEY,
       telegram: !!process.env.TELEGRAM_BOT_TOKEN,
+    },
+    redacted: {
+      POLYMARKET_API_KEY: redact(process.env.POLYMARKET_API_KEY),
+      POLYMARKET_API_SECRET: redact(process.env.POLYMARKET_API_SECRET),
+      POLYMARKET_API_PASSPHRASE: redact(process.env.POLYMARKET_API_PASSPHRASE),
+      POLYMARKET_PRIVATE_KEY: redact(process.env.POLYMARKET_PRIVATE_KEY),
+      ANTHROPIC_API_KEY: redact(process.env.ANTHROPIC_API_KEY),
+      OPENAI_API_KEY: redact(process.env.OPENAI_API_KEY),
+      XAI_API_KEY: redact(process.env.XAI_API_KEY),
+      POLYGON_RPC_URL: redact(process.env.POLYGON_RPC_URL),
     },
     riskLimits: getRiskLimits(),
   };
@@ -1981,20 +1992,68 @@ function renderHub(h){
 function renderActFeed(log){const el=document.getElementById('actFeed');if(!el)return;if(!log.length){el.innerHTML='<div style="color:var(--t3);font-family:var(--mono);font-size:11px">No activity</div>';return;}el.innerHTML=log.slice(0,80).map(e=>'<div class="act-entry"><span class="act-time">'+new Date(e.timestamp).toLocaleTimeString()+'</span><span class="act-type at-'+e.type+'">'+esc(e.type)+'</span><span class="act-msg">'+esc(e.message)+'</span></div>').join('');}
 
 // Settings
+const API_KEYS_CONFIG = [
+  {env:'POLYMARKET_API_KEY',    label:'Polymarket API Key',     type:'password', group:'polymarket', testFn:'testClob',  testLabel:'Test CLOB'},
+  {env:'POLYMARKET_API_SECRET', label:'Polymarket API Secret',  type:'password', group:'polymarket', testFn:null},
+  {env:'POLYMARKET_API_PASSPHRASE',label:'Polymarket Passphrase',type:'password',group:'polymarket', testFn:null},
+  {env:'POLYMARKET_PRIVATE_KEY',label:'Wallet Private Key',     type:'password', group:'wallet',     testFn:null},
+  {env:'ANTHROPIC_API_KEY',     label:'Anthropic (Claude) Key', type:'password', group:'llm',        testFn:'testLLMAnthropic', testLabel:'Test'},
+  {env:'OPENAI_API_KEY',        label:'OpenAI Key',             type:'password', group:'llm',        testFn:'testLLMOpenAI',    testLabel:'Test'},
+  {env:'XAI_API_KEY',           label:'xAI / Grok Key',        type:'password', group:'llm',        testFn:'testLLMXAI',       testLabel:'Test'},
+  {env:'POLYGON_RPC_URL',       label:'Polygon RPC URL',       type:'text',     group:'infra',      testFn:'testPolygon',      testLabel:'Test RPC'},
+];
 function renderSettings(){
   api('/api/config').then(c=>{
-    let h='<div class="settings-section"><h3>API Connections</h3><div class="settings-grid">'+
-      sI('POLYMARKET_API_KEY','Polymarket API Key',c.secrets.polymarketClob,'password')+sI('POLYMARKET_API_SECRET','Polymarket Secret',c.secrets.polymarketClob,'password')+sI('POLYMARKET_API_PASSPHRASE','Polymarket Passphrase',c.secrets.polymarketClob,'password')+sI('POLYMARKET_PRIVATE_KEY','Wallet Private Key',c.secrets.polymarketPrivateKey,'password')+sI('ANTHROPIC_API_KEY','Anthropic Key',c.secrets.anthropicKey,'password')+sI('OPENAI_API_KEY','OpenAI Key',c.secrets.openaiKey,'password')+sI('XAI_API_KEY','xAI/Grok Key',c.secrets.xaiKey,'password')+sI('POLYGON_RPC_URL','Polygon RPC URL',c.secrets.polygonRpc,'text')+
-      '</div><div style="margin-top:10px"><button class="btn btn-p" onclick="saveKeys()">Save API Keys</button></div></div>';
+    const rd=c.redacted||{};
+    let h='<div class="settings-section"><h3>API Connections</h3><p style="font-size:11px;color:var(--t3);margin-bottom:12px;font-family:var(--mono)">Saved keys show redacted values. Enter a new value to overwrite. Each row saves independently.</p>';
+    h+='<div style="display:flex;flex-direction:column;gap:8px">';
+    API_KEYS_CONFIG.forEach(k=>{
+      const val=rd[k.env]||'';
+      const hasKey=!!val;
+      h+='<div class="set-item" style="flex-direction:row;align-items:center;gap:8px;padding:10px 14px">';
+      h+='<div style="min-width:170px"><label style="display:flex;align-items:center;gap:6px">'+esc(k.label);
+      h+=' <span class="set-st '+(hasKey?'ok':'no')+'">'+(hasKey?'SET':'MISSING')+'</span></label>';
+      if(hasKey)h+='<div style="font-family:var(--mono);font-size:10px;color:var(--t3);margin-top:2px">Current: '+esc(val)+'</div>';
+      h+='</div>';
+      h+='<input type="'+k.type+'" id="set_'+k.env+'" placeholder="'+(hasKey?'Enter new value to replace...':k.label+'...')+'" style="flex:1">';
+      h+='<button class="btn btn-p btn-sm" onclick="saveSingleKey(\\''+k.env+'\\')">Save</button>';
+      if(k.testFn)h+='<button class="btn btn-sm" id="setTest_'+k.env+'" onclick="settingsTest(\\''+k.env+'\\',\\''+k.testFn+'\\',this)">'+k.testLabel+'</button>';
+      h+='</div>';
+    });
+    h+='</div></div>';
     h+='<div class="settings-section"><h3>Risk Limits</h3><div class="settings-grid">'+sN('MAX_EXPOSURE_PER_MARKET','Max Per Market ($)',c.riskLimits.maxExposurePerMarket)+sN('DAILY_MAX_EXPOSURE','Daily Max ($)',c.riskLimits.dailyMaxExposure)+sN('MIN_EDGE_THRESHOLD','Min Edge',c.riskLimits.minEdgeThreshold)+sN('MIN_DEPTH_USDC','Min Depth ($)',c.riskLimits.minDepthUsdc)+'</div><div style="margin-top:10px"><button class="btn btn-p" onclick="saveRiskLimits()">Save Limits</button></div></div>';
     h+='<div class="settings-section"><h3>Trading Mode</h3><div class="settings-grid"><div class="set-item"><label>Mode</label><select id="set_mode"><option value="true" '+(c.mode==='OBSERVATION_ONLY'?'selected':'')+'>Observation Only</option><option value="false" '+(c.mode!=='OBSERVATION_ONLY'?'selected':'')+'>Live Trading</option></select></div></div><div style="margin-top:10px"><button class="btn btn-p" onclick="saveMode()">Save Mode</button></div></div>';
     document.getElementById('settingsContent').innerHTML=h;
   }).catch(()=>{document.getElementById('settingsContent').innerHTML='<div class="empty"><p>Failed to load</p></div>';});
 }
-function sI(k,l,ok,t){return '<div class="set-item"><label>'+l+' <span class="set-st '+(ok?'ok':'no')+'">'+(ok?'OK':'MISSING')+'</span></label><input type="'+t+'" id="set_'+k+'" placeholder="'+l+'..."></div>';}
 function sN(k,l,v){return '<div class="set-item"><label>'+l+'</label><input type="number" id="set_'+k+'" value="'+v+'" step="any"></div>';}
-async function saveKeys(){const ks=['POLYMARKET_API_KEY','POLYMARKET_API_SECRET','POLYMARKET_API_PASSPHRASE','POLYMARKET_PRIVATE_KEY','ANTHROPIC_API_KEY','OPENAI_API_KEY','XAI_API_KEY','POLYGON_RPC_URL'];const u={};ks.forEach(k=>{const el=document.getElementById('set_'+k);if(el?.value.trim())u[k]=el.value.trim();});if(!Object.keys(u).length){toast('Nothing to save','info');return;}try{const r=await post('/api/founder/update-env',u);if(r.ok){toast('Saved '+r.updated.length+' keys','success');ks.forEach(k=>{const el=document.getElementById('set_'+k);if(el)el.value='';});renderSettings();fetchBlockers();}}catch(e){toast('Failed','error');}}
-async function saveRiskLimits(){const u={};['MAX_EXPOSURE_PER_MARKET','DAILY_MAX_EXPOSURE','MIN_EDGE_THRESHOLD','MIN_DEPTH_USDC'].forEach(k=>{const el=document.getElementById('set_'+k);if(el)u[k]=el.value;});try{const r=await post('/api/founder/update-env',u);if(r.ok)toast('Saved','success');}catch(e){toast('Failed','error');}}
+async function saveSingleKey(envKey){
+  const el=document.getElementById('set_'+envKey);
+  if(!el?.value.trim()){toast('Enter a value first','error');return;}
+  try{
+    const u={};u[envKey]=el.value.trim();
+    const r=await post('/api/founder/update-env',u);
+    if(r.ok){toast(envKey.split('_').slice(-1)[0]+' saved','success');el.value='';renderSettings();fetchBlockers();loadCfg();}
+    else toast('Failed: '+(r.error||'unknown'),'error');
+  }catch(e){toast('Save failed: '+e.message,'error');}
+}
+async function settingsTest(envKey,fn,btn){
+  btn.textContent='Testing...';btn.disabled=true;
+  try{
+    let r;
+    if(fn==='testClob')r=await post('/api/test/clob',{});
+    else if(fn==='testPolygon')r=await post('/api/test/polygon',{});
+    else if(fn==='testLLMAnthropic')r=await post('/api/test/llm',{provider:'anthropic'});
+    else if(fn==='testLLMOpenAI')r=await post('/api/test/llm',{provider:'openai'});
+    else if(fn==='testLLMXAI')r=await post('/api/test/llm',{provider:'xai'});
+    else r={ok:false,message:'Unknown test'};
+    btn.textContent=r.ok?'OK':'FAIL';
+    btn.style.color=r.ok?'var(--green)':'var(--red)';
+    toast(r.message||'Test complete',r.ok?'success':'error');
+    setTimeout(()=>{btn.textContent=API_KEYS_CONFIG.find(k=>k.env===envKey)?.testLabel||'Test';btn.style.color='';btn.disabled=false;},3000);
+  }catch(e){btn.textContent='Error';btn.style.color='var(--red)';btn.disabled=false;toast('Test failed','error');}
+}
+async function saveRiskLimits(){const u={};['MAX_EXPOSURE_PER_MARKET','DAILY_MAX_EXPOSURE','MIN_EDGE_THRESHOLD','MIN_DEPTH_USDC'].forEach(k=>{const el=document.getElementById('set_'+k);if(el)u[k]=el.value;});try{const r=await post('/api/founder/update-env',u);if(r.ok)toast('Risk limits saved','success');}catch(e){toast('Failed','error');}}
 async function saveMode(){const el=document.getElementById('set_mode');if(el)try{await post('/api/founder/update-env',{OBSERVATION_ONLY:el.value});toast('Mode saved. Restart for full effect.','success');loadCfg();}catch(e){toast('Failed','error');}}
 
 // Commander
@@ -2027,12 +2086,20 @@ function openWizard(stepId){
   const wizards={
     'api-keys':{
       num:'Step 1 of 5',title:'Connect API Keys',
-      what:'Configure your Polymarket CLOB API credentials so ZVI can read markets and submit orders.',
-      why:'Without CLOB API keys, ZVI can only read public market data via Gamma. To view your positions and execute trades, you need authenticated CLOB access.',
-      steps:['Go to <a href="https://polymarket.com" target="_blank" style="color:var(--cyan)">polymarket.com</a> and log in','Navigate to Settings > API Keys','Generate a new API key pair','Copy the Key, Secret, and Passphrase below'],
-      fields:[{id:'wiz_api_key',label:'API Key',type:'password',placeholder:'Your Polymarket API Key',env:'POLYMARKET_API_KEY'},{id:'wiz_api_secret',label:'API Secret',type:'password',placeholder:'Your Polymarket API Secret',env:'POLYMARKET_API_SECRET'},{id:'wiz_api_pass',label:'Passphrase',type:'password',placeholder:'Your Polymarket Passphrase',env:'POLYMARKET_API_PASSPHRASE'}],
+      what:'Configure all your API keys: Polymarket CLOB for trading, LLM providers for strategies, and Polygon RPC for on-chain data.',
+      why:'Different keys unlock different capabilities. CLOB keys enable trading. LLM keys power the probability and sentiment strategies. Polygon RPC enables balance checks.',
+      steps:['<b>Polymarket CLOB</b> — get keys from polymarket.com > Settings > API Keys','<b>LLM</b> — get Anthropic key from console.anthropic.com, OpenAI from platform.openai.com, or xAI from x.ai','<b>Polygon RPC</b> — get a free URL from alchemy.com or infura.io','Enter each key below and click its Save button'],
+      fields:[
+        {id:'wiz_api_key',label:'Polymarket API Key',type:'password',placeholder:'Polymarket CLOB Key',env:'POLYMARKET_API_KEY'},
+        {id:'wiz_api_secret',label:'Polymarket Secret',type:'password',placeholder:'Polymarket Secret',env:'POLYMARKET_API_SECRET'},
+        {id:'wiz_api_pass',label:'Polymarket Passphrase',type:'password',placeholder:'Polymarket Passphrase',env:'POLYMARKET_API_PASSPHRASE'},
+        {id:'wiz_anthropic',label:'Anthropic Key',type:'password',placeholder:'sk-ant-...',env:'ANTHROPIC_API_KEY'},
+        {id:'wiz_openai',label:'OpenAI Key',type:'password',placeholder:'sk-...',env:'OPENAI_API_KEY'},
+        {id:'wiz_xai',label:'xAI / Grok Key',type:'password',placeholder:'xai-...',env:'XAI_API_KEY'},
+        {id:'wiz_polygon',label:'Polygon RPC URL',type:'text',placeholder:'https://polygon-mainnet.g.alchemy.com/v2/...',env:'POLYGON_RPC_URL'},
+      ],
       testBtn:'Test Polymarket',testFn:'testPolymarket',
-      defaults:'The public Gamma API (gamma-api.polymarket.com) works without keys for market data. CLOB keys are only required for authenticated actions.',
+      defaults:'You don\\'t need all keys to start. The Gamma API (free, no key) provides market data. Add more keys as you enable strategies.',
     },
     'wallet':{
       num:'Step 2 of 5',title:'Connect Wallet',
@@ -2072,14 +2139,15 @@ function openWizard(stepId){
     },
   };
   const w=wizards[stepId];if(!w)return;
-  const fieldsHtml=w.fields.map(f=>'<div class="wizard-field"><label>'+f.label+'</label><input type="'+f.type+'" id="'+f.id+'" placeholder="'+f.placeholder+'"></div>').join('');
+  const fieldsHtml=w.fields.map(f=>'<div class="wizard-field" style="flex-direction:row;align-items:center;gap:8px"><label style="min-width:140px">'+f.label+'</label><input type="'+f.type+'" id="'+f.id+'" data-env="'+f.env+'" placeholder="'+f.placeholder+'" style="flex:1"><button class="btn btn-p btn-sm" onclick="event.stopPropagation();wizSaveSingleField(\\''+f.id+'\\',\\''+f.env+'\\')">Save</button></div>').join('');
   const stepsHtml=w.steps.map((s,i)=>'<div style="display:flex;gap:8px;align-items:flex-start;margin-bottom:6px"><span style="font-family:var(--mono);font-size:11px;color:var(--cyan);min-width:18px">'+(i+1)+'.</span><span style="font-size:12px;color:var(--t2)">'+s+'</span></div>').join('');
   let riskHtml='';
   if(stepId==='risks'&&blockerData){
     const rl=blockerData.blockers?.find(b=>b.id==='risks');
     if(rl?.limits)riskHtml='<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:10px 0">'+Object.entries(rl.limits).map(([k,v])=>'<div style="padding:6px 8px;background:rgba(0,0,0,.15);border-radius:4px"><div style="font-size:8px;color:var(--t3);font-family:var(--mono);text-transform:uppercase">'+k.replace(/([A-Z])/g,' $1').trim()+'</div><div style="font-size:14px;font-weight:700;font-family:var(--mono)">'+v+'</div></div>').join('')+'</div>';
   }
-  document.getElementById('marketModal').innerHTML='<div class="wizard-overlay" onclick="closeModal(event)"><div class="wizard" onclick="event.stopPropagation()"><div class="wizard-h"><div><span class="step-num">'+w.num+'</span><h2>'+w.title+'</h2></div><button class="modal-x" onclick="closeModal()">X</button></div><div class="wizard-body"><div class="wizard-section"><h4>What is this?</h4><p>'+w.what+'</p></div><div class="wizard-section"><h4>Why is it needed?</h4><p>'+w.why+'</p></div><div class="wizard-section"><h4>Steps</h4>'+stepsHtml+'</div>'+(fieldsHtml?'<div class="wizard-section"><h4>Configure</h4>'+fieldsHtml+'</div>':'')+riskHtml+'<div class="wizard-section"><h4>Defaults & Safety</h4><p style="font-size:11px;color:var(--t3);font-family:var(--mono)">'+w.defaults+'</p></div></div><div class="wizard-footer"><span class="test-result" id="wizTestResult"></span>'+(w.testBtn?'<button class="btn btn-sm" onclick="wizTest(\\''+w.testFn+'\\')">'+w.testBtn+'</button>':'')+(stepId==='risks'?'<button class="btn btn-g" onclick="wizApproveRisks()">Approve Limits</button>':'')+(stepId==='capital'?'<button class="btn btn-g" onclick="wizSetCapital()">Confirm Fund Size</button>':'')+(w.fields.length>0&&stepId!=='capital'?'<button class="btn btn-p" onclick="wizSaveFields(\\''+stepId+'\\')">Save</button>':'')+'</div></div></div>';
+  const configNote=w.fields.length>0?'<p style="font-size:10px;color:var(--t3);font-family:var(--mono);margin-bottom:6px">Each field saves independently — click Save next to each field. You don\\'t need to fill them all at once.</p>':'';
+  document.getElementById('marketModal').innerHTML='<div class="wizard-overlay" onclick="closeModal(event)"><div class="wizard" onclick="event.stopPropagation()"><div class="wizard-h"><div><span class="step-num">'+w.num+'</span><h2>'+w.title+'</h2></div><button class="modal-x" onclick="closeModal()">X</button></div><div class="wizard-body"><div class="wizard-section"><h4>What is this?</h4><p>'+w.what+'</p></div><div class="wizard-section"><h4>Why is it needed?</h4><p>'+w.why+'</p></div><div class="wizard-section"><h4>Steps</h4>'+stepsHtml+'</div>'+(fieldsHtml?'<div class="wizard-section"><h4>Configure</h4>'+configNote+fieldsHtml+'</div>':'')+riskHtml+'<div class="wizard-section"><h4>Defaults & Safety</h4><p style="font-size:11px;color:var(--t3);font-family:var(--mono)">'+w.defaults+'</p></div></div><div class="wizard-footer"><span class="test-result" id="wizTestResult"></span>'+(w.testBtn?'<button class="btn btn-sm" onclick="wizTest(\\''+w.testFn+'\\')">'+w.testBtn+'</button>':'')+(stepId==='risks'?'<button class="btn btn-g" onclick="wizApproveRisks()">Approve Limits</button>':'')+(stepId==='capital'?'<button class="btn btn-g" onclick="wizSetCapital()">Confirm Fund Size</button>':'')+'<button class="btn" onclick="closeModal()">Done</button></div></div></div>';
 }
 
 async function wizTest(fn){
@@ -2097,15 +2165,30 @@ async function wizTest(fn){
 
 async function wizSaveFields(stepId){
   const u={};
-  if(stepId==='api-keys'){
-    ['wiz_api_key:POLYMARKET_API_KEY','wiz_api_secret:POLYMARKET_API_SECRET','wiz_api_pass:POLYMARKET_API_PASSPHRASE'].forEach(pair=>{
-      const[id,env]=pair.split(':');const el=document.getElementById(id);if(el?.value.trim())u[env]=el.value.trim();
-    });
-  }else if(stepId==='wallet'){
-    const el=document.getElementById('wiz_wallet');if(el?.value.trim())u.POLYMARKET_PRIVATE_KEY=el.value.trim();
-  }
-  if(!Object.keys(u).length){toast('Enter values first','error');return;}
-  try{const r=await post('/api/founder/update-env',u);if(r.ok){toast('Saved '+r.updated.length+' key(s)','success');closeModal();fetchBlockers();}}catch(e){toast('Failed: '+e.message,'error');}
+  // Gather all wizard input fields with wiz_ prefix
+  document.querySelectorAll('[id^="wiz_"]').forEach(el=>{
+    if(el?.value.trim()&&el.dataset&&el.dataset.env){u[el.dataset.env]=el.value.trim();}
+    else if(el?.value.trim()){
+      // Fallback: map known field IDs to env vars
+      const map={'wiz_api_key':'POLYMARKET_API_KEY','wiz_api_secret':'POLYMARKET_API_SECRET','wiz_api_pass':'POLYMARKET_API_PASSPHRASE',
+        'wiz_wallet':'POLYMARKET_PRIVATE_KEY','wiz_anthropic':'ANTHROPIC_API_KEY','wiz_openai':'OPENAI_API_KEY',
+        'wiz_xai':'XAI_API_KEY','wiz_polygon':'POLYGON_RPC_URL','wiz_capital':'_capital'};
+      if(map[el.id]&&map[el.id]!=='_capital')u[map[el.id]]=el.value.trim();
+    }
+  });
+  if(!Object.keys(u).length){toast('Enter at least one value','error');return;}
+  try{const r=await post('/api/founder/update-env',u);if(r.ok){toast('Saved '+r.updated.length+' key(s)','success');closeModal();fetchBlockers();loadCfg();}}catch(e){toast('Failed: '+e.message,'error');}
+}
+
+async function wizSaveSingleField(fieldId,envKey){
+  const el=document.getElementById(fieldId);
+  if(!el?.value.trim()){toast('Enter a value first','error');return;}
+  try{
+    const u={};u[envKey]=el.value.trim();
+    const r=await post('/api/founder/update-env',u);
+    if(r.ok){toast(envKey.split('_').pop()+' saved','success');el.value='';el.placeholder='Saved! Enter new value to replace...';fetchBlockers();loadCfg();}
+    else toast('Failed: '+(r.error||'unknown'),'error');
+  }catch(e){toast('Save failed: '+e.message,'error');}
 }
 
 async function wizSetCapital(){
