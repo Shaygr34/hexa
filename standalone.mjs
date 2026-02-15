@@ -60,7 +60,10 @@ const store = {
     capitalAllocated: false, fundSize: 6000, risksApproved: false,
     decisions: {}, positions: {}, capitalDeployed: 0, completedSteps: [],
   },
-  settings: { marketLimit: 200, refreshInterval: 30, scanMode: 'volume', minEdgeDisplay: 0 },
+  settings: {
+    marketLimit: 200, refreshInterval: 30, scanMode: 'volume', minEdgeDisplay: 0,
+    scanConcurrency: 3, maxMarketsPerTick: 50, maxLlmCallsPerMin: 10, cacheTTLSec: 60,
+  },
   agentHeartbeats: {
     scanner: { lastSeen: Date.now(), status: 'running', interval: 30000 },
     signalEngine: { lastSeen: Date.now(), status: 'running', interval: 60000 },
@@ -72,6 +75,11 @@ const store = {
   pinnedMarkets: [],
   diagnostics: { lastRun: null, results: {} },
   commandHistory: [],
+  // ─── Strategy Actualization Fields ───
+  findingsRing: { negrisk_arb: [], llm_probability: [], sentiment: [], whale_watch: [] },
+  proposalsRing: [],
+  strategyDiagnostics: {},
+  manualProbabilities: {}, // marketId → { prob: 0.XX, note: '...' }
 };
 
 // ── Persistence ──
@@ -89,6 +97,14 @@ function saveState() {
       auditLog: store.auditLog.slice(-500), whaleWallets: store.whaleWallets,
       founder: store.founder, settings: store.settings,
       pinnedMarkets: store.pinnedMarkets, killSwitch: store.killSwitch,
+      findingsRing: {
+        negrisk_arb: (store.findingsRing.negrisk_arb || []).slice(-50),
+        llm_probability: (store.findingsRing.llm_probability || []).slice(-50),
+        sentiment: (store.findingsRing.sentiment || []).slice(-50),
+        whale_watch: (store.findingsRing.whale_watch || []).slice(-50),
+      },
+      proposalsRing: (store.proposalsRing || []).slice(-100),
+      manualProbabilities: store.manualProbabilities || {},
     };
     fs.writeFileSync(STATE_PATH, JSON.stringify(snap, null, 2), 'utf-8');
     persistDirty = false;
@@ -105,6 +121,9 @@ function loadState() {
     if (data.settings) Object.assign(store.settings, data.settings);
     if (data.pinnedMarkets) store.pinnedMarkets = data.pinnedMarkets;
     if (data.killSwitch !== undefined) store.killSwitch = data.killSwitch;
+    if (data.findingsRing) Object.assign(store.findingsRing, data.findingsRing);
+    if (data.proposalsRing) store.proposalsRing = data.proposalsRing;
+    if (data.manualProbabilities) store.manualProbabilities = data.manualProbabilities;
     console.log('[persist] Loaded state from zvi_state.json');
   } catch { console.log('[persist] No saved state, starting fresh'); }
 }
@@ -345,49 +364,162 @@ function checkRisk(agent, opportunity, action) {
 // STRATEGY RUNNERS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// ── S1: NegRisk Arbitrage Scanner ──
+// ── S1: NegRisk Arbitrage Scanner (with market grouping) ──
+function groupMarketsByEvent(markets) {
+  const groups = {};
+  for (const m of markets) {
+    // Grouping heuristic: use slug prefix, negRisk flag, or question similarity
+    let groupKey = null;
+    // 1) Slug-based grouping: "trump-2028-winner/will-trump-win" → "trump-2028-winner"
+    if (m.slug) {
+      const parts = m.slug.split('/');
+      if (parts.length > 1) groupKey = parts[0];
+      else {
+        // Try matching slug pattern for range markets: "btc-above-100k", "btc-above-150k"
+        const slugBase = m.slug.replace(/-\d+[kmb]?$/i, '').replace(/-above-|-below-|-over-|-under-/g, '-range-');
+        if (slugBase !== m.slug) groupKey = 'range:' + slugBase;
+      }
+    }
+    // 2) If negRisk flagged, try to group with similar questions
+    if (!groupKey && m.negRisk) {
+      // Extract core topic from question
+      const q = (m.market || '').toLowerCase().replace(/[?!.,]/g, '');
+      const words = q.split(/\s+/).filter(w => w.length > 3 && !['will', 'what', 'when', 'does', 'the', 'before', 'after', 'above', 'below'].includes(w));
+      groupKey = 'nr:' + words.slice(0, 4).join('-');
+    }
+    // 3) Fallback: each market is its own group
+    if (!groupKey) groupKey = 'single:' + (m.id || m.conditionId || crypto.randomUUID());
+
+    if (!groups[groupKey]) groups[groupKey] = { key: groupKey, markets: [], slug: m.slug };
+    groups[groupKey].markets.push(m);
+  }
+  return groups;
+}
+
 async function runNegRiskArb(agent) {
   const startTime = Date.now();
+  const diagnostics = { groupsFound: 0, groupsAnalyzed: 0, failedGates: {}, singleMarkets: 0, multiOutcome: 0 };
   try {
     const markets = store.marketCache.data.length > 0 ? store.marketCache.data : await fetchMarkets();
     const negRiskMarkets = markets.filter(m => m.negRisk || m.numOutcomes > 2);
+    const allMarkets = markets; // also check non-negRisk for structural arb
     const minEdge = agent.config.minEdgePct || 0.5;
     const minLiquidity = agent.config.minLiquidity || 1000;
+    const feesPct = agent.config.feesPct || 2.0; // round-trip fees estimate
 
-    const opportunities = negRiskMarkets.map(m => {
-      const sumYes = m.outcomePrices ? m.outcomePrices.reduce((a, b) => a + b, 0) : (m.bestBid + m.bestAsk);
-      const edgePct = sumYes < 1.0 ? (1.0 - sumYes) * 100 : sumYes > 1.0 ? (sumYes - 1.0) * 100 : 0;
-      const direction = sumYes < 1.0 ? 'BUY_ALL_YES' : sumYes > 1.0 ? 'BUY_ALL_NO' : 'NONE';
-      const depthScore = Math.min(m.liquidity / 10000, 1.0);
-      const slippageEst = m.liquidity > 0 ? Math.max(0.1, 500 / m.liquidity * 100) : 99;
-      const netEdge = Math.max(0, edgePct - slippageEst);
-      const confidence = depthScore * 0.4 + Math.min(edgePct / 5, 1.0) * 0.3 + Math.min(m.volume / 1000000, 1.0) * 0.3;
+    // Group markets by event for multi-outcome arb detection
+    const groups = groupMarketsByEvent(allMarkets);
+    diagnostics.groupsFound = Object.keys(groups).length;
 
-      return {
-        id: crypto.randomUUID(), agentId: agent.id, strategyType: 'negrisk_arb',
-        marketId: m.id || m.conditionId, title: m.market,
-        edgePct: parseFloat(edgePct.toFixed(3)), netEdge: parseFloat(netEdge.toFixed(3)),
-        confidence: parseFloat((confidence * 100).toFixed(1)),
-        liquidity: m.liquidity, volume24h: m.volume,
-        action: edgePct >= minEdge && direction !== 'NONE' ? 'ARB_BASKET' : 'PASS',
-        direction, sumYes: parseFloat(sumYes.toFixed(4)),
-        numOutcomes: m.numOutcomes || m.outcomes?.length || 2,
-        requiresApproval: true,
-        depthScore: parseFloat((depthScore * 100).toFixed(0)),
-        slippageEst: parseFloat(slippageEst.toFixed(2)),
-        rationaleSummary: edgePct >= minEdge
-          ? `${direction} arb: sum=${sumYes.toFixed(4)}, edge=${edgePct.toFixed(2)}%, net=${netEdge.toFixed(2)}% after slippage`
-          : `Edge ${edgePct.toFixed(2)}% below threshold ${minEdge}%`,
-        explain: {
-          inputs: { sumYes, outcomes: m.outcomes, outcomePrices: m.outcomePrices, liquidity: m.liquidity, volume: m.volume },
-          math: `sumYes = ${m.outcomePrices?.join(' + ') || `${m.bestBid} + ${m.bestAsk}`} = ${sumYes.toFixed(4)}; edge = |1.0 - ${sumYes.toFixed(4)}| * 100 = ${edgePct.toFixed(2)}%`,
-          assumptions: ['Prices reflect best ask for each outcome', 'Slippage estimated from liquidity depth', 'Assumes simultaneous execution of all legs'],
-          failureModes: ['Partial fill on one leg', 'Price movement during execution', 'Orderbook thin on one outcome', 'Fee structure unknown — may reduce edge'],
-        },
-        timestamp: new Date().toISOString(), status: 'new',
-        link: m.link || 'https://polymarket.com',
-      };
-    }).filter(o => o.edgePct > 0).sort((a, b) => b.edgePct - a.edgePct);
+    const opportunities = [];
+
+    for (const [key, group] of Object.entries(groups)) {
+      diagnostics.groupsAnalyzed++;
+
+      if (group.markets.length >= 2) {
+        // Multi-outcome group: compute sum of YES prices across all outcomes
+        diagnostics.multiOutcome++;
+        const outcomesDetail = group.markets.map(m => ({
+          title: m.market, price: m.bestBid, liquidity: m.liquidity, volume: m.volume, id: m.id || m.conditionId,
+        }));
+        const sumYes = outcomesDetail.reduce((s, o) => s + o.price, 0);
+        const minGroupLiq = Math.min(...outcomesDetail.map(o => o.liquidity));
+        const totalVolume = outcomesDetail.reduce((s, o) => s + o.volume, 0);
+        const edgePct = sumYes < 1.0 ? (1.0 - sumYes) * 100 : sumYes > 1.0 ? (sumYes - 1.0) * 100 : 0;
+        const direction = sumYes < 1.0 ? 'BUY_ALL_YES' : sumYes > 1.0 ? 'BUY_ALL_NO' : 'NONE';
+        const slippageEst = minGroupLiq > 0 ? Math.max(0.1, 500 / minGroupLiq * 100) : 99;
+        const netEdge = Math.max(0, edgePct - slippageEst - feesPct);
+        const depthScore = Math.min(minGroupLiq / 10000, 1.0);
+        const confidence = depthScore * 0.4 + Math.min(edgePct / 5, 1.0) * 0.3 + Math.min(totalVolume / 1000000, 1.0) * 0.3;
+
+        // Apply gates
+        let gateFailReason = null;
+        if (direction === 'NONE') gateFailReason = 'No edge (sum = 1.0)';
+        else if (edgePct < minEdge) gateFailReason = `Edge ${edgePct.toFixed(2)}% below threshold ${minEdge}%`;
+        else if (minGroupLiq < minLiquidity) gateFailReason = `Min liquidity $${minGroupLiq} below threshold $${minLiquidity}`;
+        else if (netEdge <= 0) gateFailReason = `Net edge ${netEdge.toFixed(2)}% after friction (slippage ${slippageEst.toFixed(1)}% + fees ${feesPct}%)`;
+
+        if (gateFailReason) diagnostics.failedGates[gateFailReason] = (diagnostics.failedGates[gateFailReason] || 0) + 1;
+
+        opportunities.push({
+          id: crypto.randomUUID(), agentId: agent.id, strategyType: 'negrisk_arb',
+          marketId: group.markets[0].id || group.markets[0].conditionId, title: group.markets.map(m => m.market).join(' | '),
+          groupKey: key, groupSize: group.markets.length,
+          edgePct: parseFloat(edgePct.toFixed(3)), netEdge: parseFloat(netEdge.toFixed(3)),
+          confidence: parseFloat((confidence * 100).toFixed(1)),
+          liquidity: minGroupLiq, volume24h: totalVolume,
+          action: !gateFailReason ? 'ARB_BASKET' : 'PASS', gateFailReason,
+          direction, sumYes: parseFloat(sumYes.toFixed(4)),
+          numOutcomes: group.markets.length,
+          outcomesDetail,
+          requiresApproval: true,
+          depthScore: parseFloat((depthScore * 100).toFixed(0)),
+          slippageEst: parseFloat(slippageEst.toFixed(2)),
+          feesPct,
+          rationaleSummary: !gateFailReason
+            ? `${direction} arb across ${group.markets.length} outcomes: sum=${sumYes.toFixed(4)}, gross=${edgePct.toFixed(2)}%, net=${netEdge.toFixed(2)}% after ${feesPct}% fees + ${slippageEst.toFixed(1)}% slippage`
+            : gateFailReason,
+          explain: {
+            inputs: { sumYes, outcomes: outcomesDetail, groupKey: key, feesPct, minLiquidity },
+            math: `sumYes = ${outcomesDetail.map(o => o.price.toFixed(3)).join(' + ')} = ${sumYes.toFixed(4)}; grossEdge = |1.0 - ${sumYes.toFixed(4)}| * 100 = ${edgePct.toFixed(2)}%; netEdge = ${edgePct.toFixed(2)}% - ${slippageEst.toFixed(1)}%(slippage) - ${feesPct}%(fees) = ${netEdge.toFixed(2)}%`,
+            assumptions: ['Prices reflect best ask for each outcome', `Slippage estimated from min liquidity ($${minGroupLiq})`, `Fees assumed ${feesPct}% round-trip`, 'Assumes simultaneous execution of all legs'],
+            failureModes: ['Partial fill on one leg', 'Price movement during execution', 'Orderbook thin on one outcome', `Fee may differ from assumed ${feesPct}%`],
+            riskGates: { minEdge, minLiquidity, feesPct, passed: !gateFailReason, failReason: gateFailReason },
+          },
+          timestamp: new Date().toISOString(), status: !gateFailReason ? 'new' : 'gated',
+          link: group.markets[0].link || 'https://polymarket.com',
+        });
+      } else {
+        // Single-market check: standard YES+NO sum
+        diagnostics.singleMarkets++;
+        const m = group.markets[0];
+        if (!m.negRisk && m.numOutcomes <= 2 && !(m.outcomePrices && m.outcomePrices.length > 2)) continue; // skip standard binary markets unless negRisk
+        const sumYes = m.outcomePrices ? m.outcomePrices.reduce((a, b) => a + b, 0) : (m.bestBid + m.bestAsk);
+        const edgePct = sumYes < 1.0 ? (1.0 - sumYes) * 100 : sumYes > 1.0 ? (sumYes - 1.0) * 100 : 0;
+        if (edgePct === 0) continue;
+        const direction = sumYes < 1.0 ? 'BUY_ALL_YES' : 'BUY_ALL_NO';
+        const slippageEst = m.liquidity > 0 ? Math.max(0.1, 500 / m.liquidity * 100) : 99;
+        const netEdge = Math.max(0, edgePct - slippageEst - feesPct);
+        const depthScore = Math.min(m.liquidity / 10000, 1.0);
+        const confidence = depthScore * 0.4 + Math.min(edgePct / 5, 1.0) * 0.3 + Math.min(m.volume / 1000000, 1.0) * 0.3;
+
+        let gateFailReason = null;
+        if (edgePct < minEdge) gateFailReason = `Edge ${edgePct.toFixed(2)}% below threshold ${minEdge}%`;
+        else if (m.liquidity < minLiquidity) gateFailReason = `Liquidity $${m.liquidity} below threshold $${minLiquidity}`;
+        else if (netEdge <= 0) gateFailReason = `Net edge ${netEdge.toFixed(2)}% after friction`;
+        if (gateFailReason) diagnostics.failedGates[gateFailReason] = (diagnostics.failedGates[gateFailReason] || 0) + 1;
+
+        opportunities.push({
+          id: crypto.randomUUID(), agentId: agent.id, strategyType: 'negrisk_arb',
+          marketId: m.id || m.conditionId, title: m.market,
+          groupKey: key, groupSize: 1,
+          edgePct: parseFloat(edgePct.toFixed(3)), netEdge: parseFloat(netEdge.toFixed(3)),
+          confidence: parseFloat((confidence * 100).toFixed(1)),
+          liquidity: m.liquidity, volume24h: m.volume,
+          action: !gateFailReason ? 'ARB_BASKET' : 'PASS', gateFailReason,
+          direction, sumYes: parseFloat(sumYes.toFixed(4)),
+          numOutcomes: m.numOutcomes || m.outcomes?.length || 2,
+          requiresApproval: true,
+          depthScore: parseFloat((depthScore * 100).toFixed(0)),
+          slippageEst: parseFloat(slippageEst.toFixed(2)), feesPct,
+          rationaleSummary: !gateFailReason
+            ? `${direction} arb: sum=${sumYes.toFixed(4)}, edge=${edgePct.toFixed(2)}%, net=${netEdge.toFixed(2)}%`
+            : gateFailReason,
+          explain: {
+            inputs: { sumYes, outcomes: m.outcomes, outcomePrices: m.outcomePrices, liquidity: m.liquidity, volume: m.volume },
+            math: `sumYes = ${m.outcomePrices?.join(' + ') || `${m.bestBid} + ${m.bestAsk}`} = ${sumYes.toFixed(4)}; edge = |1.0 - ${sumYes.toFixed(4)}| * 100 = ${edgePct.toFixed(2)}%; net = ${netEdge.toFixed(2)}%`,
+            assumptions: ['Prices reflect best ask for each outcome', 'Slippage estimated from liquidity depth', `Fees assumed ${feesPct}% round-trip`],
+            failureModes: ['Partial fill on one leg', 'Price movement during execution', 'Orderbook thin on one outcome', 'Fee structure unknown — may reduce edge'],
+            riskGates: { minEdge, minLiquidity, feesPct, passed: !gateFailReason, failReason: gateFailReason },
+          },
+          timestamp: new Date().toISOString(), status: !gateFailReason ? 'new' : 'gated',
+          link: m.link || 'https://polymarket.com',
+        });
+      }
+    }
+
+    // Sort by net edge descending
+    opportunities.sort((a, b) => b.netEdge - a.netEdge);
 
     // Update agent stats
     agent.stats.scanned = negRiskMarkets.length;
@@ -395,20 +527,27 @@ async function runNegRiskArb(agent) {
     agent.health.lastRunAt = new Date().toISOString();
     agent.health.polymarketOk = true;
 
+    // Store findings in ring buffer
+    store.findingsRing.negrisk_arb = opportunities.slice(0, 50);
+    store.strategyDiagnostics.negrisk_arb = diagnostics;
+
     // Push to approvals if qualifying
     opportunities.filter(o => o.action !== 'PASS').forEach(o => {
       if (!store.approvalsQueue.find(a => a.marketId === o.marketId && a.agentId === o.agentId && a.status === 'pending')) {
-        store.approvalsQueue.push({
+        const proposal = {
           id: crypto.randomUUID(), ts: new Date().toISOString(), agentId: agent.id,
           marketId: o.marketId, actionType: o.action, payload: o,
           rationale: o.rationaleSummary, risk: o.explain.failureModes.join('; '),
           expectedEdge: o.edgePct, status: 'pending',
-        });
+        };
+        store.approvalsQueue.push(proposal);
+        store.proposalsRing.unshift(proposal);
+        if (store.proposalsRing.length > 100) store.proposalsRing.length = 100;
         agent.stats.approvalsPending++;
       }
     });
 
-    audit('info', 'negrisk_arb_run', { scanned: negRiskMarkets.length, opportunities: opportunities.length, elapsed: Date.now() - startTime }, agent.id);
+    audit('info', 'negrisk_arb_run', { scanned: negRiskMarkets.length, groups: diagnostics.groupsFound, multiOutcome: diagnostics.multiOutcome, opportunities: opportunities.length, passing: agent.stats.opportunities, elapsed: Date.now() - startTime }, agent.id);
     markDirty();
     return opportunities;
   } catch (err) {
@@ -419,121 +558,210 @@ async function runNegRiskArb(agent) {
   }
 }
 
-// ── S2: LLM Probability Mispricing ──
+// ── S2: LLM Probability Mispricing (with watchlist consumption + manual fallback) ──
 async function runLLMProbability(agent) {
   const startTime = Date.now();
+  const diagnostics = { candidateSource: 'volume', llmCalls: 0, cacheHits: 0, manualInputs: 0, watchlistCandidates: 0, gateFailures: {} };
   try {
     const hasAnthropic = !!process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_API_KEY.length > 10;
     const hasOpenAI = !!process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.length > 10;
+    const hasXAI = !!process.env.XAI_API_KEY && process.env.XAI_API_KEY.length > 5;
+    const hasLLM = hasAnthropic || hasOpenAI || hasXAI;
 
-    if (!hasAnthropic && !hasOpenAI) {
+    // Select candidate markets: sentiment watchlist → pinned → whale-touched → top volume
+    const markets = store.marketCache.data.length > 0 ? store.marketCache.data : await fetchMarkets();
+    const maxCandidates = agent.config.maxCandidates || store.settings.maxMarketsPerTick || 10;
+
+    // Priority 1: Sentiment watchlist markets
+    const watchlistIds = new Set(signalBus.getWatchlistMarkets());
+    const watchlistMarkets = markets.filter(m => watchlistIds.has(m.id || m.conditionId));
+    diagnostics.watchlistCandidates = watchlistMarkets.length;
+    if (watchlistMarkets.length > 0) diagnostics.candidateSource = 'sentiment_watchlist';
+
+    // Priority 2: Pinned markets
+    const pinned = markets.filter(m => store.pinnedMarkets.includes(m.id) && !watchlistIds.has(m.id));
+
+    // Priority 3: Whale-touched markets
+    const whaleIds = new Set(signalBus.getWhaleMarkets());
+    const whaleMarkets = markets.filter(m => whaleIds.has(m.id || m.conditionId) && !watchlistIds.has(m.id) && !store.pinnedMarkets.includes(m.id));
+
+    // Priority 4: Top volume with tight spreads and good liquidity
+    const topVol = markets
+      .filter(m => !watchlistIds.has(m.id) && !store.pinnedMarkets.includes(m.id) && !whaleIds.has(m.id))
+      .filter(m => m.liquidity >= 5000 && m.volume >= 10000) // quality filter
+      .sort((a, b) => b.volume - a.volume)
+      .slice(0, 5);
+
+    const candidates = [...watchlistMarkets, ...pinned, ...whaleMarkets, ...topVol].slice(0, maxCandidates);
+
+    if (!hasLLM && Object.keys(store.manualProbabilities).length === 0) {
+      // No LLM and no manual inputs — show manual mode instruction
       agent.health.llmOk = false;
       agent.health.lastRunAt = new Date().toISOString();
-      agent.health.errors.push({ ts: new Date().toISOString(), msg: 'No LLM API key configured (need ANTHROPIC_API_KEY or OPENAI_API_KEY)' });
-      return [{ id: crypto.randomUUID(), agentId: agent.id, strategyType: 'llm_probability',
-        title: 'LLM Module Disabled', action: 'DISABLED', requiresApproval: false,
-        rationaleSummary: 'Missing API key: configure ANTHROPIC_API_KEY or OPENAI_API_KEY in Settings',
-        explain: { inputs: {}, math: 'N/A', assumptions: [], failureModes: ['No LLM API key'] },
-        timestamp: new Date().toISOString(), status: 'disabled' }];
+      store.strategyDiagnostics.llm_probability = { ...diagnostics, status: 'manual_mode', reason: 'No LLM key. Enter manual probability estimates.' };
+      store.findingsRing.llm_probability = [{
+        id: crypto.randomUUID(), agentId: agent.id, strategyType: 'llm_probability',
+        title: 'MANUAL PROBABILITY MODE', action: 'MANUAL_INPUT_NEEDED', requiresApproval: false,
+        rationaleSummary: 'No LLM API key. You can enter your own probability estimates for any market. Use the LLM Probability tab to input p̂ values.',
+        explain: { inputs: {}, math: 'Manual mode: edge = |your_estimate - market_price| * 100', assumptions: ['Founder expertise'], failureModes: ['Cognitive bias'] },
+        timestamp: new Date().toISOString(), status: 'manual_mode',
+      }];
+      return store.findingsRing.llm_probability;
     }
 
-    // Select candidate markets: pinned first, then top volume
-    const markets = store.marketCache.data.length > 0 ? store.marketCache.data : await fetchMarkets();
-    const pinned = markets.filter(m => store.pinnedMarkets.includes(m.id));
-    const topVol = markets.filter(m => !store.pinnedMarkets.includes(m.id)).sort((a, b) => b.volume - a.volume).slice(0, 5);
-    const candidates = [...pinned, ...topVol].slice(0, 10);
-
     const opportunities = [];
+    const maxLlmCalls = agent.config.maxLlmCalls || store.settings.maxLlmCallsPerMin || 10;
+
     for (const m of candidates) {
-      // Check LLM cache
       const cacheKey = m.id || m.conditionId;
+
+      // Check for manual probability input first
+      const manualProb = store.manualProbabilities[cacheKey];
+
+      // Check LLM cache
       const cached = store.llmCache[cacheKey];
       const cacheTTL = (agent.config.llmCacheTTL || 30) * 60000;
-      if (cached && (Date.now() - cached.timestamp) < cacheTTL) {
+      if (cached && (Date.now() - cached.timestamp) < cacheTTL && !manualProb) {
         opportunities.push(cached.opportunity);
+        diagnostics.cacheHits++;
         continue;
       }
 
-      // Build prompt
-      const brief = `Market: "${m.market}"\nDescription: ${m.description || 'N/A'}\nOutcomes: ${(m.outcomes || ['Yes','No']).join(', ')}\nCurrent YES price: ${m.bestBid}\nCurrent NO price: ${m.bestAsk}\nVolume 24h: $${m.volume}\nExpires: ${m.endDate || 'Unknown'}`;
-      const systemPrompt = 'You are a prediction market analyst. Estimate the TRUE probability of the YES outcome. Be calibrated — account for base rates and known information. Respond in JSON only: {"probability": 0.XX, "confidence": 0.XX, "assumptions": ["..."], "sources": ["..."]}';
+      let llmProb, llmConf, llmModel, llmAssumptions, llmSources, probSource;
 
-      let llmResult = null;
-      try {
-        if (hasAnthropic) {
-          const resp = await httpPost('https://api.anthropic.com/v1/messages', {
-            model: 'claude-sonnet-4-5-20250929', max_tokens: 500,
-            system: systemPrompt,
-            messages: [{ role: 'user', content: brief }],
-          }, { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' });
-          const text = resp.content?.[0]?.text || '';
-          const jsonMatch = text.match(/\{[\s\S]*\}/);
-          if (jsonMatch) llmResult = JSON.parse(jsonMatch[0]);
-        } else if (hasOpenAI) {
-          const resp = await httpPost('https://api.openai.com/v1/chat/completions', {
-            model: 'gpt-4o-mini', max_tokens: 500,
-            messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: brief }],
-          }, { 'Authorization': 'Bearer ' + process.env.OPENAI_API_KEY });
-          const text = resp.choices?.[0]?.message?.content || '';
-          const jsonMatch = text.match(/\{[\s\S]*\}/);
-          if (jsonMatch) llmResult = JSON.parse(jsonMatch[0]);
+      if (manualProb) {
+        // Use founder's manual probability estimate
+        llmProb = parseFloat(manualProb.prob);
+        llmConf = parseFloat(manualProb.confidence || 0.7);
+        llmModel = 'manual_founder_input';
+        llmAssumptions = [manualProb.note || 'Founder manual estimate'];
+        llmSources = ['Founder expertise'];
+        probSource = 'manual';
+        diagnostics.manualInputs++;
+      } else if (hasLLM && diagnostics.llmCalls < maxLlmCalls) {
+        // Call LLM
+        const brief = `Market: "${m.market}"\nDescription: ${m.description || 'N/A'}\nOutcomes: ${(m.outcomes || ['Yes','No']).join(', ')}\nCurrent YES price: ${m.bestBid}\nCurrent NO price: ${m.bestAsk}\nVolume 24h: $${m.volume}\nLiquidity: $${m.liquidity}\nExpires: ${m.endDate || 'Unknown'}`;
+        const systemPrompt = 'You are a superforecaster and prediction market analyst. Estimate the TRUE probability of the YES outcome resolving correctly. Be well-calibrated — account for base rates, reference classes, and known information. Consider both sides. Respond in JSON only: {"probability": 0.XX, "confidence": 0.XX, "key_factors": ["..."], "disqualifiers": ["..."], "time_sensitivity": "high|medium|low", "assumptions": ["..."], "sources": ["..."]}';
+
+        let llmResult = null;
+        try {
+          if (hasAnthropic) {
+            llmModel = 'claude-sonnet-4-5-20250929';
+            const resp = await httpPost('https://api.anthropic.com/v1/messages', {
+              model: llmModel, max_tokens: 600,
+              system: systemPrompt,
+              messages: [{ role: 'user', content: brief }],
+            }, { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' });
+            const text = resp.content?.[0]?.text || '';
+            const jsonMatch = text.match(/\{[\s\S]*\}/);
+            if (jsonMatch) llmResult = JSON.parse(jsonMatch[0]);
+          } else if (hasOpenAI) {
+            llmModel = 'gpt-4o-mini';
+            const resp = await httpPost('https://api.openai.com/v1/chat/completions', {
+              model: llmModel, max_tokens: 600,
+              messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: brief }],
+            }, { 'Authorization': 'Bearer ' + process.env.OPENAI_API_KEY });
+            const text = resp.choices?.[0]?.message?.content || '';
+            const jsonMatch = text.match(/\{[\s\S]*\}/);
+            if (jsonMatch) llmResult = JSON.parse(jsonMatch[0]);
+          } else if (hasXAI) {
+            llmModel = 'grok-2-latest';
+            const resp = await httpPost('https://api.x.ai/v1/chat/completions', {
+              model: llmModel, max_tokens: 600,
+              messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: brief }],
+            }, { 'Authorization': 'Bearer ' + process.env.XAI_API_KEY });
+            const text = resp.choices?.[0]?.message?.content || '';
+            const jsonMatch = text.match(/\{[\s\S]*\}/);
+            if (jsonMatch) llmResult = JSON.parse(jsonMatch[0]);
+          }
+          diagnostics.llmCalls++;
+        } catch (e) {
+          console.error('[llm] API error:', e.message);
+          llmResult = null;
         }
-      } catch (e) {
-        console.error('[llm] API error:', e.message);
-        llmResult = null;
+
+        if (!llmResult) continue;
+        llmProb = parseFloat(llmResult.probability) || 0.5;
+        llmConf = parseFloat(llmResult.confidence) || 0.5;
+        llmAssumptions = llmResult.assumptions || ['LLM estimate based on training data'];
+        llmSources = llmResult.sources || [];
+        probSource = 'llm';
+      } else {
+        continue; // skip if no LLM calls remaining and no manual input
       }
 
-      if (!llmResult) continue;
-
-      const llmProb = parseFloat(llmResult.probability) || 0.5;
-      const llmConf = parseFloat(llmResult.confidence) || 0.5;
       const marketProb = m.bestBid || 0.5;
       const edgePct = (llmProb - marketProb) * 100;
       const absEdge = Math.abs(edgePct);
+      const weightedEdge = absEdge * llmConf; // confidence-weighted edge
       const side = edgePct > 0 ? 'BUY_YES' : edgePct < 0 ? 'BUY_NO' : 'PASS';
+
+      // Gate checks
+      let gateFailReason = null;
+      const minEdge = agent.config.minEdgePct || 2;
+      const minConf = agent.config.minConfidence || 0.4;
+      if (absEdge < minEdge) gateFailReason = `Edge ${absEdge.toFixed(1)}% below threshold ${minEdge}%`;
+      else if (llmConf < minConf) gateFailReason = `Confidence ${(llmConf*100).toFixed(0)}% below threshold ${(minConf*100).toFixed(0)}%`;
+      else if (m.liquidity < (agent.config.minLiquidity || 5000)) gateFailReason = `Liquidity $${m.liquidity} below threshold`;
+      if (gateFailReason) diagnostics.gateFailures[gateFailReason] = (diagnostics.gateFailures[gateFailReason] || 0) + 1;
 
       const opp = {
         id: crypto.randomUUID(), agentId: agent.id, strategyType: 'llm_probability',
         marketId: cacheKey, title: m.market,
-        edgePct: parseFloat(absEdge.toFixed(2)), confidence: parseFloat((llmConf * 100).toFixed(1)),
+        edgePct: parseFloat(absEdge.toFixed(2)), weightedEdge: parseFloat(weightedEdge.toFixed(2)),
+        confidence: parseFloat((llmConf * 100).toFixed(1)),
         liquidity: m.liquidity, volume24h: m.volume,
-        action: absEdge >= (agent.config.minEdgePct || 2) ? side : 'PASS',
+        action: !gateFailReason ? side : 'PASS', gateFailReason,
         requiresApproval: true,
-        llmProbability: llmProb, marketProbability: marketProb, side,
-        rationaleSummary: `LLM estimates ${(llmProb * 100).toFixed(0)}% vs market ${(marketProb * 100).toFixed(0)}% → ${absEdge.toFixed(1)}% edge ${side}`,
+        llmProbability: llmProb, marketProbability: marketProb, side, probSource,
+        rationaleSummary: !gateFailReason
+          ? `${probSource === 'manual' ? 'Manual' : 'LLM'} estimates ${(llmProb * 100).toFixed(0)}% vs market ${(marketProb * 100).toFixed(0)}% → ${absEdge.toFixed(1)}% edge ${side} (conf: ${(llmConf*100).toFixed(0)}%)`
+          : gateFailReason,
         explain: {
-          inputs: { marketPrice: marketProb, llmEstimate: llmProb, confidence: llmConf, model: hasAnthropic ? 'claude-sonnet-4-5-20250929' : 'gpt-4o-mini' },
-          math: `edgePct = (LLM ${llmProb.toFixed(3)} - Market ${marketProb.toFixed(3)}) * 100 = ${edgePct.toFixed(2)}%`,
-          assumptions: llmResult.assumptions || ['LLM estimate based on training data', 'Market may have insider info'],
-          failureModes: ['LLM miscalibration', 'Market has information LLM lacks', 'Resolution criteria ambiguity', 'Low confidence estimate'],
-          sources: llmResult.sources || [],
-          prompt: brief, rawResponse: llmResult,
+          inputs: { marketPrice: marketProb, estimate: llmProb, confidence: llmConf, model: llmModel, source: probSource, candidateSource: watchlistIds.has(cacheKey) ? 'sentiment_watchlist' : whaleIds.has(cacheKey) ? 'whale_signal' : 'volume_ranked' },
+          math: `edge = (${probSource} ${llmProb.toFixed(3)} - market ${marketProb.toFixed(3)}) * 100 = ${edgePct.toFixed(2)}%; weightedEdge = ${absEdge.toFixed(2)}% * ${llmConf.toFixed(2)} = ${weightedEdge.toFixed(2)}%`,
+          assumptions: llmAssumptions,
+          failureModes: ['Model miscalibration', 'Market has information model lacks', 'Resolution criteria ambiguity', 'Low confidence estimate'],
+          sources: llmSources,
+          riskGates: { minEdge, minConf, passed: !gateFailReason, failReason: gateFailReason },
         },
-        timestamp: new Date().toISOString(), status: 'new',
+        timestamp: new Date().toISOString(), status: !gateFailReason ? 'new' : 'gated',
         link: m.link || 'https://polymarket.com',
       };
 
       opportunities.push(opp);
-      store.llmCache[cacheKey] = { opportunity: opp, timestamp: Date.now() };
+      if (probSource === 'llm') store.llmCache[cacheKey] = { opportunity: opp, timestamp: Date.now() };
 
       // Push to approvals if qualifying
-      if (opp.action !== 'PASS') {
-        store.approvalsQueue.push({
-          id: crypto.randomUUID(), ts: new Date().toISOString(), agentId: agent.id,
-          marketId: cacheKey, actionType: opp.action, payload: opp,
-          rationale: opp.rationaleSummary, risk: 'LLM miscalibration; market may have superior info',
-          expectedEdge: opp.edgePct, status: 'pending',
-        });
-        agent.stats.approvalsPending++;
+      if (!gateFailReason) {
+        if (!store.approvalsQueue.find(a => a.marketId === cacheKey && a.agentId === agent.id && a.status === 'pending')) {
+          const proposal = {
+            id: crypto.randomUUID(), ts: new Date().toISOString(), agentId: agent.id,
+            marketId: cacheKey, actionType: opp.action, payload: opp,
+            rationale: opp.rationaleSummary, risk: 'Model miscalibration; market may have superior info',
+            expectedEdge: opp.edgePct, status: 'pending',
+          };
+          store.approvalsQueue.push(proposal);
+          store.proposalsRing.unshift(proposal);
+          if (store.proposalsRing.length > 100) store.proposalsRing.length = 100;
+          agent.stats.approvalsPending++;
+        }
       }
     }
+
+    // Sort by weighted edge
+    opportunities.sort((a, b) => (b.weightedEdge || b.edgePct) - (a.weightedEdge || a.edgePct));
+
+    // Store findings
+    store.findingsRing.llm_probability = opportunities.slice(0, 50);
+    store.strategyDiagnostics.llm_probability = diagnostics;
 
     agent.stats.scanned = candidates.length;
     agent.stats.opportunities = opportunities.filter(o => o.action !== 'PASS' && o.action !== 'DISABLED').length;
     agent.health.lastRunAt = new Date().toISOString();
-    agent.health.llmOk = true;
+    agent.health.llmOk = hasLLM;
 
-    audit('info', 'llm_probability_run', { candidates: candidates.length, opportunities: opportunities.length, elapsed: Date.now() - startTime }, agent.id);
+    audit('info', 'llm_probability_run', { candidates: candidates.length, llmCalls: diagnostics.llmCalls, cacheHits: diagnostics.cacheHits, manualInputs: diagnostics.manualInputs, watchlistCandidates: diagnostics.watchlistCandidates, opportunities: opportunities.length, elapsed: Date.now() - startTime }, agent.id);
     markDirty();
     return opportunities;
   } catch (err) {
@@ -543,15 +771,18 @@ async function runLLMProbability(agent) {
   }
 }
 
-// ── S3: Sentiment / Headlines ──
+// ── S3: Sentiment / Headlines (with Signal Bus + Watchlist) ──
 async function runSentimentHeadlines(agent) {
   const startTime = Date.now();
+  const diagnostics = { headlinesProcessed: 0, marketsMatched: 0, watchlistEmitted: 0, analysisMethod: 'none', entitiesExtracted: 0 };
   try {
     const hasXAI = !!process.env.XAI_API_KEY && process.env.XAI_API_KEY.length > 5;
     const hasAnthropic = !!process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_API_KEY.length > 10;
+    const hasOpenAI = !!process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.length > 10;
 
     if (store.headlines.length === 0) {
       agent.health.lastRunAt = new Date().toISOString();
+      store.strategyDiagnostics.sentiment = { ...diagnostics, status: 'waiting', reason: 'No headlines loaded' };
       return [{
         id: crypto.randomUUID(), agentId: agent.id, strategyType: 'sentiment',
         title: 'Awaiting Headlines', action: 'WAITING', requiresApproval: false,
@@ -562,39 +793,63 @@ async function runSentimentHeadlines(agent) {
     }
 
     const recentHeadlines = store.headlines.slice(0, 20);
-    const markets = store.marketCache.data.slice(0, 30);
-    const marketList = markets.map(m => `- "${m.market}" (YES: ${m.bestBid}, Vol: $${m.volume})`).join('\n');
+    diagnostics.headlinesProcessed = recentHeadlines.length;
+    const markets = store.marketCache.data.slice(0, 50);
+    const marketList = markets.slice(0, 30).map(m => `- "${m.market}" (YES: ${m.bestBid}, Vol: $${m.volume})`).join('\n');
 
-    const prompt = `Analyze these headlines for prediction market impact:\n\nHEADLINES:\n${recentHeadlines.map(h => `- ${h.text} [${h.source || 'unknown'}]`).join('\n')}\n\nACTIVE MARKETS:\n${marketList}\n\nFor each headline, respond in JSON array: [{"headline": "...", "impactedMarkets": ["market title"], "direction": "bullish_yes|bearish_yes|neutral", "confidence": 0.X, "rationale": "..."}]`;
+    const prompt = `Analyze these headlines for prediction market impact. For each headline:
+1. Identify key entities, actors, and events
+2. Assess sentiment direction for relevant markets
+3. Estimate impact confidence and time window
+
+HEADLINES:
+${recentHeadlines.map(h => `- ${h.text} [${h.source || 'unknown'}]`).join('\n')}
+
+ACTIVE MARKETS:
+${marketList}
+
+Respond in JSON array: [{"headline": "...", "entities": ["entity1", "entity2"], "impactedMarkets": ["market title"], "direction": "bullish_yes|bearish_yes|neutral", "severity": "high|medium|low", "confidence": 0.X, "impact_window_hours": N, "rationale": "..."}]`;
 
     let results = [];
     try {
       if (hasXAI) {
+        diagnostics.analysisMethod = 'xAI/Grok';
         const resp = await httpPost('https://api.x.ai/v1/chat/completions', {
-          model: 'grok-2-latest', max_tokens: 1500,
-          messages: [{ role: 'system', content: 'You analyze news for prediction market impact. Respond in JSON only.' }, { role: 'user', content: prompt }],
+          model: 'grok-2-latest', max_tokens: 2000,
+          messages: [{ role: 'system', content: 'You analyze news for prediction market impact. Extract entities, assess sentiment, map to specific markets. Respond in JSON only.' }, { role: 'user', content: prompt }],
         }, { 'Authorization': 'Bearer ' + process.env.XAI_API_KEY });
         const text = resp.choices?.[0]?.message?.content || '';
         const jsonMatch = text.match(/\[[\s\S]*\]/);
         if (jsonMatch) results = JSON.parse(jsonMatch[0]);
       } else if (hasAnthropic) {
+        diagnostics.analysisMethod = 'Anthropic/Claude';
         const resp = await httpPost('https://api.anthropic.com/v1/messages', {
-          model: 'claude-sonnet-4-5-20250929', max_tokens: 1500,
+          model: 'claude-sonnet-4-5-20250929', max_tokens: 2000,
           messages: [{ role: 'user', content: prompt }],
         }, { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' });
         const text = resp.content?.[0]?.text || '';
         const jsonMatch = text.match(/\[[\s\S]*\]/);
         if (jsonMatch) results = JSON.parse(jsonMatch[0]);
+      } else if (hasOpenAI) {
+        diagnostics.analysisMethod = 'OpenAI';
+        const resp = await httpPost('https://api.openai.com/v1/chat/completions', {
+          model: 'gpt-4o-mini', max_tokens: 2000,
+          messages: [{ role: 'system', content: 'Analyze news for prediction market impact. Respond in JSON only.' }, { role: 'user', content: prompt }],
+        }, { 'Authorization': 'Bearer ' + process.env.OPENAI_API_KEY });
+        const text = resp.choices?.[0]?.message?.content || '';
+        const jsonMatch = text.match(/\[[\s\S]*\]/);
+        if (jsonMatch) results = JSON.parse(jsonMatch[0]);
       } else {
-        // Simple keyword matching fallback
-        const keywords = { trump: ['trump', 'president', 'election'], fed: ['fed', 'rate', 'interest', 'powell'], crypto: ['bitcoin', 'ethereum', 'crypto', 'btc'], war: ['ukraine', 'russia', 'ceasefire', 'war', 'israel'] };
+        // Keyword matching fallback
+        diagnostics.analysisMethod = 'keyword-fallback';
+        const keywords = { trump: ['trump', 'president', 'election', 'republican', 'democrat'], fed: ['fed', 'rate', 'interest', 'powell', 'fomc', 'monetary'], crypto: ['bitcoin', 'ethereum', 'crypto', 'btc', 'eth', 'blockchain'], war: ['ukraine', 'russia', 'ceasefire', 'war', 'israel', 'gaza', 'military'], tech: ['ai', 'openai', 'google', 'apple', 'meta', 'microsoft', 'gpt'], economy: ['gdp', 'inflation', 'jobs', 'unemployment', 'recession', 'tariff'] };
         for (const h of recentHeadlines) {
           const lower = h.text.toLowerCase();
           for (const [topic, words] of Object.entries(keywords)) {
             if (words.some(w => lower.includes(w))) {
               const matched = markets.filter(m => words.some(w => m.market.toLowerCase().includes(w)));
               if (matched.length > 0) {
-                results.push({ headline: h.text, impactedMarkets: matched.map(m => m.market).slice(0, 3), direction: 'neutral', confidence: 0.3, rationale: `Keyword match: ${topic}` });
+                results.push({ headline: h.text, entities: [topic], impactedMarkets: matched.map(m => m.market).slice(0, 3), direction: 'neutral', severity: 'low', confidence: 0.3, impact_window_hours: 24, rationale: `Keyword match: ${topic} (fallback mode, low confidence)` });
               }
             }
           }
@@ -603,27 +858,67 @@ async function runSentimentHeadlines(agent) {
     } catch (e) { console.error('[sentiment] Analysis error:', e.message); }
 
     store.sentimentResults = results;
+
+    // ── Emit to Signal Bus: watchlists + entities ──
+    const watchlistEntries = [];
+    for (const r of results) {
+      // Extract entities
+      const entities = r.entities || [];
+      diagnostics.entitiesExtracted += entities.length;
+      entities.forEach(e => {
+        signalBus.emit('entities', { name: e, type: 'headline_entity', source: 'sentiment', headline: r.headline });
+      });
+
+      // Map to specific markets and emit watchlist
+      const matchedMarkets = (r.impactedMarkets || []).map(title => {
+        const m = markets.find(mk => mk.market === title || mk.market.includes(title) || title.includes(mk.market?.slice(0, 30)));
+        return m ? { marketId: m.id || m.conditionId, title: m.market, slug: m.slug } : { marketId: null, title };
+      });
+
+      for (const mm of matchedMarkets) {
+        const entry = { market: mm.title, marketId: mm.marketId, direction: r.direction, confidence: r.confidence || 0.5, severity: r.severity || 'medium', headline: r.headline, source: 'sentiment', impact_window_hours: r.impact_window_hours || 24 };
+        signalBus.emit('watchlists', entry);
+        watchlistEntries.push(entry);
+        diagnostics.watchlistEmitted++;
+      }
+
+      // Also emit as market candidates for other strategies
+      matchedMarkets.filter(mm => mm.marketId).forEach(mm => {
+        signalBus.emit('marketCandidates', { marketId: mm.marketId, title: mm.title, reason: `Sentiment: ${r.direction} from headline`, source: 'sentiment' });
+      });
+    }
+    diagnostics.marketsMatched = watchlistEntries.length;
+
     const opportunities = results.map(r => ({
       id: crypto.randomUUID(), agentId: agent.id, strategyType: 'sentiment',
       title: r.headline?.slice(0, 100) || 'Unknown', marketId: null,
       impactedMarkets: r.impactedMarkets || [],
-      direction: r.direction || 'neutral', edgePct: 0,
+      entities: r.entities || [],
+      direction: r.direction || 'neutral', severity: r.severity || 'medium',
+      edgePct: 0,
       confidence: parseFloat(((r.confidence || 0.5) * 100).toFixed(0)),
+      impact_window_hours: r.impact_window_hours || 24,
       action: 'OBSERVE', requiresApproval: false,
       rationaleSummary: r.rationale || 'Sentiment analysis',
       explain: {
-        inputs: { headline: r.headline, source: hasXAI ? 'Grok' : hasAnthropic ? 'Claude' : 'keyword-match' },
-        math: 'Qualitative sentiment analysis', assumptions: ['Headlines are accurate', 'Market hasn\'t priced in yet'],
-        failureModes: ['Old news already priced in', 'Misinterpretation of headline', 'Market structure differs from sentiment'],
+        inputs: { headline: r.headline, entities: r.entities, source: diagnostics.analysisMethod, impactedMarkets: r.impactedMarkets },
+        math: `Confidence: ${((r.confidence || 0.5) * 100).toFixed(0)}% | Direction: ${r.direction} | Severity: ${r.severity || 'medium'} | Window: ${r.impact_window_hours || 24}h`,
+        assumptions: ['Headlines are accurate', 'Market hasn\'t fully priced in yet', `Impact window: ${r.impact_window_hours || 24}h`],
+        failureModes: ['Old news already priced in', 'Misinterpretation of headline', 'Market structure differs from sentiment', 'LLM hallucination of market mapping'],
+        signalBusOutput: { watchlistEntries: watchlistEntries.length, entities: r.entities?.length || 0 },
       },
       timestamp: new Date().toISOString(), status: 'new',
     }));
+
+    // Store findings
+    store.findingsRing.sentiment = opportunities.slice(0, 50);
+    store.strategyDiagnostics.sentiment = diagnostics;
 
     agent.stats.scanned = recentHeadlines.length;
     agent.stats.opportunities = results.length;
     agent.health.lastRunAt = new Date().toISOString();
 
-    audit('info', 'sentiment_run', { headlines: recentHeadlines.length, results: results.length, elapsed: Date.now() - startTime }, agent.id);
+    audit('info', 'sentiment_run', { headlines: recentHeadlines.length, results: results.length, watchlist: diagnostics.watchlistEmitted, method: diagnostics.analysisMethod, elapsed: Date.now() - startTime }, agent.id);
     markDirty();
     return opportunities;
   } catch (err) {
@@ -633,30 +928,87 @@ async function runSentimentHeadlines(agent) {
   }
 }
 
-// ── S4: Whale Pocket-Watching ──
+// ── S4: Whale Pocket-Watching (with discovery + Signal Bus) ──
 async function runWhaleWatch(agent) {
   const startTime = Date.now();
+  const diagnostics = { walletsTracked: 0, eventsFound: 0, apiSuccess: 0, apiFailures: 0, stubEvents: 0, convergenceAlerts: 0, discoveryAttempted: false, discoveryResult: null };
   try {
+    const markets = store.marketCache.data.length > 0 ? store.marketCache.data : await fetchMarkets();
+
+    // ── Whale Discovery Pipeline ──
     if (store.whaleWallets.length === 0) {
-      agent.health.lastRunAt = new Date().toISOString();
-      return [{
-        id: crypto.randomUUID(), agentId: agent.id, strategyType: 'whale_watch',
-        title: 'No Wallets Configured', action: 'WAITING', requiresApproval: false,
-        rationaleSummary: 'Add whale wallet addresses in the Whale Watch tab to start tracking',
-        explain: { inputs: {}, math: 'N/A', assumptions: [], failureModes: ['No wallets to watch'] },
-        timestamp: new Date().toISOString(), status: 'waiting',
-      }];
+      diagnostics.discoveryAttempted = true;
+      // Attempt A: Try Polymarket leaderboard/profile endpoint
+      try {
+        const gammaUrl = process.env.POLYMARKET_GAMMA_URL || 'https://gamma-api.polymarket.com';
+        const resp = await httpGet(`${gammaUrl}/profiles?limit=10&sortBy=volume`);
+        if (Array.isArray(resp) && resp.length > 0) {
+          diagnostics.discoveryResult = `Found ${resp.length} profiles from leaderboard`;
+          for (const profile of resp.slice(0, 5)) {
+            const addr = profile.address || profile.proxyWallet;
+            if (addr && !store.whaleWallets.find(w => w.address === addr)) {
+              store.whaleWallets.push({ address: addr, alias: profile.name || profile.username || addr.slice(0, 8), addedAt: new Date().toISOString(), source: 'discovery' });
+            }
+          }
+          markDirty();
+        }
+      } catch {
+        diagnostics.discoveryResult = 'Leaderboard API not available';
+      }
+
+      // Attempt B: If still no wallets, try to find large trades from market data
+      if (store.whaleWallets.length === 0) {
+        try {
+          const gammaUrl = process.env.POLYMARKET_GAMMA_URL || 'https://gamma-api.polymarket.com';
+          const resp = await httpGet(`${gammaUrl}/trades?limit=50`);
+          if (Array.isArray(resp) && resp.length > 0) {
+            const largeTrades = resp.filter(t => parseFloat(t.size || t.amount || 0) >= 500);
+            const addrCounts = {};
+            largeTrades.forEach(t => {
+              const addr = t.maker || t.taker || t.address;
+              if (addr) addrCounts[addr] = (addrCounts[addr] || 0) + 1;
+            });
+            // Top addresses by trade count
+            const topAddrs = Object.entries(addrCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
+            for (const [addr, count] of topAddrs) {
+              if (!store.whaleWallets.find(w => w.address === addr)) {
+                store.whaleWallets.push({ address: addr, alias: `whale-${addr.slice(0, 6)}`, addedAt: new Date().toISOString(), source: 'large-fills' });
+              }
+            }
+            diagnostics.discoveryResult = (diagnostics.discoveryResult || '') + ` | Found ${topAddrs.length} addresses from large fills`;
+            markDirty();
+          }
+        } catch {
+          diagnostics.discoveryResult = (diagnostics.discoveryResult || '') + ' | Trade feed not available';
+        }
+      }
+
+      // If still no wallets after discovery
+      if (store.whaleWallets.length === 0) {
+        agent.health.lastRunAt = new Date().toISOString();
+        store.strategyDiagnostics.whale_watch = { ...diagnostics, status: 'no_wallets', reason: 'Discovery failed. Manual entry required.' };
+        const result = [{
+          id: crypto.randomUUID(), agentId: agent.id, strategyType: 'whale_watch',
+          title: 'No Wallets — Discovery Attempted', action: 'WAITING', requiresApproval: false,
+          rationaleSummary: `Whale discovery attempted but no wallets found. ${diagnostics.discoveryResult || 'APIs not available'}. Add wallets manually in the Whale Watch tab.`,
+          explain: { inputs: { discoveryAttempted: true, result: diagnostics.discoveryResult }, math: 'N/A', assumptions: [], failureModes: ['Leaderboard API not available', 'Trade feed not available', 'No large fills detected'] },
+          timestamp: new Date().toISOString(), status: 'waiting',
+        }];
+        store.findingsRing.whale_watch = result;
+        return result;
+      }
     }
 
-    // Try Polymarket activity endpoint or use simulation
-    const events = [];
-    const markets = store.marketCache.data.slice(0, 50);
+    diagnostics.walletsTracked = store.whaleWallets.length;
 
+    // ── Fetch whale activity ──
+    const events = [];
     for (const wallet of store.whaleWallets) {
       try {
         const gammaUrl = process.env.POLYMARKET_GAMMA_URL || 'https://gamma-api.polymarket.com';
         const resp = await httpGet(`${gammaUrl}/activity?address=${wallet.address}&limit=10`);
-        if (Array.isArray(resp)) {
+        if (Array.isArray(resp) && resp.length > 0) {
+          diagnostics.apiSuccess++;
           for (const act of resp) {
             events.push({
               id: crypto.randomUUID(), wallet: wallet.address, alias: wallet.alias || wallet.address.slice(0, 8),
@@ -665,77 +1017,120 @@ async function runWhaleWatch(agent) {
               timestamp: act.timestamp || new Date().toISOString(), source: 'polymarket_api',
             });
           }
+        } else {
+          // API returned empty — stub with market data
+          diagnostics.apiFailures++;
+          if (markets.length > 0) {
+            const randomMkt = markets[Math.floor(Math.random() * Math.min(5, markets.length))];
+            events.push({
+              id: crypto.randomUUID(), wallet: wallet.address, alias: wallet.alias || wallet.address.slice(0, 8),
+              market: randomMkt.market, side: Math.random() > 0.5 ? 'YES' : 'NO',
+              size: 0, price: 0, timestamp: new Date().toISOString(), source: 'stub',
+              note: 'Activity API returned empty. Stub event from cached markets.',
+            });
+            diagnostics.stubEvents++;
+          }
         }
       } catch {
-        // API may not support this — generate stub event
+        diagnostics.apiFailures++;
         if (markets.length > 0) {
           const randomMkt = markets[Math.floor(Math.random() * Math.min(5, markets.length))];
           events.push({
             id: crypto.randomUUID(), wallet: wallet.address, alias: wallet.alias || wallet.address.slice(0, 8),
             market: randomMkt.market, side: Math.random() > 0.5 ? 'YES' : 'NO',
             size: 0, price: 0, timestamp: new Date().toISOString(), source: 'stub',
+            note: 'Activity API failed. Stub event from cached markets.',
           });
+          diagnostics.stubEvents++;
         }
       }
     }
 
+    diagnostics.eventsFound = events.length;
     store.whaleEvents = [...events, ...store.whaleEvents].slice(0, 200);
 
-    // Convergence detection: K whales on same market/side within T minutes
+    // ── Emit whale-touched markets to Signal Bus ──
+    const uniqueMarkets = new Set();
+    events.filter(e => e.source !== 'stub').forEach(e => {
+      if (!uniqueMarkets.has(e.market)) {
+        uniqueMarkets.add(e.market);
+        const matchedMarket = markets.find(m => m.market === e.market || m.market.includes(e.market?.slice(0, 30)));
+        if (matchedMarket) {
+          signalBus.emit('whaleMarkets', { marketId: matchedMarket.id || matchedMarket.conditionId, title: e.market, whaleAlias: e.alias, side: e.side, source: 'whale_watch' });
+        }
+      }
+    });
+
+    // ── Convergence detection ──
     const K = agent.config.convergenceThreshold || 2;
     const T = (agent.config.convergenceWindowMin || 60) * 60000;
     const recentEvents = store.whaleEvents.filter(e => Date.now() - new Date(e.timestamp).getTime() < T);
     const marketSideCounts = {};
     for (const e of recentEvents) {
       const key = `${e.market}::${e.side}`;
-      if (!marketSideCounts[key]) marketSideCounts[key] = { market: e.market, side: e.side, wallets: new Set(), events: [] };
+      if (!marketSideCounts[key]) marketSideCounts[key] = { market: e.market, side: e.side, wallets: new Set(), events: [], totalSize: 0 };
       marketSideCounts[key].wallets.add(e.wallet);
       marketSideCounts[key].events.push(e);
+      marketSideCounts[key].totalSize += e.size || 0;
     }
 
     const convergenceAlerts = Object.values(marketSideCounts)
       .filter(g => g.wallets.size >= K)
+      .sort((a, b) => b.wallets.size - a.wallets.size)
       .map(g => ({
         id: crypto.randomUUID(), agentId: agent.id, strategyType: 'whale_watch',
         title: `CONVERGENCE: ${g.wallets.size} whales → ${g.market} (${g.side})`,
         marketId: null, edgePct: 0, confidence: Math.min(g.wallets.size * 30, 90),
         action: 'FOLLOW', requiresApproval: true,
-        rationaleSummary: `${g.wallets.size} tracked wallets entered ${g.side} on "${g.market}" within ${agent.config.convergenceWindowMin || 60}min`,
+        convergence: { whaleCount: g.wallets.size, totalSize: g.totalSize, eventCount: g.events.length },
+        rationaleSummary: `${g.wallets.size} tracked wallets entered ${g.side} on "${g.market}" within ${agent.config.convergenceWindowMin || 60}min${g.totalSize > 0 ? ` (total: $${g.totalSize.toFixed(0)})` : ''}`,
         explain: {
-          inputs: { wallets: [...g.wallets], side: g.side, market: g.market, eventCount: g.events.length },
-          math: `convergence = ${g.wallets.size} unique wallets >= threshold ${K}`,
-          assumptions: ['Whale activity indicates informed trading', 'Time window captures correlated activity'],
-          failureModes: ['Whales may be hedging', 'Coincidental timing', 'Different position sizes'],
+          inputs: { wallets: [...g.wallets].map(w => w.slice(0, 10) + '...'), side: g.side, market: g.market, eventCount: g.events.length, totalSize: g.totalSize },
+          math: `convergence = ${g.wallets.size} unique wallets >= threshold ${K}; totalSize = $${g.totalSize.toFixed(0)}`,
+          assumptions: ['Whale activity indicates informed trading', 'Time window captures correlated activity', 'Larger total size = stronger signal'],
+          failureModes: ['Whales may be hedging', 'Coincidental timing', 'Different position sizes', 'Stub events inflate counts'],
+          dataQuality: { realEvents: g.events.filter(e => e.source !== 'stub').length, stubEvents: g.events.filter(e => e.source === 'stub').length },
         },
         timestamp: new Date().toISOString(), status: 'new',
       }));
 
+    diagnostics.convergenceAlerts = convergenceAlerts.length;
+
     // Push convergence alerts to approvals
     convergenceAlerts.forEach(a => {
       if (!store.approvalsQueue.find(q => q.rationale === a.rationaleSummary && q.status === 'pending')) {
-        store.approvalsQueue.push({
+        const proposal = {
           id: crypto.randomUUID(), ts: new Date().toISOString(), agentId: agent.id,
           marketId: a.marketId, actionType: 'FOLLOW', payload: a,
-          rationale: a.rationaleSummary, risk: 'Whale herding may be misleading',
+          rationale: a.rationaleSummary, risk: 'Whale herding may be misleading; stub data may inflate signals',
           expectedEdge: 0, status: 'pending',
-        });
+        };
+        store.approvalsQueue.push(proposal);
+        store.proposalsRing.unshift(proposal);
+        if (store.proposalsRing.length > 100) store.proposalsRing.length = 100;
         agent.stats.approvalsPending++;
       }
     });
+
+    const allResults = [...convergenceAlerts, ...events.slice(0, 15).map(e => ({
+      id: e.id, agentId: agent.id, strategyType: 'whale_watch',
+      title: `${e.alias}: ${e.side} on "${e.market}"`, action: 'INFO',
+      requiresApproval: false, rationaleSummary: `Whale ${e.alias} traded ${e.side}${e.size ? ` $${e.size}` : ''}`,
+      explain: { inputs: e, math: 'N/A', assumptions: [], failureModes: [], dataSource: e.source },
+      timestamp: e.timestamp, status: 'info', source: e.source,
+    }))];
+
+    // Store findings
+    store.findingsRing.whale_watch = allResults.slice(0, 50);
+    store.strategyDiagnostics.whale_watch = diagnostics;
 
     agent.stats.scanned = store.whaleWallets.length;
     agent.stats.opportunities = convergenceAlerts.length;
     agent.health.lastRunAt = new Date().toISOString();
 
-    audit('info', 'whale_watch_run', { wallets: store.whaleWallets.length, events: events.length, convergence: convergenceAlerts.length, elapsed: Date.now() - startTime }, agent.id);
+    audit('info', 'whale_watch_run', { wallets: diagnostics.walletsTracked, events: diagnostics.eventsFound, convergence: diagnostics.convergenceAlerts, apiSuccess: diagnostics.apiSuccess, stubEvents: diagnostics.stubEvents, elapsed: Date.now() - startTime }, agent.id);
     markDirty();
-    return [...convergenceAlerts, ...events.slice(0, 10).map(e => ({
-      id: e.id, agentId: agent.id, strategyType: 'whale_watch',
-      title: `${e.alias}: ${e.side} on "${e.market}"`, action: 'INFO',
-      requiresApproval: false, rationaleSummary: `Whale ${e.alias} traded ${e.side}${e.size ? ` $${e.size}` : ''}`,
-      explain: { inputs: e, math: 'N/A', assumptions: [], failureModes: [] },
-      timestamp: e.timestamp, status: 'info', source: e.source,
-    }))];
+    return allResults;
   } catch (err) {
     agent.health.errors.push({ ts: new Date().toISOString(), msg: err.message });
     audit('error', 'whale_watch_fail', { error: err.message }, agent.id);
@@ -749,6 +1144,301 @@ const STRATEGY_RUNNERS = {
   sentiment: runSentimentHeadlines,
   whale_watch: runWhaleWatch,
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STRATEGY SPECS (First-Class Registry)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const STRATEGY_SPECS = {
+  negrisk_arb: {
+    id: 'negrisk_arb',
+    label: 'NegRisk Arbitrage',
+    goal: 'Identify multi-outcome market structures where the sum of YES prices deviates from 1.0, creating risk-free (neg-risk) arbitrage opportunities.',
+    data_requirements: [
+      { id: 'polymarket_markets', label: 'Polymarket Markets API', required: true, check: () => true, fallback: 'Demo data used if API unreachable' },
+      { id: 'market_grouping', label: 'Event-level market grouping', required: false, check: () => true, fallback: 'Uses slug/question similarity clustering' },
+      { id: 'orderbook_depth', label: 'CLOB orderbook depth', required: false, check: () => !!process.env.POLYMARKET_API_KEY, fallback: 'Liquidity field used as depth proxy' },
+    ],
+    compute_steps: [
+      'Fetch active markets from Polymarket Gamma API',
+      'Group markets by event (slug prefix, negRisk flag, question similarity)',
+      'For each group: compute sum of best-ask YES prices across all outcomes',
+      'Detect arb: sum < 1.0 (buy-all-YES) or sum > 1.0 + fees (buy-all-NO)',
+      'Apply friction buffer (fees ~2%, slippage estimate from liquidity)',
+      'Gate on minimum liquidity, volume, and depth per outcome',
+      'Rank by net edge after friction',
+    ],
+    scoring: {
+      method: 'Net edge after friction',
+      formula: 'netEdge = |1.0 - sumPrices| * 100 - estimatedSlippage - feesPct',
+      weights: { edge: 0.4, depth: 0.3, volume: 0.3 },
+    },
+    risk_gates: [
+      { id: 'min_edge', label: 'Minimum edge %', default: 0.5 },
+      { id: 'min_liquidity', label: 'Minimum liquidity per outcome', default: 1000 },
+      { id: 'min_volume', label: 'Minimum 24h volume', default: 5000 },
+      { id: 'max_slippage', label: 'Maximum estimated slippage %', default: 3.0 },
+    ],
+    outputs: ['candidates[]', 'diagnostics', 'blocking_items', 'questions_for_founders'],
+    explain_contract: {
+      fields: ['raw_prices', 'sum_computation', 'fee_assumptions', 'slippage_model', 'net_edge', 'gates_passed', 'gates_failed', 'recommended_action'],
+    },
+    missing_detector: () => {
+      const items = [];
+      if (store.marketCache.data.length === 0) items.push({ severity: 'high', item: 'No market data loaded', fix: 'Wait for first scan or check Polymarket API connectivity', fallback: 'Demo data will be used' });
+      if (!process.env.POLYMARKET_API_KEY) items.push({ severity: 'medium', item: 'No CLOB API key for orderbook depth', fix: 'Add POLYMARKET_API_KEY in Settings', fallback: 'Using liquidity field as depth proxy' });
+      return items;
+    },
+    questions_for_founders: [
+      'What fee structure should we assume? (Default: 2% round-trip. Polymarket charges ~1% maker + taker.)',
+      'Should we include markets with < $1,000 liquidity per outcome, or skip them as too risky to execute?',
+      'When an arb is found, should ZVI auto-propose or wait for manual review? (Current: OBSERVE mode, manual review.)',
+    ],
+  },
+
+  llm_probability: {
+    id: 'llm_probability',
+    label: 'LLM Probability Mispricing',
+    goal: 'Use LLM models to estimate true probabilities for prediction markets and find mispricings where model p̂ diverges significantly from market price.',
+    data_requirements: [
+      { id: 'polymarket_markets', label: 'Polymarket Markets API', required: true, check: () => true, fallback: 'Demo data' },
+      { id: 'llm_api', label: 'LLM API (Anthropic/OpenAI/xAI)', required: false, check: () => !!(process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY || process.env.XAI_API_KEY), fallback: 'Manual probability input mode' },
+      { id: 'sentiment_watchlist', label: 'Sentiment watchlist (from Sentiment strategy)', required: false, check: () => signalBus.watchlists.length > 0, fallback: 'Uses volume-ranked market selection' },
+    ],
+    compute_steps: [
+      'Select candidate markets: sentiment watchlist > pinned > top volume',
+      'Prune to top N candidates (configurable, default 10)',
+      'For each candidate: build deterministic prompt with market rules + description',
+      'Call LLM → get structured output: {prob_yes, confidence, key_factors, disqualifiers, time_sensitivity}',
+      'Compute edge = |prob_yes - price_yes|, confidence-weighted',
+      'Cache results per market with TTL',
+      'If no LLM key: use manual probability inputs from founders',
+      'Gate on minimum edge, confidence, and liquidity',
+    ],
+    scoring: {
+      method: 'Confidence-weighted edge',
+      formula: 'weightedEdge = |llmProb - marketPrice| * confidence',
+      weights: { edge: 0.5, confidence: 0.3, liquidity: 0.2 },
+    },
+    risk_gates: [
+      { id: 'min_edge', label: 'Minimum absolute edge %', default: 2.0 },
+      { id: 'min_confidence', label: 'Minimum LLM confidence', default: 0.4 },
+      { id: 'min_liquidity', label: 'Minimum market liquidity', default: 5000 },
+      { id: 'max_llm_calls', label: 'Max LLM calls per tick', default: 10 },
+    ],
+    outputs: ['candidates[]', 'diagnostics', 'blocking_items', 'questions_for_founders'],
+    explain_contract: {
+      fields: ['market_description', 'llm_prompt', 'llm_response', 'prob_estimate', 'market_price', 'edge_calc', 'confidence', 'key_factors', 'gates_passed', 'gates_failed'],
+    },
+    missing_detector: () => {
+      const items = [];
+      const hasLLM = !!(process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY || process.env.XAI_API_KEY);
+      if (!hasLLM) items.push({ severity: 'high', item: 'No LLM API key configured', fix: 'Add ANTHROPIC_API_KEY, OPENAI_API_KEY, or XAI_API_KEY in Settings', fallback: 'MANUAL PROBABILITY MODE: founders can input p̂ for any market and the system will compute mispricing.' });
+      if (Object.keys(store.manualProbabilities).length === 0 && !hasLLM) items.push({ severity: 'medium', item: 'No manual probability estimates entered', fix: 'Use the LLM Probability tab to enter your estimated probability for specific markets', fallback: 'Strategy cannot run without either LLM or manual inputs' });
+      return items;
+    },
+    questions_for_founders: [
+      'Which LLM provider do you trust most for probability calibration? (Anthropic tends to be more conservative, OpenAI more confident.)',
+      'Should we prioritize markets from the sentiment watchlist, or scan all high-volume markets equally?',
+      'What confidence threshold should disqualify an LLM estimate? (Default: < 40% confidence = skip.)',
+    ],
+  },
+
+  sentiment: {
+    id: 'sentiment',
+    label: 'Sentiment / Headlines Value',
+    goal: 'Turn breaking news and headlines into actionable market watchlists by mapping headline content to specific Polymarket markets.',
+    data_requirements: [
+      { id: 'headlines', label: 'Headlines (manual input, file, or URL)', required: true, check: () => store.headlines.length > 0, fallback: 'Awaiting headline input from founders' },
+      { id: 'llm_api', label: 'LLM API for analysis', required: false, check: () => !!(process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY || process.env.XAI_API_KEY), fallback: 'Keyword matching fallback' },
+      { id: 'polymarket_markets', label: 'Polymarket markets for mapping', required: true, check: () => true, fallback: 'Demo data' },
+    ],
+    compute_steps: [
+      'Ingest headlines: manual text, optional file polling, optional URL polling',
+      'For each headline: extract events, actors, directionality, impact window via LLM or keywords',
+      'Map extracted entities/topics to Polymarket markets by similarity + LLM mapping',
+      'Produce watchlist: markets affected, expected direction, confidence, time window',
+      'Emit watchlist to Signal Bus for other strategies (esp. LLM Prob)',
+      'If no LLM: fall back to keyword matching (lower confidence)',
+    ],
+    scoring: {
+      method: 'LLM confidence × market relevance',
+      formula: 'score = sentimentConfidence * marketRelevance * recencyWeight',
+      weights: { confidence: 0.4, relevance: 0.35, recency: 0.25 },
+    },
+    risk_gates: [
+      { id: 'min_confidence', label: 'Minimum sentiment confidence', default: 0.3 },
+      { id: 'max_age_hours', label: 'Maximum headline age (hours)', default: 24 },
+      { id: 'min_market_match', label: 'Minimum market match score', default: 0.2 },
+    ],
+    outputs: ['watchlist[]', 'market_mappings[]', 'diagnostics', 'blocking_items', 'questions_for_founders'],
+    explain_contract: {
+      fields: ['headline_text', 'extracted_entities', 'sentiment_direction', 'severity', 'affected_topics', 'matched_markets', 'match_method', 'confidence', 'time_window'],
+    },
+    missing_detector: () => {
+      const items = [];
+      if (store.headlines.length === 0) items.push({ severity: 'high', item: 'No headlines loaded', fix: 'Paste headlines in the Sentiment tab, or configure a headline source URL', fallback: 'Strategy is idle until headlines are provided' });
+      const hasLLM = !!(process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY || process.env.XAI_API_KEY);
+      if (!hasLLM) items.push({ severity: 'medium', item: 'No LLM API key for deep analysis', fix: 'Add an LLM API key in Settings for better headline analysis', fallback: 'Using keyword matching (lower accuracy, ~30% confidence cap)' });
+      return items;
+    },
+    questions_for_founders: [
+      'What news sources do you monitor most? We can add URL polling for those sources.',
+      'How quickly do you expect headlines to be priced in? (Default: 24h window. Shorter = more aggressive.)',
+      'Should sentiment findings auto-feed into the LLM Probability strategy to prioritize mispricing analysis?',
+    ],
+  },
+
+  whale_watch: {
+    id: 'whale_watch',
+    label: 'Whale Pocket-Watching',
+    goal: 'Identify and track top-performing Polymarket traders (whales), detect convergence patterns, and surface copy-trade candidates.',
+    data_requirements: [
+      { id: 'whale_wallets', label: 'Tracked whale wallets', required: false, check: () => store.whaleWallets.length > 0, fallback: 'Discovery mode: attempts to find whales from public data' },
+      { id: 'polymarket_activity', label: 'Polymarket activity API', required: false, check: () => true, fallback: 'Stub events from market data if activity API unavailable' },
+      { id: 'polymarket_leaderboard', label: 'Polymarket leaderboard/top traders', required: false, check: () => false, fallback: 'Manual wallet entry required. Leaderboard API not yet available.' },
+    ],
+    compute_steps: [
+      'If no wallets: attempt whale discovery from Polymarket leaderboard or large-fill detection',
+      'For each tracked wallet: fetch recent activity from Polymarket API',
+      'If API fails: generate stub events linked to real cached markets (clearly labeled)',
+      'Detect convergence: K+ whales trading same market/side within T-minute window',
+      'Emit whale-touched markets to Signal Bus for other strategies',
+      'Rank convergence events by whale count and total size',
+    ],
+    scoring: {
+      method: 'Convergence strength',
+      formula: 'score = uniqueWhales * 30 + totalSize * 0.01',
+      weights: { convergence: 0.5, size: 0.3, recency: 0.2 },
+    },
+    risk_gates: [
+      { id: 'min_convergence', label: 'Minimum whale convergence count', default: 2 },
+      { id: 'convergence_window', label: 'Convergence time window (minutes)', default: 60 },
+      { id: 'min_whale_size', label: 'Minimum trade size to track ($)', default: 0 },
+    ],
+    outputs: ['convergence_alerts[]', 'whale_events[]', 'diagnostics', 'blocking_items', 'questions_for_founders'],
+    explain_contract: {
+      fields: ['tracked_wallets', 'events_found', 'convergence_detection', 'whale_count', 'market', 'side', 'time_window', 'data_source'],
+    },
+    missing_detector: () => {
+      const items = [];
+      if (store.whaleWallets.length === 0) items.push({ severity: 'high', item: 'No whale wallets configured', fix: 'Add wallet addresses in the Whale Watch tab. Find top traders on Polymarket leaderboard.', fallback: 'Will attempt automated discovery from large fills if available, otherwise idle.' });
+      items.push({ severity: 'low', item: 'Polymarket leaderboard API not available', fix: 'This endpoint may become available. Manual wallet entry is the current method.', fallback: 'Manual tracking loop runs with configured wallets.' });
+      return items;
+    },
+    questions_for_founders: [
+      'Do you have specific whale wallets to track? (Paste addresses in the Whale Watch tab.)',
+      'What convergence threshold makes you comfortable? (Default: 2+ whales = alert. Higher = fewer but stronger signals.)',
+      'Should whale convergence signals auto-feed into the LLM Probability strategy for deeper analysis?',
+    ],
+  },
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIGNAL BUS (Cross-Strategy Communication)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const signalBus = {
+  watchlists: [],       // from Sentiment: [{market, direction, confidence, source, ts}]
+  marketCandidates: [], // from any strategy: [{marketId, title, reason, source}]
+  entities: [],         // from Sentiment: [{name, type, relevance}]
+  whaleMarkets: [],     // from Whale Watch: [{marketId, title, whaleCount, side}]
+  _listeners: {},
+
+  emit(channel, data) {
+    const entry = { ...data, ts: new Date().toISOString(), channel };
+    if (!this[channel]) this[channel] = [];
+    this[channel].unshift(entry);
+    if (this[channel].length > 200) this[channel].length = 200;
+    // Notify listeners
+    (this._listeners[channel] || []).forEach(fn => { try { fn(entry); } catch (e) { console.error('[signalBus] Listener error:', e.message); } });
+  },
+
+  on(channel, fn) {
+    if (!this._listeners[channel]) this._listeners[channel] = [];
+    this._listeners[channel].push(fn);
+  },
+
+  getRecent(channel, maxAge = 3600000) {
+    const now = Date.now();
+    return (this[channel] || []).filter(e => now - new Date(e.ts).getTime() < maxAge);
+  },
+
+  getWatchlistMarkets() {
+    return this.getRecent('watchlists', 3600000).map(w => w.marketId || w.market).filter(Boolean);
+  },
+
+  getWhaleMarkets() {
+    return this.getRecent('whaleMarkets', 3600000).map(w => w.marketId).filter(Boolean);
+  },
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MARKET CACHE (Enhanced with background refresh)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+let marketCacheRefreshTimer = null;
+function startMarketCacheRefresh() {
+  if (marketCacheRefreshTimer) return;
+  const ttl = (store.settings.cacheTTLSec || 60) * 1000;
+  marketCacheRefreshTimer = setInterval(async () => {
+    try {
+      const now = Date.now();
+      if (now - store.marketCache.fetchedAt >= ttl) {
+        await fetchMarkets();
+      }
+    } catch (e) { console.error('[cache] Background refresh error:', e.message); }
+  }, Math.max(15000, (store.settings.cacheTTLSec || 60) * 1000));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STRATEGY DIAGNOSTICS HELPER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function getStrategyDiagnostics(strategyType) {
+  const spec = STRATEGY_SPECS[strategyType];
+  if (!spec) return { error: 'Unknown strategy' };
+
+  const agents = store.agents.filter(a => a.strategyType === strategyType);
+  const findings = store.findingsRing[strategyType] || [];
+  const missingItems = spec.missing_detector();
+  const dataStatus = spec.data_requirements.map(d => ({
+    id: d.id, label: d.label, required: d.required,
+    available: d.check(), fallback: d.fallback,
+  }));
+
+  // Gate failure distribution from findings
+  const gateFailures = {};
+  const allOpps = store.strategyOpportunities.filter(o => o.strategyType === strategyType);
+  allOpps.forEach(o => {
+    if (o.action === 'PASS' || o.status === 'gated') {
+      const reason = o.gateFailReason || o.rationaleSummary || 'unknown';
+      gateFailures[reason] = (gateFailures[reason] || 0) + 1;
+    }
+  });
+
+  return {
+    strategyType,
+    label: spec.label,
+    goal: spec.goal,
+    agentCount: agents.length,
+    activeAgents: agents.filter(a => a.status === 'running').length,
+    totalFindings: findings.length,
+    recentFindings: findings.slice(0, 20),
+    dataStatus,
+    missingItems,
+    blockingItems: missingItems.filter(m => m.severity === 'high'),
+    questionsForFounders: spec.questions_for_founders,
+    gateFailures,
+    riskGates: spec.risk_gates,
+    computeSteps: spec.compute_steps,
+    fallbackMode: missingItems.some(m => m.severity === 'high') ? missingItems.find(m => m.severity === 'high').fallback : null,
+    lastRun: agents.length > 0 ? agents.reduce((latest, a) => {
+      const t = a.health.lastRunAt ? new Date(a.health.lastRunAt).getTime() : 0;
+      return t > latest ? t : latest;
+    }, 0) : null,
+  };
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // AGENT MANAGER
@@ -776,6 +1466,8 @@ function createAgent(config) {
   store.agents.push(agent);
   audit('info', 'agent_created', { name: agent.name, strategy: agent.strategyType }, agent.id);
   logActivity('system', `Agent "${agent.name}" created (${agent.strategyType})`);
+  // Start runtime immediately
+  startAgentRuntime(agent.id);
   markDirty();
   return agent;
 }
@@ -796,6 +1488,7 @@ function deleteAgent(id) {
   const idx = store.agents.findIndex(a => a.id === id);
   if (idx === -1) return false;
   const agent = store.agents[idx];
+  stopAgentRuntime(id);
   store.agents.splice(idx, 1);
   store.approvalsQueue = store.approvalsQueue.filter(a => a.agentId !== id);
   audit('info', 'agent_deleted', { name: agent.name }, id);
@@ -826,22 +1519,110 @@ async function runAllAgents() {
   }
 }
 
-// Agent scheduler
+// ═══════════════════════════════════════════════════════════════════════════════
+// AGENT RUNTIME (Enhanced with per-agent ticks, heartbeat, state)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const agentTimers = new Map(); // agentId → { timer, lastTick, tickCount, state }
+
+function startAgentRuntime(agentId) {
+  const agent = store.agents.find(a => a.id === agentId);
+  if (!agent) return;
+  if (agentTimers.has(agentId)) stopAgentRuntime(agentId);
+
+  const interval = (agent.config.refreshSec || 60) * 1000;
+  const state = { lastTick: 0, tickCount: 0, running: false, errors: 0 };
+
+  const tick = async () => {
+    if (store.killSwitch || agent.status !== 'running' || state.running) return;
+    state.running = true;
+    state.tickCount++;
+    state.lastTick = Date.now();
+
+    // Update heartbeat
+    agent.health.heartbeat = { lastTick: new Date().toISOString(), tickCount: state.tickCount, interval };
+
+    try {
+      // 1) Ensure market data is fresh
+      if (store.marketCache.data.length === 0 || (Date.now() - store.marketCache.fetchedAt) > store.marketCache.ttl) {
+        await fetchMarkets();
+      }
+
+      // 2) Run strategy
+      const opps = await runAgent(agentId);
+
+      // 3) Emit activity
+      logActivity('scan', `[${agent.name}] Tick #${state.tickCount}: ${opps.length} findings (${agent.stats.opportunities} qualifying)`);
+
+      state.errors = 0;
+    } catch (e) {
+      state.errors++;
+      console.error(`[runtime] ${agent.name} tick #${state.tickCount} error:`, e.message);
+      if (state.errors >= 5) {
+        agent.status = 'error';
+        logActivity('error', `[${agent.name}] Paused after 5 consecutive errors: ${e.message}`);
+      }
+    }
+    state.running = false;
+  };
+
+  // Run immediately, then on interval
+  setTimeout(tick, 500);
+  const timer = setInterval(tick, Math.max(10000, interval));
+  agentTimers.set(agentId, { timer, state });
+  logActivity('system', `[${agent.name}] Runtime started (interval: ${interval / 1000}s)`);
+}
+
+function stopAgentRuntime(agentId) {
+  const entry = agentTimers.get(agentId);
+  if (entry) {
+    clearInterval(entry.timer);
+    agentTimers.delete(agentId);
+    const agent = store.agents.find(a => a.id === agentId);
+    if (agent) logActivity('system', `[${agent.name}] Runtime stopped`);
+  }
+}
+
+function pauseAgentRuntime(agentId) {
+  const agent = store.agents.find(a => a.id === agentId);
+  if (agent) { agent.status = 'paused'; }
+  // Timer keeps running but tick() checks status
+}
+
+function resumeAgentRuntime(agentId) {
+  const agent = store.agents.find(a => a.id === agentId);
+  if (agent) {
+    agent.status = 'running';
+    if (!agentTimers.has(agentId)) startAgentRuntime(agentId);
+  }
+}
+
+// Start runtimes for all existing running agents
+function startAllAgentRuntimes() {
+  for (const agent of store.agents) {
+    if (agent.status === 'running') {
+      startAgentRuntime(agent.id);
+    }
+  }
+}
+
+// Legacy scheduler (still useful as backup)
 let agentSchedulerInterval = null;
 function startAgentScheduler() {
   if (agentSchedulerInterval) return;
+  // Start per-agent runtimes
+  startAllAgentRuntimes();
+  // Also start market cache refresh
+  startMarketCacheRefresh();
+  // Legacy fallback: catch any agents without runtimes
   agentSchedulerInterval = setInterval(async () => {
     if (store.killSwitch) return;
-    const now = Date.now();
     for (const agent of store.agents) {
-      if (agent.status !== 'running') continue;
-      const lastRun = agent.health.lastRunAt ? new Date(agent.health.lastRunAt).getTime() : 0;
-      const interval = (agent.config.refreshSec || 60) * 1000;
-      if (now - lastRun >= interval) {
-        try { await runAgent(agent.id); } catch (e) { console.error(`[scheduler] ${agent.name}:`, e.message); }
+      if (agent.status === 'running' && !agentTimers.has(agent.id)) {
+        startAgentRuntime(agent.id);
       }
     }
-  }, 10000);
+  }, 30000);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1811,32 +2592,53 @@ body{padding-bottom:50px}
     <div id="approvalList"></div>
   </div>
   <div class="panel" id="panel-negrisk">
-    <h3 style="font-size:15px;margin-bottom:14px">NegRisk Arbitrage Scanner</h3>
-    <div id="negriskContent"><div class="empty"><p>Create a NegRisk Arb agent to start scanning</p><button class="btn btn-p" style="margin-top:10px" onclick="quickCreateAgent('negrisk_arb')">Create NegRisk Agent</button></div></div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="font-size:15px">NegRisk Arbitrage Scanner</h3><button class="btn btn-p btn-sm" onclick="quickCreateAgent('negrisk_arb')">+ Create NegRisk Agent</button></div>
+    <div id="negriskDiag"></div>
+    <div id="negriskContent"><div class="empty"><p>Loading strategy data...</p></div></div>
   </div>
   <div class="panel" id="panel-llm">
-    <h3 style="font-size:15px;margin-bottom:14px">LLM Probability Mispricing</h3>
-    <div id="llmContent"><div class="empty"><p>Create an LLM Probability agent to analyze markets</p><button class="btn btn-p" style="margin-top:10px" onclick="quickCreateAgent('llm_probability')">Create LLM Agent</button></div></div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="font-size:15px">LLM Probability Mispricing</h3><button class="btn btn-p btn-sm" onclick="quickCreateAgent('llm_probability')">+ Create LLM Agent</button></div>
+    <div id="llmDiag"></div>
+    <div id="llmManualProb" style="margin-bottom:14px;display:none">
+      <div style="padding:10px;background:rgba(245,158,11,.06);border:1px solid rgba(245,158,11,.2);border-radius:8px;margin-bottom:8px">
+        <div style="font-size:11px;font-weight:700;color:var(--yellow);font-family:var(--mono);margin-bottom:4px">MANUAL PROBABILITY MODE</div>
+        <div style="font-size:11px;color:var(--t2)">No LLM API key configured. Enter your own probability estimates below.</div>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <select id="manualProbMarket" style="flex:1;min-width:200px;padding:6px;background:var(--bg0);border:1px solid var(--bd);border-radius:4px;color:var(--t1);font-family:var(--mono);font-size:10px"></select>
+        <input type="number" id="manualProbVal" placeholder="p(YES) 0.00-1.00" step="0.01" min="0" max="1" style="width:120px;padding:6px;background:var(--bg0);border:1px solid var(--bd);border-radius:4px;color:var(--t1);font-family:var(--mono);font-size:10px">
+        <input type="text" id="manualProbNote" placeholder="Note (optional)" style="width:150px;padding:6px;background:var(--bg0);border:1px solid var(--bd);border-radius:4px;color:var(--t1);font-family:var(--mono);font-size:10px">
+        <button class="btn btn-p btn-sm" onclick="submitManualProb()">Set p&#770;</button>
+      </div>
+    </div>
+    <div id="llmContent"><div class="empty"><p>Loading strategy data...</p></div></div>
   </div>
   <div class="panel" id="panel-sentiment">
-    <h3 style="font-size:15px;margin-bottom:14px">Sentiment / Headlines Console</h3>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="font-size:15px">Sentiment / Headlines Console</h3><button class="btn btn-p btn-sm" onclick="quickCreateAgent('sentiment')">+ Create Sentiment Agent</button></div>
+    <div id="sentimentDiag"></div>
     <p style="font-size:12px;color:var(--t2);margin-bottom:10px">Paste headlines below to analyze market impact. Uses xAI/Grok if key is set, otherwise falls back to Claude or keyword matching.</p>
     <textarea class="headline-box" id="headlineBox" placeholder="Paste headlines here, one per line...&#10;Example: Trump announces new tariffs on Chinese goods&#10;Fed signals rate hold through Q3 2026"></textarea>
     <div style="margin-top:8px;display:flex;gap:8px"><button class="btn btn-p" onclick="analyzeHeadlines()">Analyze Headlines</button><button class="btn" onclick="document.getElementById('headlineBox').value=''">Clear</button></div>
     <div id="sentimentResults" style="margin-top:14px"></div>
+    <div id="sentimentWatchlist" style="margin-top:14px"></div>
   </div>
   <div class="panel" id="panel-whales">
-    <h3 style="font-size:15px;margin-bottom:14px">Whale Pocket-Watching</h3>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="font-size:15px">Whale Pocket-Watching</h3><button class="btn btn-p btn-sm" onclick="quickCreateAgent('whale_watch')">+ Create Whale Agent</button></div>
+    <div id="whaleDiag"></div>
     <div class="whale-input"><input type="text" id="whaleAddr" placeholder="Wallet address (0x...)"><input type="text" id="whaleAlias" placeholder="Alias (optional)" style="max-width:120px"><button class="btn btn-p btn-sm" onclick="addWhale()">Add Wallet</button></div>
     <div id="whaleList" style="margin-bottom:14px"></div>
     <h4 style="font-size:12px;color:var(--t2);margin-bottom:8px">Recent Whale Events</h4>
     <div id="whaleEvents" class="tw" style="max-height:400px;overflow-y:auto"></div>
   </div>
   <div class="panel" id="panel-hub">
-    <div style="display:flex;gap:8px;margin-bottom:14px"><button class="btn btn-p btn-sm" id="hubTabChat" onclick="switchHubTab('chat')" style="border-bottom:2px solid var(--cyan)">Console Chat</button><button class="btn btn-sm" id="hubTabReport" onclick="switchHubTab('report')">System Report</button><button class="btn btn-sm" id="hubTabActivity" onclick="switchHubTab('activity')">Activity</button></div>
+    <div style="display:flex;gap:8px;margin-bottom:14px"><button class="btn btn-p btn-sm" id="hubTabChat" onclick="switchHubTab('chat')" style="border-bottom:2px solid var(--cyan)">Console Chat</button><button class="btn btn-sm" id="hubTabExplain" onclick="switchHubTab('explain')">Explain Hub</button><button class="btn btn-sm" id="hubTabReport" onclick="switchHubTab('report')">System Report</button><button class="btn btn-sm" id="hubTabActivity" onclick="switchHubTab('activity')">Activity</button></div>
     <div id="hubChat" class="console-wrap" style="background:var(--bg2);border:1px solid var(--bd);border-radius:10px">
       <div class="console-messages" id="consoleMessages"><div class="console-msg system">Welcome to the Founder Console. Ask me anything about your system.<br>Try: "What's missing?" or "NegRisk status" or "help"</div></div>
       <div class="console-input"><input type="text" id="consoleInput" placeholder="Ask about your system..." onkeydown="if(event.key==='Enter')sendConsoleMsg()"><button class="btn btn-p" onclick="sendConsoleMsg()">Ask</button></div>
+    </div>
+    <div id="hubExplain" style="display:none">
+      <h4 style="font-size:12px;color:var(--cyan);font-family:var(--mono);margin-bottom:10px">RECENT AGENT REASONING</h4>
+      <div id="explainHubContent"><div class="empty"><p>Loading...</p></div></div>
     </div>
     <div id="hubReport" style="display:none"><div class="report-grid" id="reportGrid"></div></div>
     <div id="hubActivity" style="display:none"><div class="hub-grid" id="hubGrid"></div></div>
@@ -1871,7 +2673,7 @@ document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () =>
   if (t.dataset.tab === 'settings') renderSettings();
   if (t.dataset.tab === 'agents') fetchAgents();
   if (t.dataset.tab === 'approvals') fetchApprovals();
-  if (t.dataset.tab === 'negrisk' || t.dataset.tab === 'llm') fetchStratOpps(t.dataset.tab);
+  if (['negrisk','llm','sentiment','whales'].includes(t.dataset.tab)) fetchStratOpps(t.dataset.tab);
   if (t.dataset.tab === 'whales') fetchWhaleData();
   if (t.dataset.tab === 'health') { runDiag(); fetchAgentHealth(); }
 }));
@@ -1966,7 +2768,9 @@ function renderAgents(){
   if(!agents.length){document.getElementById('agentList').innerHTML='<div class="empty"><p>No agents created yet</p><p class="eh">Click "+ Create Agent" to deploy a strategy</p></div>';return;}
   document.getElementById('agentList').innerHTML=agents.map(a=>{
     const sc='st-'+(a.status||'disabled');
-    return '<div class="agent-card"><div class="ac-h"><div><span class="ac-name">'+esc(a.name)+'</span> <span class="ac-type">'+a.strategyType+'</span></div><div style="display:flex;gap:6px;align-items:center"><span class="status-pill '+sc+'">'+(a.status||'?')+'</span><button class="btn btn-sm" onclick="toggleAgentStatus(\\''+a.id+'\\')">'+((a.status==='running')?'Pause':'Resume')+'</button><button class="btn btn-sm btn-r" onclick="deleteAgentUI(\\''+a.id+'\\')">Del</button></div></div><div class="agent-stats"><div class="as-item"><div class="as-l">Scanned</div><div class="as-v">'+a.stats.scanned+'</div></div><div class="as-item"><div class="as-l">Opportunities</div><div class="as-v">'+a.stats.opportunities+'</div></div><div class="as-item"><div class="as-l">Pending</div><div class="as-v">'+a.stats.approvalsPending+'</div></div><div class="as-item"><div class="as-l">Executed</div><div class="as-v">'+a.stats.executed+'</div></div><div class="as-item"><div class="as-l">Mode</div><div class="as-v" style="font-size:10px">'+a.config.mode+'</div></div><div class="as-item"><div class="as-l">Budget</div><div class="as-v">$'+a.config.budgetUSDC+'</div></div></div><div style="font-size:10px;color:var(--t3);font-family:var(--mono)">Last run: '+(a.health.lastRunAt?new Date(a.health.lastRunAt).toLocaleTimeString():'never')+' | Min edge: '+a.config.minEdgePct+'% | Refresh: '+a.config.refreshSec+'s</div></div>';
+    const hb = a.health.heartbeat;
+    const hbInfo = hb ? ' | Tick #' + (hb.tickCount || 0) : '';
+    return '<div class="agent-card"><div class="ac-h"><div><span class="ac-name">'+esc(a.name)+'</span> <span class="ac-type">'+a.strategyType+'</span></div><div style="display:flex;gap:6px;align-items:center"><span class="status-pill '+sc+'">'+(a.status||'?')+'</span><button class="btn btn-sm" onclick="runAgentNow(\\''+a.id+'\\')">Run Now</button><button class="btn btn-sm" onclick="toggleAgentStatus(\\''+a.id+'\\')">'+((a.status==='running')?'Pause':'Resume')+'</button><button class="btn btn-sm btn-r" onclick="deleteAgentUI(\\''+a.id+'\\')">Del</button></div></div><div class="agent-stats"><div class="as-item"><div class="as-l">Scanned</div><div class="as-v">'+a.stats.scanned+'</div></div><div class="as-item"><div class="as-l">Opportunities</div><div class="as-v">'+a.stats.opportunities+'</div></div><div class="as-item"><div class="as-l">Pending</div><div class="as-v">'+a.stats.approvalsPending+'</div></div><div class="as-item"><div class="as-l">Executed</div><div class="as-v">'+a.stats.executed+'</div></div><div class="as-item"><div class="as-l">Mode</div><div class="as-v" style="font-size:10px">'+a.config.mode+'</div></div><div class="as-item"><div class="as-l">Budget</div><div class="as-v">$'+a.config.budgetUSDC+'</div></div></div>'+(a.health.errors?.length?'<div style="font-size:9px;color:var(--red);font-family:var(--mono);margin-top:4px">Last error: '+esc(a.health.errors[a.health.errors.length-1]?.msg||'')+'</div>':'')+'<div style="font-size:10px;color:var(--t3);font-family:var(--mono)">Last run: '+(a.health.lastRunAt?new Date(a.health.lastRunAt).toLocaleTimeString():'never')+hbInfo+' | Min edge: '+a.config.minEdgePct+'% | Refresh: '+a.config.refreshSec+'s</div></div>';
   }).join('');
 }
 function showCreateAgent(){
@@ -1978,6 +2782,7 @@ async function doCreateAgent(){
 }
 async function quickCreateAgent(strat){try{const r=await post('/api/agents',{strategyType:strat});if(r.agent){toast('Created '+r.agent.name,'success');fetchAgents();}}catch(e){toast('Failed','error');}}
 async function toggleAgentStatus(id){const a=agents.find(x=>x.id===id);if(!a)return;const ns=a.status==='running'?'paused':'running';try{await post('/api/agents/'+id,{status:ns});toast(ns==='running'?'Resumed':'Paused','info');fetchAgents();}catch(e){toast('Failed','error');}}
+async function runAgentNow(id){try{const r=await post('/api/command',{text:'run agent '+id});toast(r.message||'Running...','info');setTimeout(fetchAgents,2000);}catch(e){toast('Failed','error');}}
 async function deleteAgentUI(id){try{await fetch('/api/agents/'+id,{method:'DELETE'});toast('Deleted','info');fetchAgents();}catch(e){toast('Failed','error');}}
 
 // Approvals
@@ -1997,14 +2802,178 @@ function showExplain(id){
   document.getElementById('marketModal').innerHTML='<div class="modal-overlay" onclick="closeModal(event)"><div class="modal" onclick="event.stopPropagation()"><div class="modal-h"><h2>Explain: '+esc(a.payload?.title||'')+'</h2><button class="modal-x" onclick="closeModal()">X</button></div><div class="modal-b"><h4 style="color:var(--cyan);font-family:var(--mono);font-size:11px;margin-bottom:8px">MATH</h4><pre style="background:rgba(0,0,0,.2);padding:10px;border-radius:6px;font-family:var(--mono);font-size:11px;color:var(--t2);overflow-x:auto;white-space:pre-wrap">'+esc(ex.math||'N/A')+'</pre><h4 style="color:var(--cyan);font-family:var(--mono);font-size:11px;margin:12px 0 8px">INPUTS</h4><pre style="background:rgba(0,0,0,.2);padding:10px;border-radius:6px;font-family:var(--mono);font-size:10px;color:var(--t2);overflow-x:auto;white-space:pre-wrap">'+esc(JSON.stringify(ex.inputs||{},null,2))+'</pre><h4 style="color:var(--cyan);font-family:var(--mono);font-size:11px;margin:12px 0 8px">ASSUMPTIONS</h4><ul style="padding-left:16px;font-size:11px;color:var(--t2)">'+(ex.assumptions||[]).map(a=>'<li>'+esc(a)+'</li>').join('')+'</ul><h4 style="color:var(--red);font-family:var(--mono);font-size:11px;margin:12px 0 8px">FAILURE MODES</h4><ul style="padding-left:16px;font-size:11px;color:var(--t2)">'+(ex.failureModes||[]).map(f=>'<li>'+esc(f)+'</li>').join('')+'</ul></div></div></div>';
 }
 
-// Strategy tabs
-async function fetchStratOpps(tab){
-  try{const d=await api('/api/strategy-opportunities?type='+(tab==='negrisk'?'negrisk_arb':'llm_probability'));
-    const el=document.getElementById(tab+'Content');
-    const items=d.opportunities||[];
-    if(!items.length){el.innerHTML='<div class="empty"><p>No opportunities yet. Create an agent or wait for next scan.</p></div>';return;}
-    el.innerHTML='<div class="tw"><table><thead><tr><th>Market</th><th>Edge%</th><th>Action</th><th>Confidence</th><th>Rationale</th></tr></thead><tbody>'+items.map(o=>'<tr><td class="mn">'+esc(o.title||'')+'</td><td class="'+(o.edgePct>=2?'edge-h':o.edgePct>=1?'edge-m':'edge-l')+'">'+(o.edgePct?.toFixed(2)||'?')+'%</td><td class="mono">'+esc(o.action||'')+'</td><td class="mono">'+(o.confidence?.toFixed(0)||'?')+'</td><td style="font-size:11px;color:var(--t2);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(o.rationaleSummary||'')+'</td></tr>').join('')+'</tbody></table></div>';
-  }catch(e){}}
+// Strategy tabs (with diagnostics)
+function renderStratDiag(diagEl, diag) {
+  if (!diag || !diagEl) return;
+  let h = '';
+  // Blocking items
+  if (diag.blockingItems?.length) {
+    h += '<div style="padding:8px 12px;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.2);border-radius:6px;margin-bottom:8px">';
+    h += '<div style="font-size:10px;font-weight:700;color:var(--red);font-family:var(--mono);margin-bottom:4px">BLOCKING ITEMS</div>';
+    diag.blockingItems.forEach(b => { h += '<div style="font-size:11px;color:var(--t2);margin-bottom:3px">&#8226; <b>' + esc(b.item) + '</b> — ' + esc(b.fix) + '<br><span style="font-size:10px;color:var(--t3)">Fallback: ' + esc(b.fallback) + '</span></div>'; });
+    h += '</div>';
+  }
+  // Fallback mode
+  if (diag.fallbackMode) {
+    h += '<div style="padding:6px 10px;background:rgba(245,158,11,.06);border:1px solid rgba(245,158,11,.2);border-radius:6px;margin-bottom:8px;font-size:10px;color:var(--yellow);font-family:var(--mono)">FALLBACK MODE: ' + esc(diag.fallbackMode) + '</div>';
+  }
+  // Data status
+  if (diag.dataStatus?.length) {
+    h += '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">';
+    diag.dataStatus.forEach(d => {
+      const ok = d.available;
+      h += '<div style="padding:3px 8px;border-radius:4px;font-size:9px;font-family:var(--mono);background:' + (ok ? 'rgba(34,197,94,.1)' : 'rgba(245,158,11,.1)') + ';color:' + (ok ? 'var(--green)' : 'var(--yellow)') + ';border:1px solid ' + (ok ? 'rgba(34,197,94,.2)' : 'rgba(245,158,11,.2)') + '">' + (ok ? 'OK' : 'FALLBACK') + ': ' + esc(d.label) + '</div>';
+    });
+    h += '</div>';
+  }
+  // Agent count + stats
+  h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;font-size:10px;font-family:var(--mono);color:var(--t3)">';
+  h += '<span>Agents: ' + (diag.activeAgents || 0) + '/' + (diag.agentCount || 0) + '</span>';
+  h += '<span>Findings: ' + (diag.totalFindings || 0) + '</span>';
+  if (diag.lastRun) h += '<span>Last: ' + new Date(diag.lastRun).toLocaleTimeString() + '</span>';
+  h += '</div>';
+  // Gate failure distribution
+  if (diag.gateFailures && Object.keys(diag.gateFailures).length > 0) {
+    h += '<details style="margin-bottom:8px"><summary style="font-size:10px;font-family:var(--mono);color:var(--t3);cursor:pointer">Gate Failures (' + Object.values(diag.gateFailures).reduce((a,b)=>a+b,0) + ' total)</summary>';
+    h += '<div style="padding:6px;background:rgba(0,0,0,.1);border-radius:4px;margin-top:4px">';
+    Object.entries(diag.gateFailures).forEach(([reason, count]) => {
+      h += '<div style="font-size:9px;font-family:var(--mono);color:var(--t3);margin-bottom:2px">' + count + 'x — ' + esc(reason.slice(0, 80)) + '</div>';
+    });
+    h += '</div></details>';
+  }
+  // Questions for founders
+  if (diag.questionsForFounders?.length) {
+    h += '<details style="margin-bottom:8px"><summary style="font-size:10px;font-family:var(--mono);color:var(--blue);cursor:pointer">Strategy Questions for Founders</summary>';
+    h += '<div style="padding:8px;background:rgba(99,102,241,.04);border:1px solid rgba(99,102,241,.15);border-radius:6px;margin-top:4px">';
+    diag.questionsForFounders.forEach((q, i) => { h += '<div style="font-size:11px;color:var(--t2);margin-bottom:4px">' + (i+1) + '. ' + esc(q) + '</div>'; });
+    h += '</div></details>';
+  }
+  diagEl.innerHTML = h;
+}
+
+async function fetchStratDiag(stratType, diagElId) {
+  try {
+    const d = await api('/api/strategy-diagnostics?type=' + stratType);
+    renderStratDiag(document.getElementById(diagElId), d);
+  } catch(e) {}
+}
+
+async function fetchStratOpps(tab) {
+  const stratMap = { negrisk: 'negrisk_arb', llm: 'llm_probability', sentiment: 'sentiment', whales: 'whale_watch' };
+  const stratType = stratMap[tab] || tab;
+  const contentId = tab + 'Content';
+  const diagId = tab + 'Diag';
+
+  // Fetch diagnostics
+  fetchStratDiag(stratType, diagId);
+
+  try {
+    const d = await api('/api/strategy-findings?type=' + stratType);
+    const el = document.getElementById(contentId);
+    if (!el) return;
+    const items = d.findings || [];
+    if (!items.length) {
+      el.innerHTML = '<div class="empty"><p>No findings yet. Create an agent or wait for next scan cycle.</p><p class="eh">Strategy: ' + esc(stratType) + '</p></div>';
+      return;
+    }
+    let h = '<div class="tw"><table><thead><tr><th>#</th><th>Market</th><th>Edge%</th><th>Action</th><th>Conf</th><th>Rationale</th><th>Explain</th></tr></thead><tbody>';
+    items.forEach((o, i) => {
+      const ec = (o.edgePct || 0) >= 2 ? 'edge-h' : (o.edgePct || 0) >= 1 ? 'edge-m' : 'edge-l';
+      const actionColor = o.action === 'PASS' || o.action === 'WAITING' ? 'var(--t3)' : o.action === 'ARB_BASKET' || o.action === 'BUY_YES' || o.action === 'BUY_NO' ? 'var(--green)' : o.action === 'FOLLOW' ? 'var(--cyan)' : 'var(--t2)';
+      h += '<tr style="cursor:pointer" onclick="showFindingExplain(' + i + ',\\'' + esc(stratType) + '\\')">';
+      h += '<td class="mono">' + (i+1) + '</td>';
+      h += '<td class="mn">' + esc((o.title || '').slice(0, 80)) + '</td>';
+      h += '<td class="' + ec + '">' + ((o.edgePct || o.netEdge || 0).toFixed(2)) + '%</td>';
+      h += '<td style="font-family:var(--mono);font-size:10px;color:' + actionColor + '">' + esc(o.action || '?') + '</td>';
+      h += '<td class="mono">' + ((o.confidence || 0).toFixed ? (o.confidence || 0).toFixed(0) : o.confidence || '?') + '</td>';
+      h += '<td style="font-size:10px;color:var(--t2);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc((o.rationaleSummary || '').slice(0, 120)) + '</td>';
+      h += '<td><button class="btn btn-sm" onclick="event.stopPropagation();showFindingExplain(' + i + ',\\'' + esc(stratType) + '\\')">View</button></td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table></div>';
+    el.innerHTML = h;
+
+    // For LLM tab: show manual probability input if no LLM key
+    if (tab === 'llm') {
+      const hasLLM = items.some(o => o.probSource === 'llm');
+      const manualEl = document.getElementById('llmManualProb');
+      if (manualEl) {
+        manualEl.style.display = (!hasLLM || items.some(o => o.status === 'manual_mode')) ? 'block' : 'none';
+        // Populate market dropdown
+        try {
+          const mkts = await api('/api/opportunities');
+          const sel = document.getElementById('manualProbMarket');
+          if (sel && mkts.opportunities) {
+            sel.innerHTML = mkts.opportunities.slice(0, 30).map(m => '<option value="' + (m.id || m.conditionId) + '">' + esc(m.market.slice(0, 60)) + ' (YES: ' + m.bestBid.toFixed(2) + ')</option>').join('');
+          }
+        } catch {}
+      }
+    }
+  } catch(e) {}
+}
+
+// Finding explain modal (for any strategy)
+let _lastFindings = {};
+async function showFindingExplain(idx, stratType) {
+  try {
+    const d = await api('/api/strategy-findings?type=' + stratType);
+    const items = d.findings || [];
+    const o = items[idx];
+    if (!o || !o.explain) { toast('No explain data', 'error'); return; }
+    const ex = o.explain;
+    let h = '<div class="modal-overlay" onclick="closeModal(event)"><div class="modal" onclick="event.stopPropagation()" style="max-width:750px"><div class="modal-h"><h2>' + esc((o.title || '').slice(0, 80)) + '</h2><button class="modal-x" onclick="closeModal()">X</button></div><div class="modal-b">';
+    // Status + Action
+    h += '<div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">';
+    h += '<span class="status-pill st-' + (o.status === 'new' ? 'running' : o.status === 'gated' ? 'paused' : 'disabled') + '">' + esc(o.status || '?') + '</span>';
+    h += '<span style="font-family:var(--mono);font-size:11px;font-weight:700;color:' + (o.action === 'PASS' ? 'var(--t3)' : 'var(--green)') + '">' + esc(o.action || '?') + '</span>';
+    if (o.probSource) h += '<span style="font-family:var(--mono);font-size:10px;color:var(--t3)">Source: ' + esc(o.probSource) + '</span>';
+    h += '</div>';
+    // Stats grid
+    h += '<div class="md-grid">';
+    if (o.edgePct !== undefined) h += '<div class="md-stat"><div class="ms-l">Edge</div><div class="ms-v ' + (o.edgePct >= 2 ? 'edge-h' : 'edge-l') + '">' + o.edgePct.toFixed(2) + '%</div></div>';
+    if (o.netEdge !== undefined) h += '<div class="md-stat"><div class="ms-l">Net Edge</div><div class="ms-v">' + o.netEdge.toFixed(2) + '%</div></div>';
+    if (o.confidence !== undefined) h += '<div class="md-stat"><div class="ms-l">Confidence</div><div class="ms-v">' + (typeof o.confidence === "number" ? o.confidence.toFixed(0) : o.confidence) + '%</div></div>';
+    if (o.llmProbability !== undefined) h += '<div class="md-stat"><div class="ms-l">LLM p&#770;</div><div class="ms-v">' + (o.llmProbability * 100).toFixed(1) + '%</div></div>';
+    if (o.marketProbability !== undefined) h += '<div class="md-stat"><div class="ms-l">Market Price</div><div class="ms-v">' + (o.marketProbability * 100).toFixed(1) + '%</div></div>';
+    if (o.sumYes !== undefined) h += '<div class="md-stat"><div class="ms-l">Sum YES</div><div class="ms-v">' + o.sumYes.toFixed(4) + '</div></div>';
+    if (o.numOutcomes) h += '<div class="md-stat"><div class="ms-l">Outcomes</div><div class="ms-v">' + o.numOutcomes + '</div></div>';
+    if (o.liquidity) h += '<div class="md-stat"><div class="ms-l">Liquidity</div><div class="ms-v">$' + fmt(o.liquidity) + '</div></div>';
+    h += '</div>';
+    // Math
+    h += '<h4 style="color:var(--cyan);font-family:var(--mono);font-size:11px;margin:12px 0 6px">COMPUTATION</h4>';
+    h += '<pre style="background:rgba(0,0,0,.2);padding:10px;border-radius:6px;font-family:var(--mono);font-size:10px;color:var(--t2);overflow-x:auto;white-space:pre-wrap">' + esc(ex.math || 'N/A') + '</pre>';
+    // Inputs
+    h += '<h4 style="color:var(--cyan);font-family:var(--mono);font-size:11px;margin:12px 0 6px">RAW INPUTS</h4>';
+    h += '<pre style="background:rgba(0,0,0,.2);padding:10px;border-radius:6px;font-family:var(--mono);font-size:9px;color:var(--t2);overflow-x:auto;white-space:pre-wrap;max-height:200px;overflow-y:auto">' + esc(JSON.stringify(ex.inputs || {}, null, 2)) + '</pre>';
+    // Risk Gates
+    if (ex.riskGates) {
+      h += '<h4 style="color:' + (ex.riskGates.passed ? 'var(--green)' : 'var(--red)') + ';font-family:var(--mono);font-size:11px;margin:12px 0 6px">RISK GATES: ' + (ex.riskGates.passed ? 'PASSED' : 'FAILED') + '</h4>';
+      if (ex.riskGates.failReason) h += '<div style="font-size:11px;color:var(--red);font-family:var(--mono);padding:6px;background:rgba(239,68,68,.06);border-radius:4px">Reason: ' + esc(ex.riskGates.failReason) + '</div>';
+    }
+    // Assumptions
+    h += '<h4 style="color:var(--cyan);font-family:var(--mono);font-size:11px;margin:12px 0 6px">ASSUMPTIONS</h4>';
+    h += '<ul style="padding-left:16px;font-size:11px;color:var(--t2)">' + (ex.assumptions || []).map(a => '<li>' + esc(a) + '</li>').join('') + '</ul>';
+    // Failure modes
+    h += '<h4 style="color:var(--red);font-family:var(--mono);font-size:11px;margin:12px 0 6px">FAILURE MODES</h4>';
+    h += '<ul style="padding-left:16px;font-size:11px;color:var(--t2)">' + (ex.failureModes || []).map(f => '<li>' + esc(f) + '</li>').join('') + '</ul>';
+    h += '</div></div></div>';
+    document.getElementById('marketModal').innerHTML = h;
+  } catch(e) { toast('Failed to load explain data', 'error'); }
+}
+
+async function submitManualProb() {
+  const marketId = document.getElementById('manualProbMarket')?.value;
+  const prob = parseFloat(document.getElementById('manualProbVal')?.value);
+  const note = document.getElementById('manualProbNote')?.value || '';
+  if (!marketId || isNaN(prob) || prob < 0 || prob > 1) { toast('Enter market and probability (0-1)', 'error'); return; }
+  try {
+    await post('/api/manual-probability', { marketId, prob, note });
+    toast('Manual p set: ' + (prob * 100).toFixed(0) + '%', 'success');
+    document.getElementById('manualProbVal').value = '';
+    document.getElementById('manualProbNote').value = '';
+    fetchStratOpps('llm');
+  } catch(e) { toast('Failed', 'error'); }
+}
 
 // Sentiment
 async function analyzeHeadlines(){
@@ -2276,13 +3245,39 @@ async function wizApproveRisks(){
 // Founder Console
 function switchHubTab(tab){
   document.getElementById('hubChat').style.display=tab==='chat'?'flex':'none';
+  document.getElementById('hubExplain').style.display=tab==='explain'?'block':'none';
   document.getElementById('hubReport').style.display=tab==='report'?'block':'none';
   document.getElementById('hubActivity').style.display=tab==='activity'?'block':'none';
-  ['hubTabChat','hubTabReport','hubTabActivity'].forEach(id=>{const el=document.getElementById(id);if(el){el.className='btn btn-sm';el.style.borderBottom='';}});
+  ['hubTabChat','hubTabExplain','hubTabReport','hubTabActivity'].forEach(id=>{const el=document.getElementById(id);if(el){el.className='btn btn-sm';el.style.borderBottom='';}});
   const active=document.getElementById('hubTab'+tab.charAt(0).toUpperCase()+tab.slice(1));
   if(active){active.className='btn btn-p btn-sm';active.style.borderBottom='2px solid var(--cyan)';}
   if(tab==='report')fetchSystemReport();
   if(tab==='activity'){fetchSysStatus();fetchActLog();}
+  if(tab==='explain')fetchExplainHub();
+}
+
+async function fetchExplainHub(){
+  try {
+    const all = await api('/api/strategy-findings');
+    const el = document.getElementById('explainHubContent');
+    if (!el) return;
+    let h = '';
+    for (const [stratType, findings] of Object.entries(all.findings || {})) {
+      const recent = (findings || []).filter(f => f.action !== 'WAITING' && f.action !== 'MANUAL_INPUT_NEEDED').slice(0, 5);
+      if (!recent.length) continue;
+      const spec = { negrisk_arb: 'NegRisk Arb', llm_probability: 'LLM Probability', sentiment: 'Sentiment', whale_watch: 'Whale Watch' };
+      h += '<div style="margin-bottom:14px"><h4 style="font-size:11px;font-family:var(--mono);color:var(--blue);margin-bottom:6px">' + (spec[stratType] || stratType) + '</h4>';
+      recent.forEach((f, i) => {
+        const ec = (f.edgePct || 0) >= 2 ? 'var(--green)' : (f.edgePct || 0) >= 1 ? 'var(--yellow)' : 'var(--t3)';
+        h += '<div style="padding:8px 10px;background:var(--bg2);border:1px solid var(--bd);border-radius:6px;margin-bottom:4px;cursor:pointer" onclick="showFindingExplain(' + i + ',\\'' + stratType + '\\')">';
+        h += '<div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:12px;font-weight:600">' + esc((f.title || '').slice(0, 60)) + '</span><span style="font-family:var(--mono);font-size:10px;color:' + ec + '">' + ((f.edgePct || 0).toFixed ? (f.edgePct || 0).toFixed(2) + '%' : '') + ' ' + esc(f.action || '') + '</span></div>';
+        h += '<div style="font-size:10px;color:var(--t3);font-family:var(--mono);margin-top:2px">' + esc((f.rationaleSummary || '').slice(0, 120)) + '</div>';
+        h += '</div>';
+      });
+      h += '</div>';
+    }
+    el.innerHTML = h || '<div class="empty"><p>No findings yet. Create agents and wait for scans.</p></div>';
+  } catch(e) { document.getElementById('explainHubContent').innerHTML = '<div class="empty"><p>Failed to load</p></div>'; }
 }
 
 async function sendConsoleMsg(){
@@ -2365,15 +3360,18 @@ async function handleRequest(req, res) {
     if (pathname === '/api/agents' && method === 'POST') {
       const body = await readBody(req);
       const agent = createAgent(body);
-      // Run immediately
-      setTimeout(() => runAgent(agent.id).catch(() => {}), 100);
+      // createAgent now starts runtime automatically
       return jsonResp(res, { ok: true, agent });
     }
     if (pathname.startsWith('/api/agents/') && method === 'POST') {
       const id = pathname.split('/')[3];
       const body = await readBody(req);
       const agent = updateAgent(id, body);
-      return agent ? jsonResp(res, { ok: true, agent }) : jsonResp(res, { error: 'Not found' }, 404);
+      if (!agent) return jsonResp(res, { error: 'Not found' }, 404);
+      // Handle runtime state changes
+      if (body.status === 'running') resumeAgentRuntime(id);
+      else if (body.status === 'paused') pauseAgentRuntime(id);
+      return jsonResp(res, { ok: true, agent });
     }
     if (pathname.startsWith('/api/agents/') && method === 'DELETE') {
       const id = pathname.split('/')[3];
@@ -2420,6 +3418,66 @@ async function handleRequest(req, res) {
       const type = url.searchParams.get('type');
       const opps = type ? store.strategyOpportunities.filter(o => o.strategyType === type) : store.strategyOpportunities;
       return jsonResp(res, { opportunities: opps });
+    }
+
+    // Strategy specs
+    if (pathname === '/api/strategy-specs' && method === 'GET') {
+      const specs = {};
+      for (const [id, spec] of Object.entries(STRATEGY_SPECS)) {
+        specs[id] = { id: spec.id, label: spec.label, goal: spec.goal, compute_steps: spec.compute_steps, risk_gates: spec.risk_gates, questions_for_founders: spec.questions_for_founders };
+      }
+      return jsonResp(res, { specs });
+    }
+
+    // Strategy diagnostics (per-strategy)
+    if (pathname === '/api/strategy-diagnostics' && method === 'GET') {
+      const type = url.searchParams.get('type');
+      if (type) {
+        return jsonResp(res, getStrategyDiagnostics(type));
+      }
+      // All strategies
+      const all = {};
+      for (const id of Object.keys(STRATEGY_SPECS)) {
+        all[id] = getStrategyDiagnostics(id);
+      }
+      return jsonResp(res, { strategies: all });
+    }
+
+    // Strategy findings (ring buffer)
+    if (pathname === '/api/strategy-findings' && method === 'GET') {
+      const type = url.searchParams.get('type');
+      if (type) {
+        return jsonResp(res, { findings: store.findingsRing[type] || [], diagnostics: store.strategyDiagnostics[type] || {} });
+      }
+      return jsonResp(res, { findings: store.findingsRing, diagnostics: store.strategyDiagnostics });
+    }
+
+    // Manual probability input (for LLM Prob fallback)
+    if (pathname === '/api/manual-probability' && method === 'POST') {
+      const body = await readBody(req);
+      if (!body.marketId || body.prob === undefined) return jsonResp(res, { error: 'marketId and prob required' }, 400);
+      store.manualProbabilities[body.marketId] = { prob: parseFloat(body.prob), confidence: parseFloat(body.confidence || 0.7), note: body.note || '', ts: new Date().toISOString() };
+      markDirty();
+      logActivity('config', `Manual probability set for market: p̂=${body.prob}`);
+      return jsonResp(res, { ok: true, manualProbabilities: store.manualProbabilities });
+    }
+    if (pathname === '/api/manual-probability' && method === 'GET') {
+      return jsonResp(res, { manualProbabilities: store.manualProbabilities });
+    }
+
+    // Signal bus state
+    if (pathname === '/api/signal-bus' && method === 'GET') {
+      return jsonResp(res, {
+        watchlists: signalBus.getRecent('watchlists', 3600000).slice(0, 50),
+        marketCandidates: signalBus.getRecent('marketCandidates', 3600000).slice(0, 50),
+        entities: signalBus.getRecent('entities', 3600000).slice(0, 50),
+        whaleMarkets: signalBus.getRecent('whaleMarkets', 3600000).slice(0, 50),
+      });
+    }
+
+    // Proposals ring buffer
+    if (pathname === '/api/proposals' && method === 'GET') {
+      return jsonResp(res, { proposals: store.proposalsRing.slice(0, 50) });
     }
 
     // Kill switch
