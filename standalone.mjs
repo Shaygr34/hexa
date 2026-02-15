@@ -844,6 +844,80 @@ function startAgentScheduler() {
   }, 10000);
 }
 
+// ── Quick Start: complete setup + launch all agents ──
+async function quickStart() {
+  const results = { steps: [], agents: [] };
+
+  // Step 3: Fund capital (default if not set)
+  if (!store.founder.capitalAllocated) {
+    store.founder.capitalAllocated = true;
+    logActivity('config', 'Quick Start: Fund capital confirmed at $' + store.founder.fundSize.toLocaleString());
+    results.steps.push('Capital: $' + store.founder.fundSize.toLocaleString());
+    markDirty();
+  }
+
+  // Step 4: Approve risk limits
+  if (!store.founder.risksApproved) {
+    store.founder.risksApproved = true;
+    logActivity('config', 'Quick Start: Risk limits approved');
+    results.steps.push('Risk limits approved');
+    markDirty();
+  }
+
+  // Create default agents if none exist
+  const strategies = [
+    { strategyType: 'negrisk_arb', name: 'NegRisk Scanner', refreshSec: 60, minEdgePct: 0.5 },
+    { strategyType: 'llm_probability', name: 'LLM Probability', refreshSec: 120, minEdgePct: 2.0 },
+    { strategyType: 'sentiment', name: 'Sentiment Analyzer', refreshSec: 90, minEdgePct: 0 },
+    { strategyType: 'whale_watch', name: 'Whale Watcher', refreshSec: 60, minEdgePct: 0 },
+  ];
+  for (const cfg of strategies) {
+    const existing = store.agents.find(a => a.strategyType === cfg.strategyType);
+    if (!existing) {
+      const agent = createAgent(cfg);
+      results.agents.push(agent.name);
+    }
+  }
+
+  // Kick off first scan
+  await fetchMarkets().catch(() => {});
+
+  // Run all agents immediately
+  for (const agent of store.agents) {
+    if (agent.status === 'running') {
+      try { await runAgent(agent.id); } catch (e) { /* continue */ }
+    }
+  }
+
+  logActivity('system', 'Quick Start complete: ' + results.agents.length + ' agents launched');
+  return { ok: true, ...results, blockers: getBlockers() };
+}
+
+// Auto-bootstrap: create default agents on startup if keys present and no agents exist
+function autoBootstrap() {
+  if (store.agents.length > 0) return; // already have agents
+
+  const hasLLM = (process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_API_KEY.length > 10) ||
+                 (process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.length > 10);
+
+  // Always create NegRisk (no keys needed)
+  createAgent({ strategyType: 'negrisk_arb', name: 'NegRisk Scanner', refreshSec: 60, minEdgePct: 0.5 });
+
+  // Create LLM agent if key is present
+  if (hasLLM) {
+    createAgent({ strategyType: 'llm_probability', name: 'LLM Probability', refreshSec: 120, minEdgePct: 2.0 });
+  }
+
+  // Sentiment (works with keyword fallback even without keys)
+  createAgent({ strategyType: 'sentiment', name: 'Sentiment Analyzer', refreshSec: 90, minEdgePct: 0 });
+
+  // Whale watch (always available)
+  createAgent({ strategyType: 'whale_watch', name: 'Whale Watcher', refreshSec: 60, minEdgePct: 0 });
+
+  console.log('  [auto] Created ' + store.agents.length + ' default agents');
+  logActivity('system', 'Auto-created ' + store.agents.length + ' default agents');
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // CLOB TRADE EXECUTION (Gated)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1943,7 +2017,12 @@ async function fetchBlockers(){try{const d=await api('/api/blockers');blockerDat
 function renderAQ(){
   if(!blockerData)return;const{blockers:bs,currentStep:cs,allClear}=blockerData;
   document.getElementById('aqProg').textContent=allClear?'ALL CLEAR':'Step '+cs+'/'+bs.length;
-  if(allClear){document.getElementById('aqSteps').innerHTML='<div style="display:flex;align-items:center;gap:8px;padding:8px 14px;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.25);border-radius:8px;font-family:var(--mono);font-size:11px;color:var(--green);font-weight:600">ALL SYSTEMS GO — Ready for trading decisions</div>';return;}
+  if(allClear){document.getElementById('aqSteps').innerHTML='<div style="display:flex;align-items:center;gap:8px;padding:8px 14px;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.25);border-radius:8px;font-family:var(--mono);font-size:11px;color:var(--green);font-weight:600">ALL SYSTEMS GO — Agents scanning, check Markets and Approvals tabs</div>';return;}
+  // Check if steps 1-2 are done (keys + wallet) — show Quick Start button
+  const keysDone=bs[0]?.status==='done'||false;const walletDone=bs[1]?.status==='done'||false;
+  const needsQuickStart=keysDone&&!allClear;
+  let quickBtn='';
+  if(needsQuickStart){quickBtn='<div style="flex:0 0 auto;display:flex;align-items:center"><button class="btn btn-g" style="padding:10px 20px;font-size:12px;font-weight:700;white-space:nowrap" onclick="doQuickStart()">Quick Start — Complete Setup & Launch Agents</button></div>';}
   document.getElementById('aqSteps').innerHTML=bs.map((b,i)=>{
     let sc='step-locked';if(b.status==='done')sc='step-done';else if(b.status==='blocked')sc=i===cs-1?'step-blocked step-current':'step-blocked';else if(b.status==='action-needed')sc=i===cs-1?'step-current':'';else if(b.status==='ready')sc='step-current';
     let statusLine='';
@@ -1952,9 +2031,21 @@ function renderAQ(){
     else if(b.status==='action-needed')statusLine='<div style="font-size:9px;color:var(--yellow);font-family:var(--mono);margin-top:4px">Action needed</div>';
     const clk=b.status!=='done'&&b.status!=='locked'?' onclick="openWizard(\\''+b.id+'\\')"':'';
     return '<div class="aq-step '+sc+'"'+clk+'><div class="aq-num">'+(b.status==='done'?'>':i+1)+'</div><div class="aq-step-title">'+esc(b.title)+'</div><div class="aq-step-desc">'+esc(b.desc)+'</div>'+statusLine+'</div>';
-  }).join('');
+  }).join('')+quickBtn;
 }
 function toggleExp(id){openWizard(id);}
+async function doQuickStart(){
+  toast('Launching Quick Start...','info');
+  try{
+    const r=await post('/api/quick-start',{});
+    if(r.ok){
+      blockerData=r.blockers;tradingUnlocked=r.blockers?.allClear||false;
+      toast('Setup complete! '+r.agents.length+' agents launched','success');
+      renderAQ();renderFundBar();fetchAgents();fetchOpps();
+      if(r.blockers?.allClear)setTimeout(()=>toast('Agents are scanning — check Markets and Approvals tabs','info'),1500);
+    }else{toast('Quick Start failed','error');}
+  }catch(e){toast('Quick Start error: '+e.message,'error');}
+}
 async function setCap(){const v=parseInt(document.getElementById('aqCap')?.value);if(!v||v<100){toast('Min $100','error');return;}try{const r=await post('/api/founder/set-capital',{fundSize:v});if(r.ok){blockerData=r.blockers;toast('Fund: $'+v.toLocaleString(),'success');renderAQ();renderFundBar();}}catch(e){toast('Failed','error');}}
 async function approveRisks(){try{const r=await post('/api/founder/approve-risks',{});if(r.ok){blockerData=r.blockers;tradingUnlocked=r.blockers.allClear;toast('Risks approved','success');renderAQ();if(opps.length)renderOpps();}}catch(e){toast('Failed','error');}}
 function renderFundBar(){const b=document.getElementById('fundBar');if(!blockerData?.founder?.capitalAllocated){b.style.display='none';return;}const f=blockerData.founder,rem=f.fundSize-f.capitalDeployed;b.style.display='flex';b.innerHTML='<div class="fb-i"><span class="fb-l">Fund:</span><span class="fb-v">$'+f.fundSize.toLocaleString()+'</span></div><div class="fb-i"><span class="fb-l">Deployed:</span><span class="fb-v" style="color:var(--yellow)">$'+f.capitalDeployed.toLocaleString()+'</span></div><div class="fb-i"><span class="fb-l">Remaining:</span><span class="fb-v" style="color:'+(rem>f.fundSize*.3?'var(--green)':'var(--red)')+'">$'+rem.toLocaleString()+'</span></div>';}
@@ -2508,6 +2599,12 @@ async function handleRequest(req, res) {
       return jsonResp(res, generateSystemReport());
     }
 
+    // Quick Start
+    if (pathname === '/api/quick-start' && method === 'POST') {
+      const result = await quickStart();
+      return jsonResp(res, result);
+    }
+
     // Commander
     if (pathname === '/api/command' && method === 'POST') {
       const body = await readBody(req);
@@ -2621,9 +2718,11 @@ const server = http.createServer(handleRequest);
 
 server.listen(PORT, () => {
   logActivity('system', 'Server started on port ' + PORT);
+  autoBootstrap();
   startAgentScheduler();
-  // Auto-run diagnostics
+  // Auto-run diagnostics + first agent scan
   setTimeout(() => runDiagnostics().catch(() => {}), 3000);
+  setTimeout(() => runAllAgents().catch(() => {}), 5000);
   console.log('');
   console.log('  ╔══════════════════════════════════════════════════════════════╗');
   console.log('  ║   ZVI v1 — Fund Operating System                           ║');
