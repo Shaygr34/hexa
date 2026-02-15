@@ -1411,17 +1411,89 @@ async function founderConsoleChat(question) {
     return { answer: `Last Scan:\n- ${cache.data.length} markets cached\n- Source: ${status.dataSource}\n- Fetched: ${cache.fetchedAt ? Math.round((Date.now() - cache.fetchedAt) / 1000) + 's ago' : 'never'}\n- High-edge (>1%): ${highEdge.length}\n- Top 3:${highEdge.slice(0, 3).map(m => `\n  - ${m.market.slice(0, 50)}: ${m.edge.toFixed(2)}%`).join('') || '\n  (none)'}`, source: 'system' };
   }
 
-  // If LLM available, use it for unknown questions
-  if (process.env.ANTHROPIC_API_KEY) {
+  // If LLM available, use it for any question with full system context
+  const hasAnthropic = process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_API_KEY.length > 10;
+  const hasOpenAI = process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.length > 10;
+  const hasXAI = process.env.XAI_API_KEY && process.env.XAI_API_KEY.length > 5;
+
+  if (hasAnthropic || hasOpenAI || hasXAI) {
     try {
-      const ctx = `System status: ${JSON.stringify({ mode: status.mode, uptime: status.uptimeFormatted, agents: status.agentsCount, markets: status.marketsInCache, killSwitch: status.killSwitch, dataSource: status.dataSource, pendingApprovals: status.pendingApprovals, secrets: cfg.secrets, founder: status.founder })}`;
-      const resp = await httpPost('https://api.anthropic.com/v1/messages', {
-        model: 'claude-sonnet-4-5-20250929', max_tokens: 300,
-        system: 'You are ZVI, a fund operating system assistant. Answer the founder\'s question about the system using the provided runtime state. Be concise and actionable. Current state: ' + ctx,
-        messages: [{ role: 'user', content: question }],
-      }, { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' });
-      return { answer: resp.content?.[0]?.text || 'No response', source: 'llm' };
-    } catch (e) { return { answer: `LLM unavailable: ${e.message}\n\nType "help" for built-in questions.`, source: 'error' }; }
+      // Build rich context from live system state
+      const topMarkets = store.marketCache.data.slice(0, 15).map(m => ({
+        market: m.market, edge: m.edge.toFixed(2) + '%', yes: m.bestBid, no: m.bestAsk,
+        volume: '$' + (m.volume >= 1e6 ? (m.volume/1e6).toFixed(1)+'M' : (m.volume/1e3).toFixed(0)+'K'),
+        liquidity: '$' + (m.liquidity >= 1e6 ? (m.liquidity/1e6).toFixed(1)+'M' : (m.liquidity/1e3).toFixed(0)+'K'),
+        negRisk: m.negRisk, demo: m.demo,
+      }));
+      const agentDetails = store.agents.map(a => ({
+        name: a.name, strategy: a.strategyType, status: a.status, mode: a.config.mode,
+        scanned: a.stats.scanned, opportunities: a.stats.opportunities,
+        lastRun: a.health.lastRunAt, errors: a.health.errors.slice(-3).map(e => e.msg),
+      }));
+      const pendingApprovals = store.approvalsQueue.filter(a => a.status === 'pending').map(a => ({
+        action: a.actionType, market: a.payload?.title?.slice(0, 60), edge: a.expectedEdge,
+        rationale: a.rationale?.slice(0, 100), agent: a.agentId?.slice(0, 8),
+      }));
+      const recentActivity = activityLog.slice(0, 10).map(e => `[${e.type}] ${e.message}`);
+      const ctx = JSON.stringify({
+        system: { mode: status.mode, uptime: status.uptimeFormatted, dataSource: status.dataSource, killSwitch: status.killSwitch, totalScans: store.totalScans },
+        connections: cfg.secrets,
+        founder: { fundSize: status.founder.fundSize, capitalDeployed: status.founder.capitalDeployed, capitalAllocated: status.founder.capitalAllocated, risksApproved: status.founder.risksApproved, decisions: status.founder.totalDecisions },
+        agents: agentDetails,
+        topMarkets,
+        pendingApprovals,
+        recentActivity,
+        diagnostics: store.diagnostics.results || {},
+      });
+
+      const systemPrompt = `You are ZVI, an AI fund operating system for Polymarket prediction markets on Polygon. You help the founder understand and operate the system.
+
+You have access to LIVE system state below. Use it to give accurate, grounded answers. Be concise but thorough. Reference specific numbers from the data. If you see problems, suggest concrete next steps.
+
+LIVE SYSTEM STATE:
+${ctx}
+
+Rules:
+- Always ground answers in the actual data above
+- If data shows issues (missing keys, paused agents, etc), proactively mention them
+- Suggest specific actions the founder can take
+- For market questions, reference actual market names and prices from the data
+- Keep responses clear and actionable, not academic`;
+
+      if (hasOpenAI) {
+        const resp = await httpPost('https://api.openai.com/v1/chat/completions', {
+          model: 'gpt-4o-mini', max_tokens: 600, temperature: 0.7,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: question },
+          ],
+        }, { 'Authorization': 'Bearer ' + process.env.OPENAI_API_KEY });
+        if (resp.error) return { answer: `OpenAI error: ${resp.error.message}\n\nType "help" for built-in commands.`, source: 'error' };
+        return { answer: resp.choices?.[0]?.message?.content || 'No response from OpenAI', source: 'llm' };
+      }
+
+      if (hasAnthropic) {
+        const resp = await httpPost('https://api.anthropic.com/v1/messages', {
+          model: 'claude-sonnet-4-5-20250929', max_tokens: 600,
+          system: systemPrompt,
+          messages: [{ role: 'user', content: question }],
+        }, { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' });
+        if (resp.error) return { answer: `Anthropic error: ${resp.error.message}\n\nType "help" for built-in commands.`, source: 'error' };
+        return { answer: resp.content?.[0]?.text || 'No response from Anthropic', source: 'llm' };
+      }
+
+      if (hasXAI) {
+        const resp = await httpPost('https://api.x.ai/v1/chat/completions', {
+          model: 'grok-2-latest', max_tokens: 600,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: question },
+          ],
+        }, { 'Authorization': 'Bearer ' + process.env.XAI_API_KEY });
+        if (resp.error) return { answer: `xAI error: ${resp.error.message}\n\nType "help" for built-in commands.`, source: 'error' };
+        return { answer: resp.choices?.[0]?.message?.content || 'No response from xAI', source: 'llm' };
+      }
+    } catch (e) { return { answer: `LLM call failed: ${e.message}\n\nType "help" for built-in questions.`, source: 'error' }; }
   }
 
   return { answer: `I don't have enough context for that question. Try:\n- "What's missing?"\n- "System status"\n- "NegRisk status"\n- "Why are no opportunities showing?"\n- "help" for full list`, source: 'system' };
@@ -1763,7 +1835,7 @@ body{padding-bottom:50px}
   <div class="panel" id="panel-hub">
     <div style="display:flex;gap:8px;margin-bottom:14px"><button class="btn btn-p btn-sm" id="hubTabChat" onclick="switchHubTab('chat')" style="border-bottom:2px solid var(--cyan)">Console Chat</button><button class="btn btn-sm" id="hubTabReport" onclick="switchHubTab('report')">System Report</button><button class="btn btn-sm" id="hubTabActivity" onclick="switchHubTab('activity')">Activity</button></div>
     <div id="hubChat" class="console-wrap" style="background:var(--bg2);border:1px solid var(--bd);border-radius:10px">
-      <div class="console-messages" id="consoleMessages"><div class="console-msg system">Welcome to the Founder Console. Ask me anything about your system.\\nTry: "What's missing?" or "NegRisk status" or "help"</div></div>
+      <div class="console-messages" id="consoleMessages"><div class="console-msg system">Welcome to the Founder Console. Ask me anything about your system.<br>Try: "What's missing?" or "NegRisk status" or "help"</div></div>
       <div class="console-input"><input type="text" id="consoleInput" placeholder="Ask about your system..." onkeydown="if(event.key==='Enter')sendConsoleMsg()"><button class="btn btn-p" onclick="sendConsoleMsg()">Ask</button></div>
     </div>
     <div id="hubReport" style="display:none"><div class="report-grid" id="reportGrid"></div></div>
@@ -2096,7 +2168,7 @@ function openWizard(stepId){
         {id:'wiz_anthropic',label:'Anthropic Key',type:'password',placeholder:'sk-ant-...',env:'ANTHROPIC_API_KEY'},
         {id:'wiz_openai',label:'OpenAI Key',type:'password',placeholder:'sk-...',env:'OPENAI_API_KEY'},
         {id:'wiz_xai',label:'xAI / Grok Key',type:'password',placeholder:'xai-...',env:'XAI_API_KEY'},
-        {id:'wiz_polygon',label:'Polygon RPC URL',type:'text',placeholder:'https://polygon-mainnet.g.alchemy.com/v2/...',env:'POLYGON_RPC_URL'},
+        {id:'wiz_polygon',label:'Polygon RPC URL (optional)',type:'text',placeholder:'https://polygon-mainnet.g.alchemy.com/v2/... (skip if unsure)',env:'POLYGON_RPC_URL'},
       ],
       testBtn:'Test Polymarket',testFn:'testPolymarket',
       defaults:'You don\\'t need all keys to start. The Gamma API (free, no key) provides market data. Add more keys as you enable strategies.',
@@ -2222,7 +2294,7 @@ async function sendConsoleMsg(){
   try{
     const r=await post('/api/console',{question:q});
     const loading=document.getElementById('consoleLoading');if(loading)loading.remove();
-    msgs.innerHTML+='<div class="console-msg '+(r.source||'system')+'">'+esc(r.answer||'No response')+'</div>';
+    msgs.innerHTML+='<div class="console-msg '+(r.source||'system')+'">'+esc(r.answer||'No response').replace(/\\n/g,'<br>')+'</div>';
     msgs.scrollTop=msgs.scrollHeight;
   }catch(e){
     const loading=document.getElementById('consoleLoading');if(loading)loading.remove();
