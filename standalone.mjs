@@ -665,7 +665,7 @@ async function runLLMProbability(agent) {
             const jsonMatch = text.match(/\{[\s\S]*\}/);
             if (jsonMatch) llmResult = JSON.parse(jsonMatch[0]);
           } else if (hasXAI) {
-            llmModel = 'grok-2-latest';
+            llmModel = 'grok-3-mini-beta';
             const resp = await httpPost('https://api.x.ai/v1/chat/completions', {
               model: llmModel, max_tokens: 600,
               messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: brief }],
@@ -815,7 +815,7 @@ Respond in JSON array: [{"headline": "...", "entities": ["entity1", "entity2"], 
       if (hasXAI) {
         diagnostics.analysisMethod = 'xAI/Grok';
         const resp = await httpPost('https://api.x.ai/v1/chat/completions', {
-          model: 'grok-2-latest', max_tokens: 2000,
+          model: 'grok-3-mini-beta', max_tokens: 2000,
           messages: [{ role: 'system', content: 'You analyze news for prediction market impact. Extract entities, assess sentiment, map to specific markets. Respond in JSON only.' }, { role: 'user', content: prompt }],
         }, { 'Authorization': 'Bearer ' + process.env.XAI_API_KEY });
         const text = resp.choices?.[0]?.message?.content || '';
@@ -1869,7 +1869,7 @@ async function testLLMApi(provider) {
     if (provider === 'xai' || (!provider && process.env.XAI_API_KEY)) {
       if (!process.env.XAI_API_KEY) return { ok: false, message: 'XAI_API_KEY not set' };
       const resp = await httpPost('https://api.x.ai/v1/chat/completions', {
-        model: 'grok-2-latest', max_tokens: 20,
+        model: 'grok-3-mini-beta', max_tokens: 20,
         messages: [{ role: 'user', content: 'Reply with just the word "pong"' }],
       }, { 'Authorization': 'Bearer ' + process.env.XAI_API_KEY });
       const latency = Date.now() - start;
@@ -2339,7 +2339,7 @@ Rules:
 
       if (hasXAI) {
         const resp = await httpPost('https://api.x.ai/v1/chat/completions', {
-          model: 'grok-2-latest', max_tokens: 600,
+          model: 'grok-3-mini-beta', max_tokens: 600,
           messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: question },
