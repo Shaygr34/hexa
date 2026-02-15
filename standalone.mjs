@@ -1589,7 +1589,6 @@ async function decide(id,v,m){try{const d=await post('/api/founder/decide',{mark
 
 // Blockers
 async function fetchBlockers(){try{const d=await api('/api/blockers');blockerData=d;founderDecisions=d.founder?.decisions||{};tradingUnlocked=d.allClear;renderAQ();renderFundBar();if(opps.length)renderOpps();}catch(e){}}
-var expandedStep=null;
 function renderAQ(){
   if(!blockerData)return;const{blockers:bs,currentStep:cs,allClear}=blockerData;
   document.getElementById('aqProg').textContent=allClear?'ALL CLEAR':'Step '+cs+'/'+bs.length;
