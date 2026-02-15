@@ -1,476 +1,1217 @@
 #!/usr/bin/env node
 // ═══════════════════════════════════════════════════════════════════════════════
-// ZVI v1 — Fund Operating System Dashboard
-// Standalone Node.js server — ZERO npm dependencies
+// ZVI v1 — Fund Operating System
+// Agent-first autonomous trading platform for Polymarket
+// Single-file · Zero dependencies · Node.js
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import http from 'node:http';
+import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-// ─── .env.local loader ──────────────────────────────────────────────────────
-const ENV_PATH = path.join(path.dirname(new URL(import.meta.url).pathname), '.env.local');
+const BASE_DIR = path.dirname(new URL(import.meta.url).pathname);
+const ENV_PATH = path.join(BASE_DIR, '.env.local');
+const STATE_PATH = path.join(BASE_DIR, 'zvi_state.json');
+const STARTUP_TIME = Date.now();
 
+// ─── .env.local loader ──────────────────────────────────────────────────────
 function loadEnv() {
   try {
-    const raw = fs.readFileSync(ENV_PATH, 'utf-8');
-    for (const line of raw.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) continue;
-      const eqIdx = trimmed.indexOf('=');
-      if (eqIdx === -1) continue;
-      const key = trimmed.slice(0, eqIdx).trim();
-      let val = trimmed.slice(eqIdx + 1).trim();
-      // Strip surrounding quotes
-      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+    const content = fs.readFileSync(ENV_PATH, 'utf-8');
+    for (const line of content.split('\n')) {
+      const t = line.trim();
+      if (!t || t.startsWith('#')) continue;
+      const eq = t.indexOf('=');
+      if (eq === -1) continue;
+      const key = t.slice(0, eq).trim();
+      let val = t.slice(eq + 1).trim();
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'")))
         val = val.slice(1, -1);
-      }
-      if (!process.env[key]) {
-        process.env[key] = val;
-      }
+      process.env[key] = val;
     }
     console.log('[env] Loaded .env.local');
   } catch (e) {
-    console.warn('[env] Could not load .env.local:', e.message);
+    console.log('[env] Could not load .env.local:', e.message);
   }
 }
-
 loadEnv();
 
-// ─── Activity Log ────────────────────────────────────────────────────────────
-const activityLog = [];
-const STARTUP_TIME = Date.now();
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATE STORE + PERSISTENCE
+// ═══════════════════════════════════════════════════════════════════════════════
 
-function logActivity(type, message, details = {}) {
-  const entry = {
-    id: crypto.randomUUID(),
-    timestamp: new Date().toISOString(),
-    type, // 'system' | 'trade' | 'config' | 'scan' | 'error' | 'decision'
-    message,
-    details,
-  };
-  activityLog.unshift(entry);
-  if (activityLog.length > 1000) activityLog.pop();
-  console.log('[' + type + '] ' + message);
-  return entry;
-}
-
-logActivity('system', 'ZVI v1 starting up');
-
-// ─── In-memory state ─────────────────────────────────────────────────────────
-const state = {
-  thresholds: [],
+const store = {
+  agents: [],
+  approvalsQueue: [],
+  auditLog: [],
+  marketCache: { data: [], fetchedAt: 0, ttl: 15000 },
+  llmCache: {},
+  whaleWallets: [],
+  whaleEvents: [],
+  headlines: [],
+  sentimentResults: [],
+  strategyOpportunities: [],
   signals: [],
-  pinnedMarkets: [],
+  thresholds: [],
+  openOrders: [],
+  founder: {
+    capitalAllocated: false, fundSize: 6000, risksApproved: false,
+    decisions: {}, positions: {}, capitalDeployed: 0, completedSteps: [],
+  },
+  settings: { marketLimit: 200, refreshInterval: 30, scanMode: 'volume', minEdgeDisplay: 0 },
   agentHeartbeats: {
     scanner: { lastSeen: Date.now(), status: 'running', interval: 30000 },
     signalEngine: { lastSeen: Date.now(), status: 'running', interval: 60000 },
     riskManager: { lastSeen: Date.now(), status: 'idle', interval: 120000 },
   },
-  opportunityCache: { data: [], fetchedAt: 0, ttl: 15000 },
+  killSwitch: false,
   totalScans: 0,
   totalMarketsScanned: 0,
-  // ── Founder decision state ──
-  founder: {
-    capitalAllocated: false,
-    fundSize: 6000,             // $6K default
-    risksApproved: false,
-    decisions: {},              // { marketId: 'BUY' | 'PASS' }
-    positions: {},              // { marketId: { side, size, entryPrice, timestamp } }
-    capitalDeployed: 0,
-    completedSteps: [],
-  },
-  // ── Configurable settings (editable from UI) ──
-  settings: {
-    marketLimit: 200,
-    refreshInterval: 30,
-    scanMode: 'volume',         // 'volume' | 'newest' | 'ending-soon'
-    minEdgeDisplay: 0,          // show all markets by default
-  },
+  pinnedMarkets: [],
+  diagnostics: { lastRun: null, results: {} },
+  commandHistory: [],
 };
 
-// ─── Polymarket API helpers ──────────────────────────────────────────────────
-const GAMMA_BASE = process.env.POLYMARKET_GAMMA_URL || 'https://gamma-api.polymarket.com';
-
-async function fetchOpportunities() {
-  const now = Date.now();
-  if (state.opportunityCache.data.length > 0 && (now - state.opportunityCache.fetchedAt) < state.opportunityCache.ttl) {
-    return state.opportunityCache.data;
+// ── Persistence ──
+let persistTimer = null, persistDirty = false;
+function markDirty() {
+  persistDirty = true;
+  if (!persistTimer) {
+    persistTimer = setTimeout(() => { persistTimer = null; if (persistDirty) saveState(); }, 5000);
   }
-
+}
+function saveState() {
   try {
-    // ── Configurable limit — NO hard cap. Default 200, configurable from UI ──
-    const limit = state.settings.marketLimit || 200;
-    const orderBy = state.settings.scanMode === 'newest' ? 'startDate'
-      : state.settings.scanMode === 'ending-soon' ? 'endDate'
-      : 'volume24hr';
-    const ascending = state.settings.scanMode === 'ending-soon' ? 'true' : 'false';
+    const snap = {
+      agents: store.agents, approvalsQueue: store.approvalsQueue,
+      auditLog: store.auditLog.slice(-500), whaleWallets: store.whaleWallets,
+      founder: store.founder, settings: store.settings,
+      pinnedMarkets: store.pinnedMarkets, killSwitch: store.killSwitch,
+    };
+    fs.writeFileSync(STATE_PATH, JSON.stringify(snap, null, 2), 'utf-8');
+    persistDirty = false;
+  } catch (e) { console.error('[persist] Save error:', e.message); }
+}
+function loadState() {
+  try {
+    const data = JSON.parse(fs.readFileSync(STATE_PATH, 'utf-8'));
+    if (data.agents) store.agents = data.agents;
+    if (data.approvalsQueue) store.approvalsQueue = data.approvalsQueue;
+    if (data.auditLog) store.auditLog = data.auditLog;
+    if (data.whaleWallets) store.whaleWallets = data.whaleWallets;
+    if (data.founder) Object.assign(store.founder, data.founder);
+    if (data.settings) Object.assign(store.settings, data.settings);
+    if (data.pinnedMarkets) store.pinnedMarkets = data.pinnedMarkets;
+    if (data.killSwitch !== undefined) store.killSwitch = data.killSwitch;
+    console.log('[persist] Loaded state from zvi_state.json');
+  } catch { console.log('[persist] No saved state, starting fresh'); }
+}
+loadState();
 
-    // Fetch multiple pages if limit > 100 (Gamma API max per page)
-    let allMarkets = [];
-    let offset = 0;
-    const pageSize = Math.min(limit, 100);
+// ── Audit + Activity Logs ──
+function audit(level, event, data = {}, agentId = null) {
+  const entry = { ts: new Date().toISOString(), level, agentId, event, data };
+  store.auditLog.push(entry);
+  if (store.auditLog.length > 2000) store.auditLog = store.auditLog.slice(-1000);
+  markDirty();
+  return entry;
+}
+const activityLog = [];
+function logActivity(type, message) {
+  activityLog.unshift({ type, message, timestamp: new Date().toISOString() });
+  if (activityLog.length > 200) activityLog.length = 200;
+}
+logActivity('system', 'ZVI v1 starting up');
 
-    while (allMarkets.length < limit) {
-      const url = `${GAMMA_BASE}/markets?closed=false&limit=${pageSize}&offset=${offset}&order=${orderBy}&ascending=${ascending}`;
-      const resp = await fetch(url, {
-        headers: { 'Accept': 'application/json', 'User-Agent': 'ZVI-FundOS/1.0' },
-        signal: AbortSignal.timeout(8000),
+// ═══════════════════════════════════════════════════════════════════════════════
+// POLYMARKET API CLIENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function httpGet(url, timeout = 10000) {
+  return new Promise((resolve, reject) => {
+    const mod = url.startsWith('https') ? https : http;
+    const req = mod.get(url, { timeout }, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch { resolve(data); }
       });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+  });
+}
 
-      if (!resp.ok) throw new Error(`Gamma API ${resp.status}: ${resp.statusText}`);
-      const page = await resp.json();
-      if (!Array.isArray(page) || page.length === 0) break;
-      allMarkets = allMarkets.concat(page);
-      offset += page.length;
-      if (page.length < pageSize) break; // no more pages
+function httpPost(url, body, headers = {}, timeout = 15000) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const payload = typeof body === 'string' ? body : JSON.stringify(body);
+    const opts = {
+      hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
+      path: u.pathname + u.search, method: 'POST', timeout,
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), ...headers },
+    };
+    const mod = u.protocol === 'https:' ? https : http;
+    const req = mod.request(opts, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(data); } });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+    req.write(payload);
+    req.end();
+  });
+}
+
+async function fetchMarkets() {
+  const now = Date.now();
+  if (store.marketCache.data.length > 0 && (now - store.marketCache.fetchedAt) < store.marketCache.ttl) {
+    return store.marketCache.data;
+  }
+  try {
+    const gammaUrl = process.env.POLYMARKET_GAMMA_URL || 'https://gamma-api.polymarket.com';
+    const limit = store.settings.marketLimit || 200;
+    const allMarkets = [];
+    let offset = 0;
+    const batchSize = 100;
+    while (offset < limit) {
+      const url = `${gammaUrl}/markets?limit=${Math.min(batchSize, limit - offset)}&offset=${offset}&active=true&closed=false`;
+      const batch = await httpGet(url);
+      if (!Array.isArray(batch) || batch.length === 0) break;
+      allMarkets.push(...batch);
+      offset += batch.length;
+      if (batch.length < batchSize) break;
     }
-
-    const opportunities = [];
-
-    for (const m of allMarkets) {
-      if (!m.outcomePrices) continue;
-
-      let prices;
+    const opportunities = allMarkets.map(m => {
+      const outcomes = [];
+      const outcomePrices = [];
       try {
-        prices = JSON.parse(m.outcomePrices);
-      } catch { continue; }
-
-      if (!Array.isArray(prices) || prices.length < 2) continue;
-
-      const numPrices = prices.map(Number).filter(p => !isNaN(p) && p > 0);
-      if (numPrices.length < 2) continue;
-
-      const sum = numPrices.reduce((a, b) => a + b, 0);
+        const op = JSON.parse(m.outcomePrices || '[]');
+        const on = JSON.parse(m.outcomes || '[]');
+        for (let i = 0; i < on.length; i++) { outcomes.push(on[i]); outcomePrices.push(parseFloat(op[i]) || 0); }
+      } catch {}
+      const yes = outcomePrices[0] || 0, no = outcomePrices[1] || 0;
+      const sum = outcomePrices.reduce((a, b) => a + b, 0);
       const edge = Math.abs(1.0 - sum);
-
-      const bestBid = numPrices[0];
-      const bestAsk = numPrices.length >= 2 ? numPrices[1] : 0;
-      const volume = parseFloat(m.volume24hr) || parseFloat(m.volume) || 0;
-      const liquidity = parseFloat(m.liquidityClob) || parseFloat(m.liquidity) || 0;
-
-      // Confidence: composite of edge magnitude, volume, and liquidity
+      const vol = parseFloat(m.volume) || 0, liq = parseFloat(m.liquidity) || 0;
       const edgeScore = Math.min(edge / 0.05, 1.0);
-      const volScore = Math.min(volume / 500000, 1.0);
-      const liqScore = Math.min(liquidity / 100000, 1.0);
+      const volScore = Math.min(vol / 500000, 1.0);
+      const liqScore = Math.min(liq / 100000, 1.0);
       const confidence = (edgeScore * 0.4 + volScore * 0.35 + liqScore * 0.25) * 100;
-
-      // ── Fix Polymarket links — use correct slug-based URL ──
-      // Gamma API returns slugs that map to polymarket.com/event/{slug}
-      // If slug is missing, fall back to condition ID search
-      const slug = m.slug || '';
-      let link;
-      if (slug) {
-        link = `https://polymarket.com/event/${slug}`;
-      } else if (m.conditionId) {
-        link = `https://polymarket.com/markets?tid=${m.conditionId}`;
-      } else {
-        link = `https://polymarket.com`;
+      const negRisk = m.negRisk === true || m.negRisk === 'true';
+      let daysToExpiry = null;
+      if (m.endDate) {
+        const diff = new Date(m.endDate).getTime() - now;
+        if (diff > 0) daysToExpiry = Math.ceil(diff / 86400000);
       }
-
-      // Parse end date for time-to-expiry info
-      const endDate = m.endDate || m.endDateIso || null;
-      const daysToExpiry = endDate ? Math.max(0, Math.round((new Date(endDate) - now) / 86400000)) : null;
-
-      opportunities.push({
-        id: m.id || m.conditionId || crypto.randomUUID(),
-        market: m.question || m.title || 'Unknown Market',
+      return {
+        id: m.conditionId || crypto.randomUUID(),
+        market: m.question || m.title || 'Unknown',
         description: m.description || '',
         edge: parseFloat((edge * 100).toFixed(3)),
-        bestBid: parseFloat(bestBid.toFixed(4)),
-        bestAsk: parseFloat(bestAsk.toFixed(4)),
-        priceSum: parseFloat(sum.toFixed(4)),
-        outcomes: m.outcomes ? (typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes) : ['Yes', 'No'],
-        volume: Math.round(volume),
-        liquidity: Math.round(liquidity),
+        bestBid: yes, bestAsk: no, priceSum: parseFloat(sum.toFixed(4)),
+        outcomes, outcomePrices, volume: vol, liquidity: liq,
         confidence: parseFloat(confidence.toFixed(1)),
-        link,
-        slug,
-        negRisk: !!m.negRisk,
-        conditionId: m.conditionId || '',
-        endDate,
-        daysToExpiry,
-        updatedAt: m.updatedAt || new Date().toISOString(),
-      });
-    }
+        link: m.slug ? `https://polymarket.com/event/${m.slug}` : 'https://polymarket.com',
+        slug: m.slug || '', negRisk, conditionId: m.conditionId || '',
+        clobTokenIds: m.clobTokenIds || '', endDate: m.endDate || null,
+        daysToExpiry, updatedAt: m.updatedAt || new Date().toISOString(), demo: false,
+        numOutcomes: outcomes.length,
+      };
+    }).sort((a, b) => b.edge - a.edge);
 
-    // Sort by edge descending
-    opportunities.sort((a, b) => b.edge - a.edge);
-
-    state.opportunityCache = { data: opportunities, fetchedAt: now, ttl: 15000 };
-    state.agentHeartbeats.scanner.lastSeen = now;
-    state.agentHeartbeats.scanner.status = 'running';
-    state.totalScans++;
-    state.totalMarketsScanned += allMarkets.length;
-
+    store.marketCache = { data: opportunities, fetchedAt: now, ttl: 15000 };
+    store.agentHeartbeats.scanner.lastSeen = now;
+    store.agentHeartbeats.scanner.status = 'running';
+    store.totalScans++;
+    store.totalMarketsScanned += allMarkets.length;
     logActivity('scan', `Scanned ${allMarkets.length} markets, found ${opportunities.filter(o => o.edge > 0.5).length} with edge > 0.5%`);
-
     return opportunities;
   } catch (err) {
-    console.error('[gamma] Fetch error:', err.message, '— loading demo data');
+    console.error('[gamma] Fetch error:', err.message);
     logActivity('error', 'Gamma API fetch failed: ' + err.message);
-    state.agentHeartbeats.scanner.status = 'demo';
-    // Return stale cache or demo data
-    if (state.opportunityCache.data.length > 0) return state.opportunityCache.data;
+    store.agentHeartbeats.scanner.status = 'demo';
+    if (store.marketCache.data.length > 0) return store.marketCache.data;
     const demo = getDemoOpportunities();
-    state.opportunityCache = { data: demo, fetchedAt: now, ttl: 30000 };
+    store.marketCache = { data: demo, fetchedAt: now, ttl: 30000 };
     return demo;
   }
 }
 
 function getDemoOpportunities() {
   const markets = [
-    { market: 'Will Trump win the 2028 presidential election?', yes: 0.35, no: 0.62, vol: 1842000, liq: 520000, slug: 'will-trump-win-2028', negRisk: false },
-    { market: 'Fed rate cut before July 2026?', yes: 0.72, no: 0.31, vol: 980000, liq: 310000, slug: 'fed-rate-cut-before-july-2026', negRisk: false },
-    { market: 'Bitcoin above $150k by end of 2026?', yes: 0.28, no: 0.69, vol: 2100000, liq: 890000, slug: 'bitcoin-above-150k-2026', negRisk: false },
-    { market: 'Ukraine ceasefire before April 2026?', yes: 0.41, no: 0.55, vol: 750000, liq: 210000, slug: 'ukraine-ceasefire-april-2026', negRisk: true },
-    { market: 'S&P 500 above 6500 by March 2026?', yes: 0.58, no: 0.45, vol: 1200000, liq: 420000, slug: 'sp500-above-6500-march-2026', negRisk: false },
-    { market: 'Will AI model beat IMO gold medalist in 2026?', yes: 0.62, no: 0.41, vol: 480000, liq: 150000, slug: 'ai-imo-gold-2026', negRisk: true },
-    { market: 'US recession in 2026?', yes: 0.22, no: 0.75, vol: 3200000, liq: 1100000, slug: 'us-recession-2026', negRisk: false },
-    { market: 'Ethereum ETF inflows > $10B by June 2026?', yes: 0.45, no: 0.52, vol: 620000, liq: 280000, slug: 'eth-etf-inflows-10b', negRisk: false },
-    { market: 'Israel-Saudi normalization deal in 2026?', yes: 0.18, no: 0.78, vol: 340000, liq: 95000, slug: 'israel-saudi-normalization-2026', negRisk: true },
-    { market: 'GPT-5 released before September 2026?', yes: 0.55, no: 0.48, vol: 890000, liq: 370000, slug: 'gpt5-release-sept-2026', negRisk: false },
-    { market: 'Tesla stock above $500 by mid-2026?', yes: 0.30, no: 0.67, vol: 1500000, liq: 600000, slug: 'tesla-500-mid-2026', negRisk: false },
-    { market: 'Next Supreme Court retirement in 2026?', yes: 0.33, no: 0.64, vol: 290000, liq: 85000, slug: 'scotus-retirement-2026', negRisk: false },
+    { market: 'Will Trump win the 2028 presidential election?', yes: 0.35, no: 0.62, vol: 1842000, liq: 520000, negRisk: false },
+    { market: 'Fed rate cut before July 2026?', yes: 0.72, no: 0.31, vol: 980000, liq: 310000, negRisk: false },
+    { market: 'Bitcoin above $150k by end of 2026?', yes: 0.28, no: 0.69, vol: 2100000, liq: 890000, negRisk: false },
+    { market: 'Ukraine ceasefire before April 2026?', yes: 0.41, no: 0.55, vol: 750000, liq: 210000, negRisk: true },
+    { market: 'S&P 500 above 6500 by March 2026?', yes: 0.58, no: 0.45, vol: 1200000, liq: 420000, negRisk: false },
+    { market: 'Will AI model beat IMO gold medalist in 2026?', yes: 0.62, no: 0.41, vol: 480000, liq: 150000, negRisk: true },
+    { market: 'US recession in 2026?', yes: 0.22, no: 0.75, vol: 3200000, liq: 1100000, negRisk: false },
+    { market: 'Ethereum ETF inflows > $10B by June 2026?', yes: 0.45, no: 0.52, vol: 620000, liq: 280000, negRisk: false },
+    { market: 'Israel-Saudi normalization deal in 2026?', yes: 0.18, no: 0.78, vol: 340000, liq: 95000, negRisk: true },
+    { market: 'GPT-5 released before September 2026?', yes: 0.55, no: 0.48, vol: 890000, liq: 370000, negRisk: false },
+    { market: 'Tesla stock above $500 by mid-2026?', yes: 0.30, no: 0.67, vol: 1500000, liq: 600000, negRisk: false },
+    { market: 'Next Supreme Court retirement in 2026?', yes: 0.33, no: 0.64, vol: 290000, liq: 85000, negRisk: false },
   ];
   return markets.map((m, i) => {
-    const sum = m.yes + m.no;
-    const edge = Math.abs(1.0 - sum);
-    const edgeScore = Math.min(edge / 0.05, 1.0);
-    const volScore = Math.min(m.vol / 500000, 1.0);
-    const liqScore = Math.min(m.liq / 100000, 1.0);
+    const sum = m.yes + m.no, edge = Math.abs(1.0 - sum);
+    const edgeScore = Math.min(edge / 0.05, 1.0), volScore = Math.min(m.vol / 500000, 1.0), liqScore = Math.min(m.liq / 100000, 1.0);
     const confidence = (edgeScore * 0.4 + volScore * 0.35 + liqScore * 0.25) * 100;
     return {
-      id: crypto.randomUUID(),
-      market: m.market,
+      id: crypto.randomUUID(), market: m.market,
       description: 'Demo market — connect Polymarket API for live data',
-      edge: parseFloat((edge * 100).toFixed(3)),
-      bestBid: m.yes,
-      bestAsk: m.no,
-      priceSum: parseFloat(sum.toFixed(4)),
-      outcomes: ['Yes', 'No'],
-      volume: m.vol,
-      liquidity: m.liq,
-      confidence: parseFloat(confidence.toFixed(1)),
-      link: 'https://polymarket.com',
-      slug: '',
-      negRisk: m.negRisk,
-      conditionId: 'demo-' + i,
-      endDate: null,
-      daysToExpiry: null,
-      updatedAt: new Date().toISOString(),
-      demo: true,
+      edge: parseFloat((edge * 100).toFixed(3)), bestBid: m.yes, bestAsk: m.no,
+      priceSum: parseFloat(sum.toFixed(4)), outcomes: ['Yes', 'No'], outcomePrices: [m.yes, m.no],
+      volume: m.vol, liquidity: m.liq, confidence: parseFloat(confidence.toFixed(1)),
+      link: 'https://polymarket.com', slug: '', negRisk: m.negRisk,
+      conditionId: 'demo-' + i, endDate: null, daysToExpiry: null,
+      updatedAt: new Date().toISOString(), demo: true, numOutcomes: 2,
     };
   }).sort((a, b) => b.edge - a.edge);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// RISK ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════
 
-function checkThresholds(symbol, price) {
-  const triggered = [];
-  for (const t of state.thresholds) {
-    const hit =
-      (t.direction === 'above' && price >= t.thresholdPrice) ||
-      (t.direction === 'below' && price <= t.thresholdPrice);
-    if (hit && t.symbol === symbol) {
-      const signal = {
-        id: crypto.randomUUID(),
-        symbol: t.symbol,
-        price,
-        threshold: t.thresholdPrice,
-        direction: t.direction,
-        triggeredAt: new Date().toISOString(),
-        brief: `RP Optical Mini-Brief: ${t.symbol} crossed ${t.direction} ${t.thresholdPrice}. ` +
-               `Current price: ${price}. ` +
-               `Action: Review position sizing and hedging strategy. ` +
-               `Risk assessment: ${price > t.thresholdPrice ? 'Elevated' : 'Moderate'}.`,
+function getRiskLimits() {
+  return {
+    maxExposurePerMarket: parseInt(process.env.MAX_EXPOSURE_PER_MARKET) || 500,
+    dailyMaxExposure: parseInt(process.env.DAILY_MAX_EXPOSURE) || 2000,
+    minEdgeThreshold: parseFloat(process.env.MIN_EDGE_THRESHOLD) || 0.02,
+    minDepthUsdc: parseInt(process.env.MIN_DEPTH_USDC) || 100,
+    maxOpenPositions: parseInt(process.env.MAX_OPEN_POSITIONS) || 20,
+    cooldownMs: parseInt(process.env.TRADE_COOLDOWN_MS) || 30000,
+  };
+}
+
+function checkRisk(agent, opportunity, action) {
+  const reasons = [];
+  const limits = getRiskLimits();
+  const agentCfg = agent?.config || {};
+
+  // Kill switch
+  if (store.killSwitch) { reasons.push('KILL SWITCH ACTIVE — all trading halted'); return { allowed: false, reasons }; }
+
+  // Agent mode check
+  if (agentCfg.mode === 'OBSERVE') { reasons.push('Agent in OBSERVE mode'); return { allowed: false, reasons }; }
+
+  // Per-trade max
+  const perTradeMax = agentCfg.perTradeMax || limits.maxExposurePerMarket;
+  if (action.size > perTradeMax) reasons.push(`Trade size $${action.size} exceeds per-trade max $${perTradeMax}`);
+
+  // Per-market exposure
+  const existingExposure = Object.values(store.founder.positions)
+    .filter(p => p.marketId === opportunity.id)
+    .reduce((s, p) => s + (p.recommendedSize || 0), 0);
+  const perMarketMax = agentCfg.perMarketMax || limits.maxExposurePerMarket;
+  if (existingExposure + action.size > perMarketMax)
+    reasons.push(`Market exposure $${existingExposure + action.size} exceeds max $${perMarketMax}`);
+
+  // Daily max
+  const dailyMax = agentCfg.dailyMax || limits.dailyMaxExposure;
+  if (store.founder.capitalDeployed + action.size > dailyMax)
+    reasons.push(`Daily exposure $${store.founder.capitalDeployed + action.size} exceeds max $${dailyMax}`);
+
+  // Min edge
+  const minEdge = agentCfg.minEdgePct || (limits.minEdgeThreshold * 100);
+  if (opportunity.edge < minEdge) reasons.push(`Edge ${opportunity.edge.toFixed(2)}% below min ${minEdge}%`);
+
+  // Liquidity check
+  if (opportunity.liquidity < limits.minDepthUsdc)
+    reasons.push(`Liquidity $${opportunity.liquidity} below min $${limits.minDepthUsdc}`);
+
+  // Max open positions
+  const openCount = Object.keys(store.founder.positions).length;
+  if (openCount >= limits.maxOpenPositions)
+    reasons.push(`Open positions (${openCount}) at max (${limits.maxOpenPositions})`);
+
+  // Budget check
+  const budget = agentCfg.budgetUSDC || store.founder.fundSize;
+  const agentDeployed = store.strategyOpportunities
+    .filter(o => o.agentId === agent?.id && o.status === 'executed')
+    .reduce((s, o) => s + (o.tradeSize || 0), 0);
+  if (agentDeployed + action.size > budget)
+    reasons.push(`Agent budget exhausted: $${agentDeployed + action.size} > $${budget}`);
+
+  return { allowed: reasons.length === 0, reasons };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STRATEGY RUNNERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── S1: NegRisk Arbitrage Scanner ──
+async function runNegRiskArb(agent) {
+  const startTime = Date.now();
+  try {
+    const markets = store.marketCache.data.length > 0 ? store.marketCache.data : await fetchMarkets();
+    const negRiskMarkets = markets.filter(m => m.negRisk || m.numOutcomes > 2);
+    const minEdge = agent.config.minEdgePct || 0.5;
+    const minLiquidity = agent.config.minLiquidity || 1000;
+
+    const opportunities = negRiskMarkets.map(m => {
+      const sumYes = m.outcomePrices ? m.outcomePrices.reduce((a, b) => a + b, 0) : (m.bestBid + m.bestAsk);
+      const edgePct = sumYes < 1.0 ? (1.0 - sumYes) * 100 : sumYes > 1.0 ? (sumYes - 1.0) * 100 : 0;
+      const direction = sumYes < 1.0 ? 'BUY_ALL_YES' : sumYes > 1.0 ? 'BUY_ALL_NO' : 'NONE';
+      const depthScore = Math.min(m.liquidity / 10000, 1.0);
+      const slippageEst = m.liquidity > 0 ? Math.max(0.1, 500 / m.liquidity * 100) : 99;
+      const netEdge = Math.max(0, edgePct - slippageEst);
+      const confidence = depthScore * 0.4 + Math.min(edgePct / 5, 1.0) * 0.3 + Math.min(m.volume / 1000000, 1.0) * 0.3;
+
+      return {
+        id: crypto.randomUUID(), agentId: agent.id, strategyType: 'negrisk_arb',
+        marketId: m.id || m.conditionId, title: m.market,
+        edgePct: parseFloat(edgePct.toFixed(3)), netEdge: parseFloat(netEdge.toFixed(3)),
+        confidence: parseFloat((confidence * 100).toFixed(1)),
+        liquidity: m.liquidity, volume24h: m.volume,
+        action: edgePct >= minEdge && direction !== 'NONE' ? 'ARB_BASKET' : 'PASS',
+        direction, sumYes: parseFloat(sumYes.toFixed(4)),
+        numOutcomes: m.numOutcomes || m.outcomes?.length || 2,
+        requiresApproval: true,
+        depthScore: parseFloat((depthScore * 100).toFixed(0)),
+        slippageEst: parseFloat(slippageEst.toFixed(2)),
+        rationaleSummary: edgePct >= minEdge
+          ? `${direction} arb: sum=${sumYes.toFixed(4)}, edge=${edgePct.toFixed(2)}%, net=${netEdge.toFixed(2)}% after slippage`
+          : `Edge ${edgePct.toFixed(2)}% below threshold ${minEdge}%`,
+        explain: {
+          inputs: { sumYes, outcomes: m.outcomes, outcomePrices: m.outcomePrices, liquidity: m.liquidity, volume: m.volume },
+          math: `sumYes = ${m.outcomePrices?.join(' + ') || `${m.bestBid} + ${m.bestAsk}`} = ${sumYes.toFixed(4)}; edge = |1.0 - ${sumYes.toFixed(4)}| * 100 = ${edgePct.toFixed(2)}%`,
+          assumptions: ['Prices reflect best ask for each outcome', 'Slippage estimated from liquidity depth', 'Assumes simultaneous execution of all legs'],
+          failureModes: ['Partial fill on one leg', 'Price movement during execution', 'Orderbook thin on one outcome', 'Fee structure unknown — may reduce edge'],
+        },
+        timestamp: new Date().toISOString(), status: 'new',
+        link: m.link || 'https://polymarket.com',
       };
-      state.signals.push(signal);
-      triggered.push(signal);
+    }).filter(o => o.edgePct > 0).sort((a, b) => b.edgePct - a.edgePct);
+
+    // Update agent stats
+    agent.stats.scanned = negRiskMarkets.length;
+    agent.stats.opportunities = opportunities.filter(o => o.action !== 'PASS').length;
+    agent.health.lastRunAt = new Date().toISOString();
+    agent.health.polymarketOk = true;
+
+    // Push to approvals if qualifying
+    opportunities.filter(o => o.action !== 'PASS').forEach(o => {
+      if (!store.approvalsQueue.find(a => a.marketId === o.marketId && a.agentId === o.agentId && a.status === 'pending')) {
+        store.approvalsQueue.push({
+          id: crypto.randomUUID(), ts: new Date().toISOString(), agentId: agent.id,
+          marketId: o.marketId, actionType: o.action, payload: o,
+          rationale: o.rationaleSummary, risk: o.explain.failureModes.join('; '),
+          expectedEdge: o.edgePct, status: 'pending',
+        });
+        agent.stats.approvalsPending++;
+      }
+    });
+
+    audit('info', 'negrisk_arb_run', { scanned: negRiskMarkets.length, opportunities: opportunities.length, elapsed: Date.now() - startTime }, agent.id);
+    markDirty();
+    return opportunities;
+  } catch (err) {
+    agent.health.errors.push({ ts: new Date().toISOString(), msg: err.message });
+    if (agent.health.errors.length > 20) agent.health.errors = agent.health.errors.slice(-10);
+    audit('error', 'negrisk_arb_fail', { error: err.message }, agent.id);
+    return [];
+  }
+}
+
+// ── S2: LLM Probability Mispricing ──
+async function runLLMProbability(agent) {
+  const startTime = Date.now();
+  try {
+    const hasAnthropic = !!process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_API_KEY.length > 10;
+    const hasOpenAI = !!process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.length > 10;
+
+    if (!hasAnthropic && !hasOpenAI) {
+      agent.health.llmOk = false;
+      agent.health.lastRunAt = new Date().toISOString();
+      agent.health.errors.push({ ts: new Date().toISOString(), msg: 'No LLM API key configured (need ANTHROPIC_API_KEY or OPENAI_API_KEY)' });
+      return [{ id: crypto.randomUUID(), agentId: agent.id, strategyType: 'llm_probability',
+        title: 'LLM Module Disabled', action: 'DISABLED', requiresApproval: false,
+        rationaleSummary: 'Missing API key: configure ANTHROPIC_API_KEY or OPENAI_API_KEY in Settings',
+        explain: { inputs: {}, math: 'N/A', assumptions: [], failureModes: ['No LLM API key'] },
+        timestamp: new Date().toISOString(), status: 'disabled' }];
+    }
+
+    // Select candidate markets: pinned first, then top volume
+    const markets = store.marketCache.data.length > 0 ? store.marketCache.data : await fetchMarkets();
+    const pinned = markets.filter(m => store.pinnedMarkets.includes(m.id));
+    const topVol = markets.filter(m => !store.pinnedMarkets.includes(m.id)).sort((a, b) => b.volume - a.volume).slice(0, 5);
+    const candidates = [...pinned, ...topVol].slice(0, 10);
+
+    const opportunities = [];
+    for (const m of candidates) {
+      // Check LLM cache
+      const cacheKey = m.id || m.conditionId;
+      const cached = store.llmCache[cacheKey];
+      const cacheTTL = (agent.config.llmCacheTTL || 30) * 60000;
+      if (cached && (Date.now() - cached.timestamp) < cacheTTL) {
+        opportunities.push(cached.opportunity);
+        continue;
+      }
+
+      // Build prompt
+      const brief = `Market: "${m.market}"\nDescription: ${m.description || 'N/A'}\nOutcomes: ${(m.outcomes || ['Yes','No']).join(', ')}\nCurrent YES price: ${m.bestBid}\nCurrent NO price: ${m.bestAsk}\nVolume 24h: $${m.volume}\nExpires: ${m.endDate || 'Unknown'}`;
+      const systemPrompt = 'You are a prediction market analyst. Estimate the TRUE probability of the YES outcome. Be calibrated — account for base rates and known information. Respond in JSON only: {"probability": 0.XX, "confidence": 0.XX, "assumptions": ["..."], "sources": ["..."]}';
+
+      let llmResult = null;
+      try {
+        if (hasAnthropic) {
+          const resp = await httpPost('https://api.anthropic.com/v1/messages', {
+            model: 'claude-sonnet-4-5-20250929', max_tokens: 500,
+            system: systemPrompt,
+            messages: [{ role: 'user', content: brief }],
+          }, { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' });
+          const text = resp.content?.[0]?.text || '';
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) llmResult = JSON.parse(jsonMatch[0]);
+        } else if (hasOpenAI) {
+          const resp = await httpPost('https://api.openai.com/v1/chat/completions', {
+            model: 'gpt-4o-mini', max_tokens: 500,
+            messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: brief }],
+          }, { 'Authorization': 'Bearer ' + process.env.OPENAI_API_KEY });
+          const text = resp.choices?.[0]?.message?.content || '';
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) llmResult = JSON.parse(jsonMatch[0]);
+        }
+      } catch (e) {
+        console.error('[llm] API error:', e.message);
+        llmResult = null;
+      }
+
+      if (!llmResult) continue;
+
+      const llmProb = parseFloat(llmResult.probability) || 0.5;
+      const llmConf = parseFloat(llmResult.confidence) || 0.5;
+      const marketProb = m.bestBid || 0.5;
+      const edgePct = (llmProb - marketProb) * 100;
+      const absEdge = Math.abs(edgePct);
+      const side = edgePct > 0 ? 'BUY_YES' : edgePct < 0 ? 'BUY_NO' : 'PASS';
+
+      const opp = {
+        id: crypto.randomUUID(), agentId: agent.id, strategyType: 'llm_probability',
+        marketId: cacheKey, title: m.market,
+        edgePct: parseFloat(absEdge.toFixed(2)), confidence: parseFloat((llmConf * 100).toFixed(1)),
+        liquidity: m.liquidity, volume24h: m.volume,
+        action: absEdge >= (agent.config.minEdgePct || 2) ? side : 'PASS',
+        requiresApproval: true,
+        llmProbability: llmProb, marketProbability: marketProb, side,
+        rationaleSummary: `LLM estimates ${(llmProb * 100).toFixed(0)}% vs market ${(marketProb * 100).toFixed(0)}% → ${absEdge.toFixed(1)}% edge ${side}`,
+        explain: {
+          inputs: { marketPrice: marketProb, llmEstimate: llmProb, confidence: llmConf, model: hasAnthropic ? 'claude-sonnet-4-5-20250929' : 'gpt-4o-mini' },
+          math: `edgePct = (LLM ${llmProb.toFixed(3)} - Market ${marketProb.toFixed(3)}) * 100 = ${edgePct.toFixed(2)}%`,
+          assumptions: llmResult.assumptions || ['LLM estimate based on training data', 'Market may have insider info'],
+          failureModes: ['LLM miscalibration', 'Market has information LLM lacks', 'Resolution criteria ambiguity', 'Low confidence estimate'],
+          sources: llmResult.sources || [],
+          prompt: brief, rawResponse: llmResult,
+        },
+        timestamp: new Date().toISOString(), status: 'new',
+        link: m.link || 'https://polymarket.com',
+      };
+
+      opportunities.push(opp);
+      store.llmCache[cacheKey] = { opportunity: opp, timestamp: Date.now() };
+
+      // Push to approvals if qualifying
+      if (opp.action !== 'PASS') {
+        store.approvalsQueue.push({
+          id: crypto.randomUUID(), ts: new Date().toISOString(), agentId: agent.id,
+          marketId: cacheKey, actionType: opp.action, payload: opp,
+          rationale: opp.rationaleSummary, risk: 'LLM miscalibration; market may have superior info',
+          expectedEdge: opp.edgePct, status: 'pending',
+        });
+        agent.stats.approvalsPending++;
+      }
+    }
+
+    agent.stats.scanned = candidates.length;
+    agent.stats.opportunities = opportunities.filter(o => o.action !== 'PASS' && o.action !== 'DISABLED').length;
+    agent.health.lastRunAt = new Date().toISOString();
+    agent.health.llmOk = true;
+
+    audit('info', 'llm_probability_run', { candidates: candidates.length, opportunities: opportunities.length, elapsed: Date.now() - startTime }, agent.id);
+    markDirty();
+    return opportunities;
+  } catch (err) {
+    agent.health.errors.push({ ts: new Date().toISOString(), msg: err.message });
+    audit('error', 'llm_probability_fail', { error: err.message }, agent.id);
+    return [];
+  }
+}
+
+// ── S3: Sentiment / Headlines ──
+async function runSentimentHeadlines(agent) {
+  const startTime = Date.now();
+  try {
+    const hasXAI = !!process.env.XAI_API_KEY && process.env.XAI_API_KEY.length > 5;
+    const hasAnthropic = !!process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_API_KEY.length > 10;
+
+    if (store.headlines.length === 0) {
+      agent.health.lastRunAt = new Date().toISOString();
+      return [{
+        id: crypto.randomUUID(), agentId: agent.id, strategyType: 'sentiment',
+        title: 'Awaiting Headlines', action: 'WAITING', requiresApproval: false,
+        rationaleSummary: 'Paste headlines in the Sentiment tab to analyze market impact',
+        explain: { inputs: {}, math: 'N/A', assumptions: [], failureModes: ['No headlines provided'] },
+        timestamp: new Date().toISOString(), status: 'waiting',
+      }];
+    }
+
+    const recentHeadlines = store.headlines.slice(0, 20);
+    const markets = store.marketCache.data.slice(0, 30);
+    const marketList = markets.map(m => `- "${m.market}" (YES: ${m.bestBid}, Vol: $${m.volume})`).join('\n');
+
+    const prompt = `Analyze these headlines for prediction market impact:\n\nHEADLINES:\n${recentHeadlines.map(h => `- ${h.text} [${h.source || 'unknown'}]`).join('\n')}\n\nACTIVE MARKETS:\n${marketList}\n\nFor each headline, respond in JSON array: [{"headline": "...", "impactedMarkets": ["market title"], "direction": "bullish_yes|bearish_yes|neutral", "confidence": 0.X, "rationale": "..."}]`;
+
+    let results = [];
+    try {
+      if (hasXAI) {
+        const resp = await httpPost('https://api.x.ai/v1/chat/completions', {
+          model: 'grok-2-latest', max_tokens: 1500,
+          messages: [{ role: 'system', content: 'You analyze news for prediction market impact. Respond in JSON only.' }, { role: 'user', content: prompt }],
+        }, { 'Authorization': 'Bearer ' + process.env.XAI_API_KEY });
+        const text = resp.choices?.[0]?.message?.content || '';
+        const jsonMatch = text.match(/\[[\s\S]*\]/);
+        if (jsonMatch) results = JSON.parse(jsonMatch[0]);
+      } else if (hasAnthropic) {
+        const resp = await httpPost('https://api.anthropic.com/v1/messages', {
+          model: 'claude-sonnet-4-5-20250929', max_tokens: 1500,
+          messages: [{ role: 'user', content: prompt }],
+        }, { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' });
+        const text = resp.content?.[0]?.text || '';
+        const jsonMatch = text.match(/\[[\s\S]*\]/);
+        if (jsonMatch) results = JSON.parse(jsonMatch[0]);
+      } else {
+        // Simple keyword matching fallback
+        const keywords = { trump: ['trump', 'president', 'election'], fed: ['fed', 'rate', 'interest', 'powell'], crypto: ['bitcoin', 'ethereum', 'crypto', 'btc'], war: ['ukraine', 'russia', 'ceasefire', 'war', 'israel'] };
+        for (const h of recentHeadlines) {
+          const lower = h.text.toLowerCase();
+          for (const [topic, words] of Object.entries(keywords)) {
+            if (words.some(w => lower.includes(w))) {
+              const matched = markets.filter(m => words.some(w => m.market.toLowerCase().includes(w)));
+              if (matched.length > 0) {
+                results.push({ headline: h.text, impactedMarkets: matched.map(m => m.market).slice(0, 3), direction: 'neutral', confidence: 0.3, rationale: `Keyword match: ${topic}` });
+              }
+            }
+          }
+        }
+      }
+    } catch (e) { console.error('[sentiment] Analysis error:', e.message); }
+
+    store.sentimentResults = results;
+    const opportunities = results.map(r => ({
+      id: crypto.randomUUID(), agentId: agent.id, strategyType: 'sentiment',
+      title: r.headline?.slice(0, 100) || 'Unknown', marketId: null,
+      impactedMarkets: r.impactedMarkets || [],
+      direction: r.direction || 'neutral', edgePct: 0,
+      confidence: parseFloat(((r.confidence || 0.5) * 100).toFixed(0)),
+      action: 'OBSERVE', requiresApproval: false,
+      rationaleSummary: r.rationale || 'Sentiment analysis',
+      explain: {
+        inputs: { headline: r.headline, source: hasXAI ? 'Grok' : hasAnthropic ? 'Claude' : 'keyword-match' },
+        math: 'Qualitative sentiment analysis', assumptions: ['Headlines are accurate', 'Market hasn\'t priced in yet'],
+        failureModes: ['Old news already priced in', 'Misinterpretation of headline', 'Market structure differs from sentiment'],
+      },
+      timestamp: new Date().toISOString(), status: 'new',
+    }));
+
+    agent.stats.scanned = recentHeadlines.length;
+    agent.stats.opportunities = results.length;
+    agent.health.lastRunAt = new Date().toISOString();
+
+    audit('info', 'sentiment_run', { headlines: recentHeadlines.length, results: results.length, elapsed: Date.now() - startTime }, agent.id);
+    markDirty();
+    return opportunities;
+  } catch (err) {
+    agent.health.errors.push({ ts: new Date().toISOString(), msg: err.message });
+    audit('error', 'sentiment_fail', { error: err.message }, agent.id);
+    return [];
+  }
+}
+
+// ── S4: Whale Pocket-Watching ──
+async function runWhaleWatch(agent) {
+  const startTime = Date.now();
+  try {
+    if (store.whaleWallets.length === 0) {
+      agent.health.lastRunAt = new Date().toISOString();
+      return [{
+        id: crypto.randomUUID(), agentId: agent.id, strategyType: 'whale_watch',
+        title: 'No Wallets Configured', action: 'WAITING', requiresApproval: false,
+        rationaleSummary: 'Add whale wallet addresses in the Whale Watch tab to start tracking',
+        explain: { inputs: {}, math: 'N/A', assumptions: [], failureModes: ['No wallets to watch'] },
+        timestamp: new Date().toISOString(), status: 'waiting',
+      }];
+    }
+
+    // Try Polymarket activity endpoint or use simulation
+    const events = [];
+    const markets = store.marketCache.data.slice(0, 50);
+
+    for (const wallet of store.whaleWallets) {
+      try {
+        const gammaUrl = process.env.POLYMARKET_GAMMA_URL || 'https://gamma-api.polymarket.com';
+        const resp = await httpGet(`${gammaUrl}/activity?address=${wallet.address}&limit=10`);
+        if (Array.isArray(resp)) {
+          for (const act of resp) {
+            events.push({
+              id: crypto.randomUUID(), wallet: wallet.address, alias: wallet.alias || wallet.address.slice(0, 8),
+              market: act.title || act.question || 'Unknown', side: act.side || 'unknown',
+              size: parseFloat(act.size) || 0, price: parseFloat(act.price) || 0,
+              timestamp: act.timestamp || new Date().toISOString(), source: 'polymarket_api',
+            });
+          }
+        }
+      } catch {
+        // API may not support this — generate stub event
+        if (markets.length > 0) {
+          const randomMkt = markets[Math.floor(Math.random() * Math.min(5, markets.length))];
+          events.push({
+            id: crypto.randomUUID(), wallet: wallet.address, alias: wallet.alias || wallet.address.slice(0, 8),
+            market: randomMkt.market, side: Math.random() > 0.5 ? 'YES' : 'NO',
+            size: 0, price: 0, timestamp: new Date().toISOString(), source: 'stub',
+          });
+        }
+      }
+    }
+
+    store.whaleEvents = [...events, ...store.whaleEvents].slice(0, 200);
+
+    // Convergence detection: K whales on same market/side within T minutes
+    const K = agent.config.convergenceThreshold || 2;
+    const T = (agent.config.convergenceWindowMin || 60) * 60000;
+    const recentEvents = store.whaleEvents.filter(e => Date.now() - new Date(e.timestamp).getTime() < T);
+    const marketSideCounts = {};
+    for (const e of recentEvents) {
+      const key = `${e.market}::${e.side}`;
+      if (!marketSideCounts[key]) marketSideCounts[key] = { market: e.market, side: e.side, wallets: new Set(), events: [] };
+      marketSideCounts[key].wallets.add(e.wallet);
+      marketSideCounts[key].events.push(e);
+    }
+
+    const convergenceAlerts = Object.values(marketSideCounts)
+      .filter(g => g.wallets.size >= K)
+      .map(g => ({
+        id: crypto.randomUUID(), agentId: agent.id, strategyType: 'whale_watch',
+        title: `CONVERGENCE: ${g.wallets.size} whales → ${g.market} (${g.side})`,
+        marketId: null, edgePct: 0, confidence: Math.min(g.wallets.size * 30, 90),
+        action: 'FOLLOW', requiresApproval: true,
+        rationaleSummary: `${g.wallets.size} tracked wallets entered ${g.side} on "${g.market}" within ${agent.config.convergenceWindowMin || 60}min`,
+        explain: {
+          inputs: { wallets: [...g.wallets], side: g.side, market: g.market, eventCount: g.events.length },
+          math: `convergence = ${g.wallets.size} unique wallets >= threshold ${K}`,
+          assumptions: ['Whale activity indicates informed trading', 'Time window captures correlated activity'],
+          failureModes: ['Whales may be hedging', 'Coincidental timing', 'Different position sizes'],
+        },
+        timestamp: new Date().toISOString(), status: 'new',
+      }));
+
+    // Push convergence alerts to approvals
+    convergenceAlerts.forEach(a => {
+      if (!store.approvalsQueue.find(q => q.rationale === a.rationaleSummary && q.status === 'pending')) {
+        store.approvalsQueue.push({
+          id: crypto.randomUUID(), ts: new Date().toISOString(), agentId: agent.id,
+          marketId: a.marketId, actionType: 'FOLLOW', payload: a,
+          rationale: a.rationaleSummary, risk: 'Whale herding may be misleading',
+          expectedEdge: 0, status: 'pending',
+        });
+        agent.stats.approvalsPending++;
+      }
+    });
+
+    agent.stats.scanned = store.whaleWallets.length;
+    agent.stats.opportunities = convergenceAlerts.length;
+    agent.health.lastRunAt = new Date().toISOString();
+
+    audit('info', 'whale_watch_run', { wallets: store.whaleWallets.length, events: events.length, convergence: convergenceAlerts.length, elapsed: Date.now() - startTime }, agent.id);
+    markDirty();
+    return [...convergenceAlerts, ...events.slice(0, 10).map(e => ({
+      id: e.id, agentId: agent.id, strategyType: 'whale_watch',
+      title: `${e.alias}: ${e.side} on "${e.market}"`, action: 'INFO',
+      requiresApproval: false, rationaleSummary: `Whale ${e.alias} traded ${e.side}${e.size ? ` $${e.size}` : ''}`,
+      explain: { inputs: e, math: 'N/A', assumptions: [], failureModes: [] },
+      timestamp: e.timestamp, status: 'info', source: e.source,
+    }))];
+  } catch (err) {
+    agent.health.errors.push({ ts: new Date().toISOString(), msg: err.message });
+    audit('error', 'whale_watch_fail', { error: err.message }, agent.id);
+    return [];
+  }
+}
+
+const STRATEGY_RUNNERS = {
+  negrisk_arb: runNegRiskArb,
+  llm_probability: runLLMProbability,
+  sentiment: runSentimentHeadlines,
+  whale_watch: runWhaleWatch,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AGENT MANAGER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function createAgent(config) {
+  const agent = {
+    id: crypto.randomUUID(), name: config.name || `Agent-${store.agents.length + 1}`,
+    strategyType: config.strategyType || 'negrisk_arb',
+    status: 'running', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    config: {
+      mode: config.mode || 'OBSERVE', budgetUSDC: config.budgetUSDC || 1000,
+      perTradeMax: config.perTradeMax || 200, dailyMax: config.dailyMax || 500,
+      minEdgePct: config.minEdgePct || 1.0, approvalMode: config.approvalMode || 'REQUIRE_ALL',
+      allowLive: false, refreshSec: config.refreshSec || 60,
+      marketsScope: config.marketsScope || 'all', latencyHint: config.latencyHint || 'normal',
+      minLiquidity: config.minLiquidity || 1000, convergenceThreshold: config.convergenceThreshold || 2,
+      convergenceWindowMin: config.convergenceWindowMin || 60, llmCacheTTL: config.llmCacheTTL || 30,
+      perMarketMax: config.perMarketMax || 500,
+    },
+    health: { lastRunAt: null, errors: [], rpcOk: false, polymarketOk: false, llmOk: false },
+    stats: { scanned: 0, opportunities: 0, approvalsPending: 0, executed: 0, pnlEst: 0 },
+    lastOpportunities: [],
+  };
+  store.agents.push(agent);
+  audit('info', 'agent_created', { name: agent.name, strategy: agent.strategyType }, agent.id);
+  logActivity('system', `Agent "${agent.name}" created (${agent.strategyType})`);
+  markDirty();
+  return agent;
+}
+
+function updateAgent(id, updates) {
+  const agent = store.agents.find(a => a.id === id);
+  if (!agent) return null;
+  if (updates.name) agent.name = updates.name;
+  if (updates.status) agent.status = updates.status;
+  if (updates.config) Object.assign(agent.config, updates.config);
+  agent.updatedAt = new Date().toISOString();
+  audit('info', 'agent_updated', updates, id);
+  markDirty();
+  return agent;
+}
+
+function deleteAgent(id) {
+  const idx = store.agents.findIndex(a => a.id === id);
+  if (idx === -1) return false;
+  const agent = store.agents[idx];
+  store.agents.splice(idx, 1);
+  store.approvalsQueue = store.approvalsQueue.filter(a => a.agentId !== id);
+  audit('info', 'agent_deleted', { name: agent.name }, id);
+  logActivity('system', `Agent "${agent.name}" deleted`);
+  markDirty();
+  return true;
+}
+
+async function runAgent(agentId) {
+  const agent = store.agents.find(a => a.id === agentId);
+  if (!agent || agent.status !== 'running') return [];
+  if (store.killSwitch) { agent.status = 'paused'; return []; }
+  const runner = STRATEGY_RUNNERS[agent.strategyType];
+  if (!runner) return [];
+  const opps = await runner(agent);
+  agent.lastOpportunities = opps;
+  store.strategyOpportunities = store.strategyOpportunities.filter(o => o.agentId !== agentId);
+  store.strategyOpportunities.push(...opps);
+  return opps;
+}
+
+async function runAllAgents() {
+  if (store.killSwitch) return;
+  for (const agent of store.agents) {
+    if (agent.status === 'running') {
+      try { await runAgent(agent.id); } catch (e) { console.error(`[agent] ${agent.name} error:`, e.message); }
     }
   }
-  state.agentHeartbeats.signalEngine.lastSeen = Date.now();
-  return triggered;
 }
+
+// Agent scheduler
+let agentSchedulerInterval = null;
+function startAgentScheduler() {
+  if (agentSchedulerInterval) return;
+  agentSchedulerInterval = setInterval(async () => {
+    if (store.killSwitch) return;
+    const now = Date.now();
+    for (const agent of store.agents) {
+      if (agent.status !== 'running') continue;
+      const lastRun = agent.health.lastRunAt ? new Date(agent.health.lastRunAt).getTime() : 0;
+      const interval = (agent.config.refreshSec || 60) * 1000;
+      if (now - lastRun >= interval) {
+        try { await runAgent(agent.id); } catch (e) { console.error(`[scheduler] ${agent.name}:`, e.message); }
+      }
+    }
+  }, 10000);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLOB TRADE EXECUTION (Gated)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function canExecuteTrades() {
+  const hasKeys = !!process.env.POLYMARKET_API_KEY && !!process.env.POLYMARKET_API_SECRET;
+  const hasWallet = !!process.env.POLYMARKET_PRIVATE_KEY;
+  const isLive = process.env.OBSERVATION_ONLY !== 'true';
+  return { canTrade: hasKeys && hasWallet && isLive && !store.killSwitch,
+    missing: [!hasKeys && 'CLOB API keys', !hasWallet && 'Wallet key', !isLive && 'Live mode not enabled', store.killSwitch && 'Kill switch active'].filter(Boolean) };
+}
+
+async function createClobOrder(params) {
+  const { canTrade, missing } = canExecuteTrades();
+  if (!canTrade) {
+    audit('warn', 'trade_blocked', { missing, params });
+    return { ok: false, error: 'Cannot trade: ' + missing.join(', '), simulated: false };
+  }
+
+  // Double-check with type-to-confirm for live trades
+  if (!params._confirmed) {
+    return { ok: false, error: 'Live trade requires confirmation (_confirmed: true)', needsConfirmation: true };
+  }
+
+  try {
+    const clobUrl = process.env.POLYMARKET_CLOB_URL || 'https://clob.polymarket.com';
+    const order = {
+      tokenID: params.tokenId, price: params.price, size: params.size,
+      side: params.side, type: params.type || 'limit',
+    };
+
+    // In SIMULATE mode, don't actually place
+    if (params.simulate) {
+      audit('info', 'trade_simulated', order);
+      logActivity('trade', `SIMULATED ${params.side} $${params.size} @ ${params.price}`);
+      return { ok: true, simulated: true, order, message: 'Order simulated (not placed)' };
+    }
+
+    const resp = await httpPost(`${clobUrl}/order`, order, {
+      'POLY-API-KEY': process.env.POLYMARKET_API_KEY,
+      'POLY-SECRET': process.env.POLYMARKET_API_SECRET,
+      'POLY-PASSPHRASE': process.env.POLYMARKET_API_PASSPHRASE || '',
+    });
+
+    audit('info', 'trade_executed', { order, response: resp });
+    logActivity('trade', `EXECUTED ${params.side} $${params.size} @ ${params.price}`);
+    return { ok: true, simulated: false, order, response: resp };
+  } catch (err) {
+    audit('error', 'trade_failed', { error: err.message, params });
+    return { ok: false, error: err.message };
+  }
+}
+
+async function cancelClobOrder(orderId) {
+  const { canTrade, missing } = canExecuteTrades();
+  if (!canTrade) return { ok: false, error: 'Cannot trade: ' + missing.join(', ') };
+  try {
+    const clobUrl = process.env.POLYMARKET_CLOB_URL || 'https://clob.polymarket.com';
+    const resp = await httpPost(`${clobUrl}/cancel`, { orderID: orderId }, {
+      'POLY-API-KEY': process.env.POLYMARKET_API_KEY,
+      'POLY-SECRET': process.env.POLYMARKET_API_SECRET,
+    });
+    audit('info', 'order_cancelled', { orderId, response: resp });
+    return { ok: true, response: resp };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+async function fetchOpenOrders() {
+  try {
+    const clobUrl = process.env.POLYMARKET_CLOB_URL || 'https://clob.polymarket.com';
+    const resp = await httpGet(`${clobUrl}/orders?isActive=true`);
+    store.openOrders = Array.isArray(resp) ? resp : [];
+    return store.openOrders;
+  } catch { return store.openOrders; }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SELF-DIAGNOSTICS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function runDiagnostics() {
+  const results = {};
+
+  // Polygon RPC
+  results.polygonRpc = { status: 'unchecked', message: '' };
+  if (process.env.POLYGON_RPC_URL) {
+    try {
+      const resp = await httpPost(process.env.POLYGON_RPC_URL, { jsonrpc: '2.0', method: 'eth_blockNumber', params: [], id: 1 });
+      results.polygonRpc = resp.result ? { status: 'ok', message: 'Block: ' + parseInt(resp.result, 16) } : { status: 'error', message: 'Bad response' };
+    } catch (e) { results.polygonRpc = { status: 'error', message: e.message }; }
+  } else { results.polygonRpc = { status: 'missing', message: 'POLYGON_RPC_URL not set' }; }
+
+  // Polymarket API
+  results.polymarketApi = { status: 'unchecked', message: '' };
+  try {
+    const resp = await httpGet((process.env.POLYMARKET_GAMMA_URL || 'https://gamma-api.polymarket.com') + '/markets?limit=1');
+    results.polymarketApi = Array.isArray(resp) ? { status: 'ok', message: 'Connected' } : { status: 'error', message: 'Unexpected response' };
+  } catch (e) { results.polymarketApi = { status: 'error', message: e.message }; }
+
+  // CLOB Auth
+  results.clobAuth = { status: 'unchecked', message: '' };
+  if (process.env.POLYMARKET_API_KEY) {
+    results.clobAuth = { status: 'configured', message: 'Key present (auth not tested until first trade)' };
+  } else { results.clobAuth = { status: 'missing', message: 'POLYMARKET_API_KEY not set' }; }
+
+  // Wallet
+  results.wallet = { status: 'unchecked', message: '' };
+  if (process.env.POLYMARKET_PRIVATE_KEY) {
+    const key = process.env.POLYMARKET_PRIVATE_KEY;
+    const valid = /^(0x)?[0-9a-fA-F]{64}$/.test(key);
+    results.wallet = valid ? { status: 'ok', message: 'Valid format (0x...)' } : { status: 'warning', message: 'Key present but format may be invalid' };
+  } else { results.wallet = { status: 'missing', message: 'POLYMARKET_PRIVATE_KEY not set' }; }
+
+  // LLM APIs
+  results.anthropic = process.env.ANTHROPIC_API_KEY ? { status: 'configured', message: 'Key present' } : { status: 'missing', message: 'ANTHROPIC_API_KEY not set' };
+  results.openai = process.env.OPENAI_API_KEY ? { status: 'configured', message: 'Key present' } : { status: 'missing', message: 'OPENAI_API_KEY not set' };
+  results.xai = process.env.XAI_API_KEY ? { status: 'configured', message: 'Key present' } : { status: 'missing', message: 'XAI_API_KEY not set' };
+
+  // USDC Balance (stub)
+  results.usdcBalance = { status: 'unknown', message: 'Balance check not implemented — requires on-chain query' };
+
+  store.diagnostics = { lastRun: new Date().toISOString(), results };
+  audit('info', 'diagnostics_run', results);
+  return results;
+}
+
+function getBlockersForStrategy(strategyType) {
+  const d = store.diagnostics.results;
+  const blockers = [];
+  if (!d.polymarketApi || d.polymarketApi.status !== 'ok') blockers.push('Polymarket API not connected');
+  if (strategyType === 'llm_probability') {
+    if ((!d.anthropic || d.anthropic.status === 'missing') && (!d.openai || d.openai.status === 'missing'))
+      blockers.push('No LLM API key (need ANTHROPIC_API_KEY or OPENAI_API_KEY)');
+  }
+  if (strategyType === 'sentiment') {
+    if (store.headlines.length === 0) blockers.push('No headlines pasted yet');
+  }
+  if (strategyType === 'whale_watch') {
+    if (store.whaleWallets.length === 0) blockers.push('No whale wallets configured');
+  }
+  return blockers;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMMANDER (Simple command parser)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function parseCommand(text) {
+  const cmd = text.trim().toLowerCase();
+  store.commandHistory.push({ text, ts: new Date().toISOString() });
+
+  if (cmd === 'help' || cmd === '?') {
+    return { type: 'help', message: 'Commands: create agent <strategy>, list agents, status, set min edge <N>, kill switch on/off, run agent <name>, diagnostics, why is <strategy> disabled?' };
+  }
+
+  if (cmd === 'status') {
+    const running = store.agents.filter(a => a.status === 'running').length;
+    const pending = store.approvalsQueue.filter(a => a.status === 'pending').length;
+    return { type: 'status', message: `Agents: ${store.agents.length} (${running} running) | Pending approvals: ${pending} | Kill switch: ${store.killSwitch ? 'ON' : 'OFF'} | Markets cached: ${store.marketCache.data.length}` };
+  }
+
+  if (cmd === 'list agents') {
+    return { type: 'list', message: store.agents.length === 0 ? 'No agents created yet.' : store.agents.map(a => `- ${a.name} [${a.strategyType}] ${a.status} | scanned: ${a.stats.scanned} | opps: ${a.stats.opportunities}`).join('\n') };
+  }
+
+  if (cmd.startsWith('create agent')) {
+    const strategies = ['negrisk_arb', 'llm_probability', 'sentiment', 'whale_watch'];
+    const parts = cmd.split(/\s+/);
+    let strategy = parts[2] || '';
+    if (!strategies.includes(strategy)) {
+      const match = strategies.find(s => s.includes(strategy));
+      strategy = match || 'negrisk_arb';
+    }
+    const agent = createAgent({ strategyType: strategy, name: `${strategy}-${Date.now().toString(36)}` });
+    return { type: 'created', message: `Created agent "${agent.name}" (${strategy}) in OBSERVE mode. ID: ${agent.id}` };
+  }
+
+  if (cmd.startsWith('set min edge')) {
+    const n = parseFloat(cmd.replace('set min edge', '').trim());
+    if (isNaN(n)) return { type: 'error', message: 'Usage: set min edge <number>' };
+    store.agents.forEach(a => { a.config.minEdgePct = n; });
+    return { type: 'config', message: `Set min edge to ${n}% for all agents` };
+  }
+
+  if (cmd === 'kill switch on') {
+    store.killSwitch = true; markDirty();
+    store.agents.forEach(a => { a.status = 'paused'; });
+    audit('warn', 'kill_switch_on', {});
+    logActivity('system', 'KILL SWITCH ACTIVATED');
+    return { type: 'kill', message: 'KILL SWITCH ON — All agents paused, trading halted.' };
+  }
+
+  if (cmd === 'kill switch off') {
+    store.killSwitch = false; markDirty();
+    audit('info', 'kill_switch_off', {});
+    logActivity('system', 'Kill switch deactivated');
+    return { type: 'kill', message: 'Kill switch OFF — Agents can resume.' };
+  }
+
+  if (cmd === 'diagnostics' || cmd === 'diag') {
+    await runDiagnostics();
+    const d = store.diagnostics.results;
+    const lines = Object.entries(d).map(([k, v]) => `  ${k}: ${v.status} — ${v.message}`);
+    return { type: 'diagnostics', message: 'Diagnostics:\n' + lines.join('\n') };
+  }
+
+  if (cmd.startsWith('run agent')) {
+    const name = cmd.replace('run agent', '').trim();
+    const agent = store.agents.find(a => a.name.toLowerCase().includes(name) || a.id === name);
+    if (!agent) return { type: 'error', message: 'Agent not found: ' + name };
+    const opps = await runAgent(agent.id);
+    return { type: 'run', message: `Ran ${agent.name}: ${opps.length} opportunities found` };
+  }
+
+  // Fallback: try LLM if available
+  if (process.env.ANTHROPIC_API_KEY) {
+    try {
+      const resp = await httpPost('https://api.anthropic.com/v1/messages', {
+        model: 'claude-sonnet-4-5-20250929', max_tokens: 300,
+        system: 'You are ZVI, a fund OS assistant. Parse user commands into agent configuration. Respond concisely. Available strategies: negrisk_arb, llm_probability, sentiment, whale_watch.',
+        messages: [{ role: 'user', content: text }],
+      }, { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' });
+      return { type: 'llm', message: resp.content?.[0]?.text || 'No response from LLM' };
+    } catch { /* fall through */ }
+  }
+
+  return { type: 'unknown', message: `Unknown command: "${text}". Type "help" for commands.` };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONFIG, BLOCKERS, SYSTEM STATUS
+// ═══════════════════════════════════════════════════════════════════════════════
 
 function getConfig() {
   return {
     mode: process.env.OBSERVATION_ONLY === 'true' ? 'OBSERVATION_ONLY' : 'LIVE',
     autoExec: process.env.AUTO_EXEC === 'true',
-    killSwitch: process.env.KILL_SWITCH === 'true',
+    killSwitch: store.killSwitch,
     manualApproval: process.env.MANUAL_APPROVAL_REQUIRED !== 'false',
     secrets: {
       polygonRpc: !!process.env.POLYGON_RPC_URL,
       anthropicKey: !!process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_API_KEY.length > 10,
-      polymarketGamma: !!process.env.POLYMARKET_GAMMA_URL,
-      polymarketClob: !!process.env.POLYMARKET_CLOB_URL,
+      polymarketGamma: !!process.env.POLYMARKET_GAMMA_URL || true, // default URL works
+      polymarketClob: !!process.env.POLYMARKET_API_KEY,
       polymarketPrivateKey: !!process.env.POLYMARKET_PRIVATE_KEY,
       openaiKey: !!process.env.OPENAI_API_KEY,
+      xaiKey: !!process.env.XAI_API_KEY,
       telegram: !!process.env.TELEGRAM_BOT_TOKEN,
     },
-    riskLimits: {
-      maxExposurePerMarket: parseInt(process.env.MAX_EXPOSURE_PER_MARKET) || 500,
-      dailyMaxExposure: parseInt(process.env.DAILY_MAX_EXPOSURE) || 2000,
-      minEdgeThreshold: parseFloat(process.env.MIN_EDGE_THRESHOLD) || 0.02,
-      minDepthUsdc: parseInt(process.env.MIN_DEPTH_USDC) || 100,
-    },
+    riskLimits: getRiskLimits(),
   };
 }
 
-// ─── AI Blocker Detection Engine ────────────────────────────────────────────
-// Analyzes system state and returns prioritized founder actions.
-// Critical blockers (API keys, wallet) come first. Then capital, risk approval,
-// and finally trading decisions. Each step unlocks the next.
+function checkThresholds(symbol, price) {
+  const triggered = [];
+  for (const t of store.thresholds) {
+    const hit = (t.direction === 'above' && price >= t.thresholdPrice) || (t.direction === 'below' && price <= t.thresholdPrice);
+    if (hit && t.symbol === symbol) {
+      const signal = {
+        id: crypto.randomUUID(), symbol: t.symbol, price,
+        threshold: t.thresholdPrice, direction: t.direction,
+        triggeredAt: new Date().toISOString(),
+        brief: `Signal: ${t.symbol} crossed ${t.direction} ${t.thresholdPrice}. Current: ${price}.`,
+      };
+      store.signals.push(signal);
+      triggered.push(signal);
+    }
+  }
+  store.agentHeartbeats.signalEngine.lastSeen = Date.now();
+  return triggered;
+}
+
 function getBlockers() {
   const cfg = getConfig();
   const blockers = [];
-
-  // ── Priority 1: Polymarket API Keys ──
   const missingApi = [];
   if (!process.env.POLYMARKET_API_KEY) missingApi.push('POLYMARKET_API_KEY');
   if (!process.env.POLYMARKET_API_SECRET) missingApi.push('POLYMARKET_API_SECRET');
   if (!process.env.POLYMARKET_API_PASSPHRASE) missingApi.push('POLYMARKET_API_PASSPHRASE');
 
   blockers.push({
-    id: 'api-keys',
-    priority: 1,
-    title: 'Connect API Keys',
-    desc: 'Polymarket CLOB credentials are required to place orders.',
-    status: missingApi.length === 0 ? 'done' : 'blocked',
-    missing: missingApi,
-    action: 'Add keys to .env.local and restart',
-    category: 'critical',
+    id: 'api-keys', priority: 1, title: 'Connect API Keys',
+    desc: 'Polymarket CLOB + LLM keys for strategies.',
+    status: missingApi.length === 0 ? 'done' : 'blocked', missing: missingApi,
+    action: 'Add keys in Settings', category: 'critical',
   });
 
-  // ── Priority 2: Wallet Private Key ──
   const hasWallet = !!process.env.POLYMARKET_PRIVATE_KEY;
   blockers.push({
-    id: 'wallet',
-    priority: 2,
-    title: 'Connect Wallet',
-    desc: 'Private key needed to sign transactions on Polygon.',
-    status: hasWallet ? 'done' : 'blocked',
-    missing: hasWallet ? [] : ['POLYMARKET_PRIVATE_KEY'],
-    action: 'Add POLYMARKET_PRIVATE_KEY to .env.local',
-    category: 'critical',
+    id: 'wallet', priority: 2, title: 'Connect Wallet',
+    desc: 'Private key for signing Polygon transactions.',
+    status: hasWallet ? 'done' : 'blocked', missing: hasWallet ? [] : ['POLYMARKET_PRIVATE_KEY'],
+    action: 'Add POLYMARKET_PRIVATE_KEY', category: 'critical',
   });
 
-  // ── Priority 3: Fund Capital Allocation ──
   blockers.push({
-    id: 'capital',
-    priority: 3,
-    title: 'Fund Capital',
-    desc: 'Confirm USDC allocation for trading. Current: $' + state.founder.fundSize.toLocaleString(),
-    status: state.founder.capitalAllocated ? 'done' : 'action-needed',
-    missing: [],
-    action: 'Set fund size and confirm',
-    category: 'setup',
-    interactive: true,
-    fundSize: state.founder.fundSize,
+    id: 'capital', priority: 3, title: 'Fund Capital',
+    desc: 'USDC allocation: $' + store.founder.fundSize.toLocaleString(),
+    status: store.founder.capitalAllocated ? 'done' : 'action-needed', missing: [],
+    action: 'Set fund size and confirm', category: 'setup', interactive: true,
+    fundSize: store.founder.fundSize,
   });
 
-  // ── Priority 4: Approve Risk Limits ──
   blockers.push({
-    id: 'risks',
-    priority: 4,
-    title: 'Approve Risk Limits',
-    desc: 'Max/market: $' + cfg.riskLimits.maxExposurePerMarket +
-          ' | Daily: $' + cfg.riskLimits.dailyMaxExposure +
-          ' | Min edge: ' + (cfg.riskLimits.minEdgeThreshold * 100).toFixed(1) + '%',
-    status: state.founder.risksApproved ? 'done' : 'action-needed',
-    missing: [],
-    action: 'Review and approve limits',
-    category: 'setup',
-    interactive: true,
+    id: 'risks', priority: 4, title: 'Approve Risk Limits',
+    desc: 'Max/market: $' + cfg.riskLimits.maxExposurePerMarket + ' | Daily: $' + cfg.riskLimits.dailyMaxExposure,
+    status: store.founder.risksApproved ? 'done' : 'action-needed', missing: [],
+    action: 'Review and approve', category: 'setup', interactive: true,
     limits: cfg.riskLimits,
   });
 
-  // ── Priority 5: Trading decisions (auto-unlocks) ──
   const prevDone = blockers.every(b => b.status === 'done');
-  const decisionCount = Object.keys(state.founder.decisions).length;
+  const pending = store.approvalsQueue.filter(a => a.status === 'pending').length;
   blockers.push({
-    id: 'trade',
-    priority: 5,
-    title: 'BUY / PASS Decisions',
-    desc: prevDone
-      ? 'All systems go. Review opportunities and make decisions. ' + decisionCount + ' decided so far.'
-      : 'Complete steps above to unlock trading.',
-    status: prevDone ? 'ready' : 'locked',
-    missing: [],
-    action: 'Review opportunities below',
-    category: 'trade',
-    decisionsCount: decisionCount,
+    id: 'trade', priority: 5, title: 'Approvals / Decisions',
+    desc: prevDone ? `${pending} pending approvals. ${Object.keys(store.founder.decisions).length} decisions made.` : 'Complete steps above first.',
+    status: prevDone ? 'ready' : 'locked', missing: [], action: 'Review approvals',
+    category: 'trade', pendingApprovals: pending,
   });
 
   const currentStep = blockers.findIndex(b => b.status !== 'done');
   return {
-    blockers,
-    currentStep: currentStep === -1 ? blockers.length : currentStep + 1,
-    totalSteps: blockers.length,
-    allClear: prevDone,
-    founder: {
-      fundSize: state.founder.fundSize,
-      capitalAllocated: state.founder.capitalAllocated,
-      risksApproved: state.founder.risksApproved,
-      capitalDeployed: state.founder.capitalDeployed,
-      decisions: state.founder.decisions,
-    },
+    blockers, currentStep: currentStep === -1 ? blockers.length : currentStep + 1,
+    totalSteps: blockers.length, allClear: prevDone,
+    founder: { fundSize: store.founder.fundSize, capitalAllocated: store.founder.capitalAllocated,
+      risksApproved: store.founder.risksApproved, capitalDeployed: store.founder.capitalDeployed,
+      decisions: store.founder.decisions },
   };
 }
 
-// Position sizing: Kelly-lite based on edge, confidence, fund size
 function recommendPosition(opp) {
-  const fundSize = state.founder.fundSize;
-  const maxPerMarket = parseInt(process.env.MAX_EXPOSURE_PER_MARKET) || 500;
-  const edgeFraction = opp.edge / 100;
-  const confFraction = opp.confidence / 100;
-  // Fractional Kelly: edge * confidence * fund, capped at max per market
-  const kellySize = Math.round(edgeFraction * confFraction * fundSize * 0.25);
-  const size = Math.min(Math.max(kellySize, 10), maxPerMarket);
-  const pctOfFund = ((size / fundSize) * 100).toFixed(1);
-  return { size, pctOfFund, maxPerMarket };
+  const fundSize = store.founder.fundSize;
+  const maxPer = parseInt(process.env.MAX_EXPOSURE_PER_MARKET) || 500;
+  const edgeFrac = opp.edge / 100, confFrac = opp.confidence / 100;
+  const kellySize = Math.round(edgeFrac * confFrac * fundSize * 0.25);
+  const size = Math.min(Math.max(kellySize, 10), maxPer);
+  return { size, pctOfFund: ((size / fundSize) * 100).toFixed(1), maxPerMarket: maxPer };
 }
 
-// ─── System Status ───────────────────────────────────────────────────────────
 function getSystemStatus() {
   const cfg = getConfig();
   const uptime = Math.round((Date.now() - STARTUP_TIME) / 1000);
-  const cacheAge = state.opportunityCache.fetchedAt > 0
-    ? Math.round((Date.now() - state.opportunityCache.fetchedAt) / 1000) : -1;
-
   return {
     uptime,
-    uptimeFormatted: uptime > 3600 ? Math.floor(uptime/3600) + 'h ' + Math.floor((uptime%3600)/60) + 'm'
-      : uptime > 60 ? Math.floor(uptime/60) + 'm ' + (uptime%60) + 's'
-      : uptime + 's',
-    mode: cfg.mode,
-    totalScans: state.totalScans,
-    totalMarketsScanned: state.totalMarketsScanned,
-    marketsInCache: state.opportunityCache.data.length,
-    cacheAge,
-    dataSource: state.agentHeartbeats.scanner.status === 'demo' ? 'demo' : 'live',
-    secrets: cfg.secrets,
-    riskLimits: cfg.riskLimits,
-    settings: state.settings,
+    uptimeFormatted: uptime > 3600 ? Math.floor(uptime / 3600) + 'h ' + Math.floor((uptime % 3600) / 60) + 'm' : uptime > 60 ? Math.floor(uptime / 60) + 'm ' + (uptime % 60) + 's' : uptime + 's',
+    mode: cfg.mode, totalScans: store.totalScans, totalMarketsScanned: store.totalMarketsScanned,
+    marketsInCache: store.marketCache.data.length,
+    dataSource: store.agentHeartbeats.scanner.status === 'demo' ? 'demo' : 'live',
+    secrets: cfg.secrets, riskLimits: cfg.riskLimits, settings: store.settings,
+    killSwitch: store.killSwitch, agentsCount: store.agents.length,
+    pendingApprovals: store.approvalsQueue.filter(a => a.status === 'pending').length,
     founder: {
-      capitalAllocated: state.founder.capitalAllocated,
-      fundSize: state.founder.fundSize,
-      risksApproved: state.founder.risksApproved,
-      capitalDeployed: state.founder.capitalDeployed,
-      totalDecisions: Object.keys(state.founder.decisions).length,
-      buys: Object.values(state.founder.decisions).filter(d => d.verdict === 'BUY').length,
-      passes: Object.values(state.founder.decisions).filter(d => d.verdict === 'PASS').length,
+      capitalAllocated: store.founder.capitalAllocated, fundSize: store.founder.fundSize,
+      risksApproved: store.founder.risksApproved, capitalDeployed: store.founder.capitalDeployed,
+      totalDecisions: Object.keys(store.founder.decisions).length,
+      buys: Object.values(store.founder.decisions).filter(d => d.verdict === 'BUY').length,
+      passes: Object.values(store.founder.decisions).filter(d => d.verdict === 'PASS').length,
     },
-    agents: state.agentHeartbeats,
-    activityCount: activityLog.length,
+    agents: store.agentHeartbeats, activityCount: activityLog.length,
+    diagnostics: store.diagnostics,
   };
 }
 
-// ─── .env.local updater (for UI-based API key config) ────────────────────────
+// ── .env.local updater ──
 function updateEnvFile(updates) {
-  // updates is { KEY: 'value', KEY2: 'value2', ... }
-  // Only allow known safe keys
-  const ALLOWED_KEYS = new Set([
+  const ALLOWED = new Set([
     'POLYMARKET_API_KEY', 'POLYMARKET_API_SECRET', 'POLYMARKET_API_PASSPHRASE',
     'POLYMARKET_PRIVATE_KEY', 'POLYMARKET_GAMMA_URL', 'POLYMARKET_CLOB_URL',
     'POLYGON_RPC_URL', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'XAI_API_KEY',
@@ -478,47 +1219,31 @@ function updateEnvFile(updates) {
     'MAX_EXPOSURE_PER_MARKET', 'DAILY_MAX_EXPOSURE', 'MIN_EDGE_THRESHOLD', 'MIN_DEPTH_USDC',
     'OBSERVATION_ONLY', 'MANUAL_APPROVAL_REQUIRED', 'AUTO_EXEC', 'KILL_SWITCH',
   ]);
-
-  const filteredUpdates = {};
-  for (const [key, val] of Object.entries(updates)) {
-    if (ALLOWED_KEYS.has(key)) filteredUpdates[key] = val;
-  }
-
-  if (Object.keys(filteredUpdates).length === 0) return { ok: false, error: 'No valid keys to update' };
-
+  const filtered = {};
+  for (const [k, v] of Object.entries(updates)) { if (ALLOWED.has(k)) filtered[k] = v; }
+  if (Object.keys(filtered).length === 0) return { ok: false, error: 'No valid keys' };
   try {
     let content = '';
     try { content = fs.readFileSync(ENV_PATH, 'utf-8'); } catch { content = ''; }
-
-    for (const [key, val] of Object.entries(filteredUpdates)) {
-      const regex = new RegExp('^' + key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '=.*$', 'm');
-      if (regex.test(content)) {
-        content = content.replace(regex, key + '=' + val);
-      } else {
-        content += '\n' + key + '=' + val;
-      }
-      // Also update process.env immediately
-      process.env[key] = val;
+    for (const [k, v] of Object.entries(filtered)) {
+      const re = new RegExp('^' + k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '=.*$', 'm');
+      if (re.test(content)) content = content.replace(re, k + '=' + v);
+      else content += '\n' + k + '=' + v;
+      process.env[k] = v;
     }
-
     fs.writeFileSync(ENV_PATH, content, 'utf-8');
-    logActivity('config', 'Updated .env.local: ' + Object.keys(filteredUpdates).join(', '));
-    return { ok: true, updated: Object.keys(filteredUpdates) };
-  } catch (err) {
-    logActivity('error', 'Failed to update .env.local: ' + err.message);
-    return { ok: false, error: err.message };
-  }
+    logActivity('config', 'Updated .env.local: ' + Object.keys(filtered).join(', '));
+    return { ok: true, updated: Object.keys(filtered) };
+  } catch (e) { return { ok: false, error: e.message }; }
 }
 
-// ─── HTTP helpers ────────────────────────────────────────────────────────────
-function json(res, data, status = 200) {
+// ═══════════════════════════════════════════════════════════════════════════════
+// HTTP HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function jsonResp(res, data, status = 200) {
   const body = JSON.stringify(data);
-  res.writeHead(status, {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'Cache-Control': 'no-store',
-    'Content-Length': Buffer.byteLength(body),
-  });
+  res.writeHead(status, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store', 'Content-Length': Buffer.byteLength(body) });
   res.end(body);
 }
 
@@ -526,2901 +1251,767 @@ function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     req.on('data', c => chunks.push(c));
-    req.on('end', () => {
-      try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString()));
-      } catch (e) {
-        reject(new Error('Invalid JSON body'));
-      }
-    });
+    req.on('end', () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString())); } catch (e) { reject(new Error('Invalid JSON')); } });
     req.on('error', reject);
   });
 }
 
-// ─── Dashboard HTML ──────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// DASHBOARD HTML
+// ═══════════════════════════════════════════════════════════════════════════════
+
 function dashboardHTML() {
   const cfg = getConfig();
   const initialBlockers = getBlockers();
   const initialOpps = getDemoOpportunities();
-  // Embed state directly — page renders with ZERO API calls needed
-  const EMBEDDED_STATE = JSON.stringify({ blockers: initialBlockers, opportunities: initialOpps });
+  const EMBEDDED = JSON.stringify({ blockers: initialBlockers, opportunities: initialOpps, agents: store.agents, approvals: store.approvalsQueue.filter(a => a.status === 'pending'), killSwitch: store.killSwitch });
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ZVI v1 — Founder Command Center</title>
+<title>ZVI v1 — Fund Operating System</title>
 <style>
-  :root {
-    --bg-primary: #0a0a0f;
-    --bg-secondary: #0f0f18;
-    --bg-card: #12121a;
-    --bg-card-hover: #1a1a2e;
-    --border: #2a2a3e;
-    --border-bright: #3b3b55;
-    --text-primary: #e4e4ef;
-    --text-secondary: #8888a0;
-    --text-muted: #5a5a72;
-    --accent-blue: #6366f1;
-    --accent-cyan: #06b6d4;
-    --accent-green: #22c55e;
-    --accent-yellow: #eab308;
-    --accent-red: #ef4444;
-    --accent-purple: #8b5cf6;
-    --glow-blue: rgba(99, 102, 241, 0.15);
-    --glow-green: rgba(34, 197, 94, 0.15);
-    --font-mono: 'SF Mono', 'Fira Code', 'JetBrains Mono', monospace;
-    --font-sans: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
-  }
-
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-
-  body {
-    background: var(--bg-primary);
-    color: var(--text-primary);
-    font-family: var(--font-sans);
-    font-size: 14px;
-    line-height: 1.5;
-    overflow-x: hidden;
-  }
-
-  /* ── Scrollbar ── */
-  ::-webkit-scrollbar { width: 6px; height: 6px; }
-  ::-webkit-scrollbar-track { background: var(--bg-primary); }
-  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-  ::-webkit-scrollbar-thumb:hover { background: var(--border-bright); }
-
-  /* ── Top Bar ── */
-  .topbar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0 24px;
-    height: 56px;
-    background: linear-gradient(180deg, #111c30 0%, var(--bg-secondary) 100%);
-    border-bottom: 1px solid var(--border);
-    position: sticky;
-    top: 0;
-    z-index: 100;
-  }
-
-  .topbar-left { display: flex; align-items: center; gap: 16px; }
-
-  .logo {
-    font-family: var(--font-mono);
-    font-size: 16px;
-    font-weight: 700;
-    background: linear-gradient(135deg, var(--accent-blue), var(--accent-cyan));
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    letter-spacing: 0.5px;
-  }
-
-  .logo-sub {
-    font-size: 11px;
-    color: var(--text-muted);
-    font-family: var(--font-mono);
-    letter-spacing: 1px;
-    text-transform: uppercase;
-  }
-
-  .topbar-right { display: flex; align-items: center; gap: 12px; }
-
-  .mode-badge {
-    padding: 4px 12px;
-    border-radius: 4px;
-    font-family: var(--font-mono);
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.5px;
-    text-transform: uppercase;
-  }
-
-  .mode-observation {
-    background: rgba(245, 158, 11, 0.15);
-    color: var(--accent-yellow);
-    border: 1px solid rgba(245, 158, 11, 0.3);
-  }
-
-  .mode-live {
-    background: rgba(239, 68, 68, 0.15);
-    color: var(--accent-red);
-    border: 1px solid rgba(239, 68, 68, 0.3);
-    animation: pulse-border 2s infinite;
-  }
-
-  @keyframes pulse-border {
-    0%, 100% { border-color: rgba(239, 68, 68, 0.3); }
-    50% { border-color: rgba(239, 68, 68, 0.7); }
-  }
-
-  .secret-badges { display: flex; gap: 6px; }
-
-  .secret-badge {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    padding: 3px 8px;
-    border-radius: 3px;
-    font-size: 10px;
-    font-family: var(--font-mono);
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-  }
-
-  .secret-badge .dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-  }
-
-  .dot-green { background: var(--accent-green); box-shadow: 0 0 4px var(--accent-green); }
-  .dot-red { background: var(--accent-red); box-shadow: 0 0 4px var(--accent-red); }
-
-  /* ── Tabs ── */
-  .tabs {
-    display: flex;
-    gap: 0;
-    padding: 0 24px;
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--border);
-  }
-
-  .tab {
-    padding: 12px 20px;
-    font-size: 13px;
-    font-weight: 500;
-    color: var(--text-secondary);
-    cursor: pointer;
-    border-bottom: 2px solid transparent;
-    transition: all 0.2s;
-    user-select: none;
-    font-family: var(--font-sans);
-  }
-
-  .tab:hover { color: var(--text-primary); background: rgba(255,255,255,0.02); }
-
-  .tab.active {
-    color: var(--accent-cyan);
-    border-bottom-color: var(--accent-cyan);
-  }
-
-  .tab .count {
-    display: inline-block;
-    margin-left: 6px;
-    padding: 1px 6px;
-    border-radius: 8px;
-    font-size: 10px;
-    font-family: var(--font-mono);
-    background: var(--bg-card);
-    color: var(--text-muted);
-    min-width: 18px;
-    text-align: center;
-  }
-
-  .tab.active .count { background: rgba(6, 182, 212, 0.15); color: var(--accent-cyan); }
-
-  /* ── Content ── */
-  .content { padding: 20px 24px; }
-  .panel { display: none; }
-  .panel.active { display: block; }
-
-  /* ── Summary Strip ── */
-  .summary-strip {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-    gap: 12px;
-    margin-bottom: 20px;
-  }
-
-  .summary-card {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 16px;
-    position: relative;
-    overflow: hidden;
-  }
-
-  .summary-card::before {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 2px;
-  }
-
-  .summary-card.blue::before { background: var(--accent-blue); }
-  .summary-card.green::before { background: var(--accent-green); }
-  .summary-card.yellow::before { background: var(--accent-yellow); }
-  .summary-card.purple::before { background: var(--accent-purple); }
-  .summary-card.cyan::before { background: var(--accent-cyan); }
-
-  .summary-label {
-    font-size: 11px;
-    color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    font-family: var(--font-mono);
-    margin-bottom: 4px;
-  }
-
-  .summary-value {
-    font-size: 24px;
-    font-weight: 700;
-    font-family: var(--font-mono);
-  }
-
-  .summary-sub {
-    font-size: 11px;
-    color: var(--text-secondary);
-    margin-top: 2px;
-  }
-
-  /* ── Table ── */
-  .table-wrap {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    overflow: hidden;
-  }
-
-  .table-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 12px 16px;
-    border-bottom: 1px solid var(--border);
-  }
-
-  .table-title {
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--text-primary);
-  }
-
-  .table-actions { display: flex; gap: 8px; align-items: center; }
-
-  .refresh-indicator {
-    font-family: var(--font-mono);
-    font-size: 10px;
-    color: var(--text-muted);
-  }
-
-  .btn {
-    padding: 5px 12px;
-    border-radius: 4px;
-    font-size: 12px;
-    font-family: var(--font-mono);
-    border: 1px solid var(--border);
-    background: var(--bg-secondary);
-    color: var(--text-secondary);
-    cursor: pointer;
-    transition: all 0.15s;
-  }
-
-  .btn:hover { border-color: var(--accent-cyan); color: var(--accent-cyan); }
-  .btn:active { transform: scale(0.97); }
-
-  .btn-primary {
-    background: rgba(59, 130, 246, 0.15);
-    border-color: rgba(59, 130, 246, 0.4);
-    color: var(--accent-blue);
-  }
-
-  .btn-primary:hover {
-    background: rgba(59, 130, 246, 0.25);
-    border-color: var(--accent-blue);
-  }
-
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 13px;
-  }
-
-  thead th {
-    padding: 10px 16px;
-    text-align: left;
-    font-weight: 600;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--text-muted);
-    background: rgba(0,0,0,0.2);
-    border-bottom: 1px solid var(--border);
-    font-family: var(--font-mono);
-    white-space: nowrap;
-    user-select: none;
-    cursor: pointer;
-  }
-
-  thead th:hover { color: var(--text-secondary); }
-
-  tbody tr {
-    border-bottom: 1px solid rgba(42, 53, 85, 0.5);
-    transition: background 0.1s;
-  }
-
-  tbody tr:hover { background: var(--bg-card-hover); }
-  tbody tr:last-child { border-bottom: none; }
-
-  td {
-    padding: 10px 16px;
-    vertical-align: middle;
-  }
-
-  .market-name {
-    max-width: 380px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .market-name a {
-    color: var(--text-primary);
-    text-decoration: none;
-    transition: color 0.15s;
-  }
-
-  .market-name a:hover { color: var(--accent-cyan); }
-
-  .negrisk-tag {
-    display: inline-block;
-    padding: 1px 5px;
-    border-radius: 3px;
-    font-size: 9px;
-    font-family: var(--font-mono);
-    background: rgba(139, 92, 246, 0.15);
-    color: var(--accent-purple);
-    border: 1px solid rgba(139, 92, 246, 0.3);
-    margin-left: 6px;
-    vertical-align: middle;
-  }
-
-  .edge-cell {
-    font-family: var(--font-mono);
-    font-weight: 600;
-    font-size: 13px;
-  }
-
-  .edge-high { color: var(--accent-green); }
-  .edge-mid { color: var(--accent-yellow); }
-  .edge-low { color: var(--text-muted); }
-
-  .price-cell {
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: var(--text-secondary);
-  }
-
-  .volume-cell {
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: var(--text-secondary);
-  }
-
-  .confidence-bar {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .confidence-track {
-    width: 60px;
-    height: 4px;
-    background: var(--bg-primary);
-    border-radius: 2px;
-    overflow: hidden;
-  }
-
-  .confidence-fill {
-    height: 100%;
-    border-radius: 2px;
-    transition: width 0.3s;
-  }
-
-  .confidence-val {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    color: var(--text-muted);
-    min-width: 30px;
-  }
-
-  .pin-btn {
-    background: none;
-    border: 1px solid var(--border);
-    color: var(--text-muted);
-    padding: 3px 8px;
-    border-radius: 3px;
-    cursor: pointer;
-    font-size: 11px;
-    font-family: var(--font-mono);
-    transition: all 0.15s;
-  }
-
-  .pin-btn:hover { border-color: var(--accent-yellow); color: var(--accent-yellow); }
-  .pin-btn.pinned { border-color: var(--accent-yellow); color: var(--accent-yellow); background: rgba(245,158,11,0.1); }
-
-  /* ── Signals Panel ── */
-  .signal-form {
-    display: flex;
-    gap: 10px;
-    margin-bottom: 20px;
-    flex-wrap: wrap;
-    align-items: flex-end;
-  }
-
-  .form-group { display: flex; flex-direction: column; gap: 4px; }
-
-  .form-group label {
-    font-size: 10px;
-    font-family: var(--font-mono);
-    color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-  }
-
-  .form-input {
-    background: var(--bg-primary);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 7px 10px;
-    color: var(--text-primary);
-    font-family: var(--font-mono);
-    font-size: 12px;
-    outline: none;
-    transition: border-color 0.15s;
-  }
-
-  .form-input:focus { border-color: var(--accent-cyan); }
-
-  select.form-input {
-    appearance: none;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%235a6478'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: right 8px center;
-    padding-right: 24px;
-  }
-
-  .signal-card {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 16px;
-    margin-bottom: 10px;
-    border-left: 3px solid var(--accent-yellow);
-  }
-
-  .signal-card .signal-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 8px;
-  }
-
-  .signal-card .signal-symbol {
-    font-family: var(--font-mono);
-    font-weight: 700;
-    font-size: 15px;
-    color: var(--accent-cyan);
-  }
-
-  .signal-card .signal-time {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    color: var(--text-muted);
-  }
-
-  .signal-card .signal-brief {
-    font-size: 13px;
-    color: var(--text-secondary);
-    line-height: 1.6;
-    background: rgba(0,0,0,0.2);
-    padding: 10px;
-    border-radius: 4px;
-    font-family: var(--font-mono);
-    font-size: 12px;
-  }
-
-  .threshold-list {
-    margin-top: 16px;
-  }
-
-  .threshold-item {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 8px 12px;
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    margin-bottom: 6px;
-    font-family: var(--font-mono);
-    font-size: 12px;
-  }
-
-  .threshold-item .th-symbol { color: var(--accent-cyan); font-weight: 600; min-width: 80px; }
-  .threshold-item .th-dir { color: var(--text-muted); }
-  .threshold-item .th-price { color: var(--accent-yellow); font-weight: 600; }
-  .threshold-item .th-remove {
-    margin-left: auto;
-    color: var(--text-muted);
-    cursor: pointer;
-    padding: 2px 6px;
-    border-radius: 3px;
-    transition: all 0.15s;
-  }
-  .threshold-item .th-remove:hover { color: var(--accent-red); background: rgba(239,68,68,0.1); }
-
-  /* ── Pinned Markets ── */
-  .pinned-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
-    gap: 12px;
-  }
-
-  .pinned-card {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 16px;
-    transition: border-color 0.15s;
-  }
-
-  .pinned-card:hover { border-color: var(--border-bright); }
-
-  .pinned-card .pc-title {
-    font-size: 14px;
-    font-weight: 600;
-    margin-bottom: 8px;
-    line-height: 1.4;
-  }
-
-  .pinned-card .pc-title a {
-    color: var(--text-primary);
-    text-decoration: none;
-  }
-
-  .pinned-card .pc-title a:hover { color: var(--accent-cyan); }
-
-  .pinned-card .pc-meta {
-    display: flex;
-    gap: 16px;
-    margin-bottom: 12px;
-    font-family: var(--font-mono);
-    font-size: 11px;
-    color: var(--text-muted);
-  }
-
-  .pinned-card .pc-actions {
-    display: flex;
-    gap: 8px;
-  }
-
-  .pinned-card .pc-unpin { color: var(--accent-red); }
-
-  /* ── Agent Health ── */
-  .health-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-    gap: 12px;
-  }
-
-  .health-card {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 20px;
-  }
-
-  .health-card .hc-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 16px;
-  }
-
-  .health-card .hc-name {
-    font-weight: 600;
-    font-size: 14px;
-  }
-
-  .status-pill {
-    padding: 3px 10px;
-    border-radius: 10px;
-    font-size: 10px;
-    font-family: var(--font-mono);
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-  }
-
-  .status-running { background: rgba(16,185,129,0.15); color: var(--accent-green); }
-  .status-idle { background: rgba(245,158,11,0.15); color: var(--accent-yellow); }
-  .status-error { background: rgba(239,68,68,0.15); color: var(--accent-red); }
-  .status-stopped { background: rgba(90,100,120,0.15); color: var(--text-muted); }
-
-  .health-card .hc-row {
-    display: flex;
-    justify-content: space-between;
-    padding: 6px 0;
-    font-size: 12px;
-    border-bottom: 1px solid rgba(42,53,85,0.3);
-  }
-
-  .health-card .hc-row:last-child { border-bottom: none; }
-  .health-card .hc-label { color: var(--text-muted); font-family: var(--font-mono); font-size: 11px; }
-  .health-card .hc-val { color: var(--text-secondary); font-family: var(--font-mono); font-size: 11px; }
-
-  /* ── Empty state ── */
-  .empty-state {
-    text-align: center;
-    padding: 60px 20px;
-    color: var(--text-muted);
-  }
-
-  .empty-state .empty-icon {
-    font-size: 40px;
-    margin-bottom: 12px;
-    opacity: 0.3;
-  }
-
-  .empty-state p { font-size: 14px; margin-bottom: 4px; }
-  .empty-state .empty-hint { font-size: 12px; font-family: var(--font-mono); }
-
-  /* ── Loader ── */
-  .loader {
-    text-align: center;
-    padding: 40px;
-  }
-
-  .spinner {
-    display: inline-block;
-    width: 24px;
-    height: 24px;
-    border: 2px solid var(--border);
-    border-top-color: var(--accent-cyan);
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-  }
-
-  @keyframes spin { to { transform: rotate(360deg); } }
-
-  .loader-text {
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: var(--text-muted);
-    margin-top: 10px;
-  }
-
-  /* ── Toast ── */
-  .toast-container {
-    position: fixed;
-    bottom: 20px;
-    right: 20px;
-    z-index: 1000;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-
-  .toast {
-    padding: 10px 16px;
-    border-radius: 6px;
-    font-size: 12px;
-    font-family: var(--font-mono);
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    color: var(--text-primary);
-    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
-    animation: slideIn 0.2s ease-out;
-    max-width: 360px;
-  }
-
-  .toast.success { border-color: var(--accent-green); }
-  .toast.error { border-color: var(--accent-red); }
-  .toast.info { border-color: var(--accent-cyan); }
-
-  @keyframes slideIn {
-    from { transform: translateX(100%); opacity: 0; }
-    to { transform: translateX(0); opacity: 1; }
-  }
-
-  /* ── Responsive ── */
-  @media (max-width: 768px) {
-    .topbar { padding: 0 12px; flex-wrap: wrap; height: auto; padding: 10px 12px; gap: 8px; }
-    .tabs { padding: 0 12px; overflow-x: auto; }
-    .tab { padding: 10px 14px; font-size: 12px; white-space: nowrap; }
-    .content { padding: 12px; }
-    .summary-strip { grid-template-columns: repeat(2, 1fr); }
-    .market-name { max-width: 200px; }
-    table { font-size: 12px; }
-    td, thead th { padding: 8px 10px; }
-  }
-
-  /* ── Price simulation form ── */
-  .price-sim-form {
-    display: flex;
-    gap: 10px;
-    margin-top: 16px;
-    padding: 16px;
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    align-items: flex-end;
-    flex-wrap: wrap;
-  }
-
-  /* ── Action Queue (Founder Priority Flow) ── */
-  .action-queue {
-    padding: 16px 24px;
-    background: linear-gradient(180deg, rgba(99, 102, 241, 0.04) 0%, transparent 100%);
-    border-bottom: 1px solid var(--border);
-  }
-
-  .aq-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 12px;
-  }
-
-  .aq-title {
-    font-size: 10px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 1.5px;
-    color: var(--accent-blue);
-    font-family: var(--font-mono);
-  }
-
-  .aq-progress {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    color: var(--text-muted);
-  }
-
-  .aq-steps {
-    display: flex;
-    gap: 8px;
-    overflow-x: auto;
-    padding-bottom: 4px;
-  }
-
-  .aq-step {
-    flex: 1;
-    min-width: 170px;
-    padding: 12px 14px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    transition: all 0.2s;
-    position: relative;
-  }
-
-  .aq-step.step-blocked {
-    border-color: rgba(239, 68, 68, 0.4);
-    background: rgba(239, 68, 68, 0.04);
-  }
-
-  .aq-step.step-current {
-    border-color: var(--accent-blue);
-    background: rgba(99, 102, 241, 0.06);
-    box-shadow: 0 0 20px rgba(99, 102, 241, 0.08);
-  }
-
-  .aq-step.step-done {
-    border-color: rgba(34, 197, 94, 0.3);
-    background: rgba(34, 197, 94, 0.04);
-    opacity: 0.65;
-  }
-
-  .aq-step.step-locked {
-    opacity: 0.3;
-    pointer-events: none;
-  }
-
-  .aq-num {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 20px;
-    height: 20px;
-    border-radius: 50%;
-    font-size: 10px;
-    font-weight: 700;
-    font-family: var(--font-mono);
-    margin-bottom: 6px;
-  }
-
-  .step-blocked .aq-num { background: rgba(239, 68, 68, 0.2); color: var(--accent-red); }
-  .step-current .aq-num { background: rgba(99, 102, 241, 0.2); color: var(--accent-blue); }
-  .step-done .aq-num { background: rgba(34, 197, 94, 0.2); color: var(--accent-green); }
-  .step-locked .aq-num { background: rgba(90, 90, 114, 0.15); color: var(--text-muted); }
-
-  .aq-step-title {
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--text-primary);
-    margin-bottom: 3px;
-  }
-
-  .aq-step-desc {
-    font-size: 10px;
-    color: var(--text-muted);
-    line-height: 1.5;
-    font-family: var(--font-mono);
-  }
-
-  .aq-step-action {
-    margin-top: 8px;
-  }
-
-  .aq-step-action .btn {
-    font-size: 10px;
-    padding: 3px 10px;
-  }
-
-  .aq-missing {
-    margin-top: 6px;
-    font-family: var(--font-mono);
-    font-size: 10px;
-    color: var(--accent-red);
-    line-height: 1.6;
-  }
-
-  .aq-all-clear {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 10px 16px;
-    background: rgba(34, 197, 94, 0.06);
-    border: 1px solid rgba(34, 197, 94, 0.25);
-    border-radius: 8px;
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: var(--accent-green);
-    font-weight: 600;
-  }
-
-  .aq-capital-input {
-    display: flex;
-    gap: 6px;
-    margin-top: 6px;
-    align-items: center;
-  }
-
-  .aq-capital-input input {
-    width: 80px;
-    padding: 3px 6px;
-    background: var(--bg-primary);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    color: var(--text-primary);
-    font-family: var(--font-mono);
-    font-size: 11px;
-  }
-
-  .aq-capital-input input:focus {
-    border-color: var(--accent-blue);
-    outline: none;
-  }
-
-  /* ── BUY / PASS Verdict Buttons ── */
-  .verdict-cell {
-    display: flex;
-    gap: 4px;
-    align-items: center;
-  }
-
-  .verdict-btn {
-    padding: 3px 10px;
-    border-radius: 4px;
-    font-family: var(--font-mono);
-    font-size: 10px;
-    font-weight: 700;
-    border: 1px solid;
-    cursor: pointer;
-    transition: all 0.15s;
-    letter-spacing: 0.5px;
-    background: none;
-  }
-
-  .vb-buy {
-    border-color: rgba(34, 197, 94, 0.3);
-    color: var(--accent-green);
-  }
-  .vb-buy:hover { background: rgba(34, 197, 94, 0.15); border-color: var(--accent-green); }
-  .vb-buy.active { background: var(--accent-green); color: #000; }
-
-  .vb-pass {
-    border-color: rgba(239, 68, 68, 0.3);
-    color: var(--accent-red);
-  }
-  .vb-pass:hover { background: rgba(239, 68, 68, 0.15); border-color: var(--accent-red); }
-  .vb-pass.active { background: var(--accent-red); color: #fff; }
-
-  .verdict-locked .verdict-btn {
-    opacity: 0.25;
-    pointer-events: none;
-  }
-
-  .position-rec {
-    font-family: var(--font-mono);
-    font-size: 9px;
-    color: var(--accent-blue);
-    margin-top: 2px;
-  }
-
-  .verdict-decided {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    font-weight: 700;
-  }
-
-  .verdict-decided.decided-buy { color: var(--accent-green); }
-  .verdict-decided.decided-pass { color: var(--text-muted); text-decoration: line-through; }
-
-  /* ── Fund Summary Bar ── */
-  .fund-bar {
-    display: flex;
-    gap: 16px;
-    align-items: center;
-    padding: 8px 16px;
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    margin-bottom: 12px;
-    font-family: var(--font-mono);
-    font-size: 11px;
-  }
-
-  .fund-bar .fb-item { display: flex; gap: 6px; align-items: center; }
-  .fund-bar .fb-label { color: var(--text-muted); }
-  .fund-bar .fb-value { font-weight: 700; }
-  .fund-bar .fb-green { color: var(--accent-green); }
-  .fund-bar .fb-yellow { color: var(--accent-yellow); }
-  .fund-bar .fb-red { color: var(--accent-red); }
-
-  /* ── Search Bar ── */
-  .search-bar {
-    display: flex;
-    gap: 10px;
-    margin-bottom: 16px;
-    align-items: center;
-    flex-wrap: wrap;
-  }
-  .search-bar input {
-    flex: 1;
-    min-width: 200px;
-    padding: 8px 14px;
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    color: var(--text-primary);
-    font-family: var(--font-mono);
-    font-size: 12px;
-    outline: none;
-    transition: border-color 0.15s;
-  }
-  .search-bar input:focus { border-color: var(--accent-cyan); }
-  .search-bar select {
-    padding: 8px 12px;
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    color: var(--text-primary);
-    font-family: var(--font-mono);
-    font-size: 11px;
-    outline: none;
-    appearance: none;
-    cursor: pointer;
-  }
-  .search-bar .result-count {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    color: var(--text-muted);
-  }
-
-  /* ── Modal / Drawer ── */
-  .modal-overlay {
-    position: fixed;
-    top: 0; left: 0; right: 0; bottom: 0;
-    background: rgba(0,0,0,0.7);
-    z-index: 500;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    animation: fadeIn 0.15s;
-  }
-  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-  .modal {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    width: 90%;
-    max-width: 700px;
-    max-height: 85vh;
-    overflow-y: auto;
-    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
-  }
-  .modal-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 16px 20px;
-    border-bottom: 1px solid var(--border);
-  }
-  .modal-header h2 {
-    font-size: 16px;
-    font-weight: 700;
-  }
-  .modal-close {
-    background: none;
-    border: 1px solid var(--border);
-    color: var(--text-secondary);
-    width: 28px;
-    height: 28px;
-    border-radius: 6px;
-    cursor: pointer;
-    font-size: 14px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: all 0.15s;
-  }
-  .modal-close:hover { border-color: var(--accent-red); color: var(--accent-red); }
-  .modal-body { padding: 20px; }
-  .modal-footer {
-    padding: 12px 20px;
-    border-top: 1px solid var(--border);
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-  }
-
-  /* ── Settings ── */
-  .settings-section {
-    margin-bottom: 24px;
-  }
-  .settings-section h3 {
-    font-size: 13px;
-    font-weight: 700;
-    color: var(--accent-cyan);
-    margin-bottom: 12px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    font-family: var(--font-mono);
-  }
-  .settings-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-    gap: 10px;
-  }
-  .setting-item {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    padding: 12px;
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-  }
-  .setting-item label {
-    font-size: 11px;
-    font-family: var(--font-mono);
-    color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-  }
-  .setting-item .setting-desc {
-    font-size: 10px;
-    color: var(--text-muted);
-    margin-bottom: 4px;
-  }
-  .setting-item input, .setting-item select {
-    padding: 7px 10px;
-    background: var(--bg-primary);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    color: var(--text-primary);
-    font-family: var(--font-mono);
-    font-size: 12px;
-    outline: none;
-    transition: border-color 0.15s;
-  }
-  .setting-item input:focus { border-color: var(--accent-cyan); }
-  .setting-status {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    font-size: 10px;
-    font-family: var(--font-mono);
-    padding: 2px 6px;
-    border-radius: 3px;
-  }
-  .setting-status.connected { background: rgba(34,197,94,0.1); color: var(--accent-green); }
-  .setting-status.missing { background: rgba(239,68,68,0.1); color: var(--accent-red); }
-
-  /* ── Explain Hub ── */
-  .hub-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 16px;
-  }
-  @media (max-width: 900px) { .hub-grid { grid-template-columns: 1fr; } }
-  .hub-card {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 20px;
-    position: relative;
-    overflow: hidden;
-  }
-  .hub-card.full-width { grid-column: 1 / -1; }
-  .hub-card h3 {
-    font-size: 12px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    color: var(--accent-blue);
-    font-family: var(--font-mono);
-    margin-bottom: 12px;
-  }
-  .hub-card p {
-    font-size: 13px;
-    line-height: 1.7;
-    color: var(--text-secondary);
-    margin-bottom: 8px;
-  }
-  .hub-status-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 8px;
-    margin-top: 8px;
-  }
-  .hub-stat {
-    padding: 10px;
-    background: rgba(0,0,0,0.2);
-    border-radius: 6px;
-  }
-  .hub-stat .hs-label {
-    font-size: 10px;
-    color: var(--text-muted);
-    font-family: var(--font-mono);
-    text-transform: uppercase;
-  }
-  .hub-stat .hs-val {
-    font-size: 18px;
-    font-weight: 700;
-    font-family: var(--font-mono);
-  }
-
-  /* ── Activity Feed ── */
-  .activity-feed {
-    max-height: 400px;
-    overflow-y: auto;
-  }
-  .activity-entry {
-    display: flex;
-    gap: 10px;
-    padding: 8px 0;
-    border-bottom: 1px solid rgba(42,53,85,0.3);
-    font-size: 12px;
-    align-items: flex-start;
-  }
-  .activity-entry:last-child { border-bottom: none; }
-  .activity-time {
-    font-family: var(--font-mono);
-    font-size: 10px;
-    color: var(--text-muted);
-    white-space: nowrap;
-    min-width: 60px;
-  }
-  .activity-type {
-    font-family: var(--font-mono);
-    font-size: 9px;
-    padding: 2px 6px;
-    border-radius: 3px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    min-width: 55px;
-    text-align: center;
-  }
-  .at-system { background: rgba(99,102,241,0.15); color: var(--accent-blue); }
-  .at-scan { background: rgba(6,182,212,0.15); color: var(--accent-cyan); }
-  .at-config { background: rgba(245,158,11,0.15); color: var(--accent-yellow); }
-  .at-trade { background: rgba(34,197,94,0.15); color: var(--accent-green); }
-  .at-decision { background: rgba(139,92,246,0.15); color: var(--accent-purple); }
-  .at-error { background: rgba(239,68,68,0.15); color: var(--accent-red); }
-  .activity-msg { color: var(--text-secondary); }
-
-  /* ── Glossary ── */
-  .glossary-item {
-    padding: 10px;
-    margin-bottom: 6px;
-    background: rgba(0,0,0,0.15);
-    border-radius: 6px;
-    border-left: 3px solid var(--accent-blue);
-  }
-  .glossary-item .gi-term {
-    font-family: var(--font-mono);
-    font-weight: 700;
-    font-size: 12px;
-    color: var(--accent-cyan);
-    margin-bottom: 3px;
-  }
-  .glossary-item .gi-def {
-    font-size: 12px;
-    color: var(--text-secondary);
-    line-height: 1.5;
-  }
-
-  /* ── Roadmap ── */
-  .roadmap-phase {
-    padding: 12px;
-    margin-bottom: 8px;
-    background: rgba(0,0,0,0.15);
-    border-radius: 8px;
-    border-left: 3px solid var(--border);
-  }
-  .roadmap-phase.active { border-left-color: var(--accent-green); background: rgba(34,197,94,0.04); }
-  .roadmap-phase.next { border-left-color: var(--accent-blue); }
-  .roadmap-phase.future { opacity: 0.6; }
-  .rp-title {
-    font-size: 13px;
-    font-weight: 700;
-    margin-bottom: 4px;
-  }
-  .rp-desc {
-    font-size: 11px;
-    color: var(--text-muted);
-    font-family: var(--font-mono);
-  }
-  .rp-tag {
-    display: inline-block;
-    padding: 1px 6px;
-    border-radius: 3px;
-    font-size: 9px;
-    font-family: var(--font-mono);
-    font-weight: 700;
-    margin-right: 6px;
-  }
-  .rp-tag.current { background: rgba(34,197,94,0.2); color: var(--accent-green); }
-  .rp-tag.upcoming { background: rgba(99,102,241,0.2); color: var(--accent-blue); }
-  .rp-tag.planned { background: rgba(90,90,114,0.2); color: var(--text-muted); }
-
-  /* ── Interactive Action Queue (expanded) ── */
-  .aq-step { cursor: pointer; }
-  .aq-step:hover:not(.step-locked) { border-color: var(--accent-cyan); }
-  .aq-step-expanded {
-    margin-top: 8px;
-    padding-top: 8px;
-    border-top: 1px solid var(--border);
-  }
-  .aq-input-row {
-    display: flex;
-    gap: 6px;
-    margin-top: 6px;
-    align-items: center;
-  }
-  .aq-input-row input {
-    flex: 1;
-    padding: 5px 8px;
-    background: var(--bg-primary);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    color: var(--text-primary);
-    font-family: var(--font-mono);
-    font-size: 11px;
-    outline: none;
-  }
-  .aq-input-row input:focus { border-color: var(--accent-cyan); }
-  .aq-input-row label {
-    font-family: var(--font-mono);
-    font-size: 9px;
-    color: var(--text-muted);
-    text-transform: uppercase;
-    min-width: 50px;
-  }
-
-  /* ── Market Detail Modal ── */
-  .md-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 10px;
-    margin: 12px 0;
-  }
-  .md-stat {
-    padding: 10px;
-    background: rgba(0,0,0,0.2);
-    border-radius: 6px;
-  }
-  .md-stat .ms-label {
-    font-size: 10px;
-    color: var(--text-muted);
-    font-family: var(--font-mono);
-    text-transform: uppercase;
-  }
-  .md-stat .ms-val {
-    font-size: 16px;
-    font-weight: 700;
-    font-family: var(--font-mono);
-  }
-  .md-desc {
-    font-size: 13px;
-    color: var(--text-secondary);
-    line-height: 1.6;
-    padding: 12px;
-    background: rgba(0,0,0,0.15);
-    border-radius: 6px;
-    margin: 10px 0;
-  }
-  .md-link {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 8px 16px;
-    background: rgba(99,102,241,0.1);
-    border: 1px solid rgba(99,102,241,0.3);
-    border-radius: 6px;
-    color: var(--accent-blue);
-    text-decoration: none;
-    font-family: var(--font-mono);
-    font-size: 12px;
-    transition: all 0.15s;
-  }
-  .md-link:hover { background: rgba(99,102,241,0.2); border-color: var(--accent-blue); }
-
-  /* ── Clickable market rows ── */
-  tbody tr { cursor: pointer; }
+:root{--bg0:#0a0a0f;--bg1:#0f0f18;--bg2:#12121a;--bg3:#1a1a2e;--bd:#2a2a3e;--bd2:#3b3b55;--t1:#e4e4ef;--t2:#8888a0;--t3:#5a5a72;--blue:#6366f1;--cyan:#06b6d4;--green:#22c55e;--yellow:#eab308;--red:#ef4444;--purple:#8b5cf6;--mono:'SF Mono','Fira Code','JetBrains Mono',monospace;--sans:-apple-system,BlinkMacSystemFont,'Inter','Segoe UI',sans-serif}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg0);color:var(--t1);font-family:var(--sans);font-size:14px;line-height:1.5;overflow-x:hidden}
+::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-track{background:var(--bg0)}::-webkit-scrollbar-thumb{background:var(--bd);border-radius:3px}
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:0 24px;height:56px;background:linear-gradient(180deg,#111c30,var(--bg1));border-bottom:1px solid var(--bd);position:sticky;top:0;z-index:100}
+.topbar-left{display:flex;align-items:center;gap:16px}
+.logo{font-family:var(--mono);font-size:16px;font-weight:700;background:linear-gradient(135deg,var(--blue),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.logo-sub{font-size:11px;color:var(--t3);font-family:var(--mono);letter-spacing:1px;text-transform:uppercase}
+.topbar-right{display:flex;align-items:center;gap:12px}
+.mode-badge{padding:4px 12px;border-radius:4px;font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:.5px;text-transform:uppercase}
+.mode-obs{background:rgba(245,158,11,.15);color:var(--yellow);border:1px solid rgba(245,158,11,.3)}
+.mode-live{background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.3);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{border-color:rgba(239,68,68,.3)}50%{border-color:rgba(239,68,68,.7)}}
+.secret-badges{display:flex;gap:6px}
+.secret-badge{display:flex;align-items:center;gap:4px;padding:3px 8px;border-radius:3px;font-size:10px;font-family:var(--mono);background:var(--bg2);border:1px solid var(--bd)}
+.dot{width:6px;height:6px;border-radius:50%}.dot-g{background:var(--green);box-shadow:0 0 4px var(--green)}.dot-r{background:var(--red);box-shadow:0 0 4px var(--red)}
+.kill-btn{padding:4px 10px;border-radius:4px;font-family:var(--mono);font-size:10px;font-weight:700;cursor:pointer;border:1px solid rgba(239,68,68,.4);background:rgba(239,68,68,.1);color:var(--red);transition:all .15s}
+.kill-btn:hover{background:rgba(239,68,68,.3)}.kill-btn.active{background:var(--red);color:#fff}
+.tabs{display:flex;gap:0;padding:0 24px;background:var(--bg1);border-bottom:1px solid var(--bd);overflow-x:auto}
+.tab{padding:12px 16px;font-size:12px;font-weight:500;color:var(--t2);cursor:pointer;border-bottom:2px solid transparent;transition:all .2s;user-select:none;white-space:nowrap}
+.tab:hover{color:var(--t1);background:rgba(255,255,255,.02)}.tab.active{color:var(--cyan);border-bottom-color:var(--cyan)}
+.tab .cnt{display:inline-block;margin-left:5px;padding:1px 5px;border-radius:8px;font-size:9px;font-family:var(--mono);background:var(--bg2);color:var(--t3);min-width:16px;text-align:center}
+.tab.active .cnt{background:rgba(6,182,212,.15);color:var(--cyan)}
+.content{padding:20px 24px}.panel{display:none}.panel.active{display:block}
+.aq{padding:14px 24px;background:linear-gradient(180deg,rgba(99,102,241,.04),transparent);border-bottom:1px solid var(--bd)}
+.aq-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.aq-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:var(--blue);font-family:var(--mono)}
+.aq-progress{font-family:var(--mono);font-size:11px;color:var(--t3)}
+.aq-steps{display:flex;gap:8px;overflow-x:auto;padding-bottom:4px}
+.aq-step{flex:1;min-width:160px;padding:10px 12px;border:1px solid var(--bd);border-radius:8px;cursor:pointer;transition:all .2s}
+.aq-step:hover:not(.step-locked){border-color:var(--cyan)}
+.step-blocked{border-color:rgba(239,68,68,.4);background:rgba(239,68,68,.04)}
+.step-current{border-color:var(--blue);background:rgba(99,102,241,.06);box-shadow:0 0 20px rgba(99,102,241,.08)}
+.step-done{border-color:rgba(34,197,94,.3);background:rgba(34,197,94,.04);opacity:.65}
+.step-locked{opacity:.3;pointer-events:none}
+.aq-num{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;font-size:9px;font-weight:700;font-family:var(--mono);margin-bottom:4px}
+.step-blocked .aq-num{background:rgba(239,68,68,.2);color:var(--red)}.step-current .aq-num{background:rgba(99,102,241,.2);color:var(--blue)}.step-done .aq-num{background:rgba(34,197,94,.2);color:var(--green)}.step-locked .aq-num{background:rgba(90,90,114,.15);color:var(--t3)}
+.aq-step-title{font-size:11px;font-weight:600;color:var(--t1);margin-bottom:2px}.aq-step-desc{font-size:9px;color:var(--t3);line-height:1.5;font-family:var(--mono)}
+.aq-missing{margin-top:4px;font-family:var(--mono);font-size:9px;color:var(--red)}
+.aq-expanded{margin-top:6px;padding-top:6px;border-top:1px solid var(--bd)}
+.aq-row{display:flex;gap:6px;margin-top:4px;align-items:center}
+.aq-row input{flex:1;padding:4px 6px;background:var(--bg0);border:1px solid var(--bd);border-radius:4px;color:var(--t1);font-family:var(--mono);font-size:10px;outline:none}
+.aq-row input:focus{border-color:var(--cyan)}.aq-row label{font-family:var(--mono);font-size:8px;color:var(--t3);text-transform:uppercase;min-width:40px}
+.ss{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:16px}
+.sc{background:var(--bg2);border:1px solid var(--bd);border-radius:8px;padding:14px;position:relative;overflow:hidden}
+.sc::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
+.sc.blue::before{background:var(--blue)}.sc.green::before{background:var(--green)}.sc.yellow::before{background:var(--yellow)}.sc.purple::before{background:var(--purple)}.sc.cyan::before{background:var(--cyan)}.sc.red::before{background:var(--red)}
+.sc-l{font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.5px;font-family:var(--mono);margin-bottom:3px}
+.sc-v{font-size:22px;font-weight:700;font-family:var(--mono)}.sc-s{font-size:10px;color:var(--t2);margin-top:2px}
+.tw{background:var(--bg2);border:1px solid var(--bd);border-radius:8px;overflow:hidden}
+.th{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--bd)}
+.th-title{font-size:13px;font-weight:600}.th-actions{display:flex;gap:8px;align-items:center}
+.btn{padding:5px 12px;border-radius:4px;font-size:11px;font-family:var(--mono);border:1px solid var(--bd);background:var(--bg1);color:var(--t2);cursor:pointer;transition:all .15s}
+.btn:hover{border-color:var(--cyan);color:var(--cyan)}.btn:active{transform:scale(.97)}
+.btn-p{background:rgba(59,130,246,.15);border-color:rgba(59,130,246,.4);color:var(--blue)}.btn-p:hover{background:rgba(59,130,246,.25);border-color:var(--blue)}
+.btn-g{background:rgba(34,197,94,.15);border-color:rgba(34,197,94,.4);color:var(--green)}.btn-g:hover{background:rgba(34,197,94,.25)}
+.btn-r{background:rgba(239,68,68,.15);border-color:rgba(239,68,68,.4);color:var(--red)}.btn-r:hover{background:rgba(239,68,68,.25)}
+.btn-sm{font-size:10px;padding:3px 8px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+thead th{padding:8px 12px;text-align:left;font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--t3);background:rgba(0,0,0,.2);border-bottom:1px solid var(--bd);font-family:var(--mono);white-space:nowrap}
+tbody tr{border-bottom:1px solid rgba(42,53,85,.5);transition:background .1s;cursor:pointer}tbody tr:hover{background:var(--bg3)}tbody tr:last-child{border-bottom:none}
+td{padding:8px 12px;vertical-align:middle}
+.mn{max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.edge-h{color:var(--green);font-family:var(--mono);font-weight:600}.edge-m{color:var(--yellow);font-family:var(--mono);font-weight:600}.edge-l{color:var(--t3);font-family:var(--mono);font-weight:600}
+.mono{font-family:var(--mono);font-size:12px;color:var(--t2)}
+.nr-tag{display:inline-block;padding:1px 4px;border-radius:3px;font-size:8px;font-family:var(--mono);background:rgba(139,92,246,.15);color:var(--purple);border:1px solid rgba(139,92,246,.3);margin-left:4px;vertical-align:middle}
+.conf-bar{display:flex;align-items:center;gap:6px}
+.conf-track{width:50px;height:3px;background:var(--bg0);border-radius:2px;overflow:hidden}.conf-fill{height:100%;border-radius:2px}
+.conf-val{font-family:var(--mono);font-size:10px;color:var(--t3)}
+.pin-btn{background:none;border:1px solid var(--bd);color:var(--t3);padding:2px 6px;border-radius:3px;cursor:pointer;font-size:10px;font-family:var(--mono);transition:all .15s}
+.pin-btn:hover{border-color:var(--yellow);color:var(--yellow)}.pin-btn.pinned{border-color:var(--yellow);color:var(--yellow);background:rgba(245,158,11,.1)}
+.vb{padding:2px 8px;border-radius:4px;font-family:var(--mono);font-size:9px;font-weight:700;border:1px solid;cursor:pointer;background:none;transition:all .15s}
+.vb-buy{border-color:rgba(34,197,94,.3);color:var(--green)}.vb-buy:hover{background:rgba(34,197,94,.15)}.vb-buy.active{background:var(--green);color:#000}
+.vb-pass{border-color:rgba(239,68,68,.3);color:var(--red)}.vb-pass:hover{background:rgba(239,68,68,.15)}.vb-pass.active{background:var(--red);color:#fff}
+.search-bar{display:flex;gap:8px;margin-bottom:14px;align-items:center;flex-wrap:wrap}
+.search-bar input{flex:1;min-width:180px;padding:7px 12px;background:var(--bg2);border:1px solid var(--bd);border-radius:6px;color:var(--t1);font-family:var(--mono);font-size:11px;outline:none}
+.search-bar input:focus{border-color:var(--cyan)}
+.search-bar select{padding:7px 10px;background:var(--bg2);border:1px solid var(--bd);border-radius:6px;color:var(--t1);font-family:var(--mono);font-size:10px;outline:none;cursor:pointer}
+.rc{font-family:var(--mono);font-size:10px;color:var(--t3)}
+.fund-bar{display:flex;gap:14px;align-items:center;padding:8px 14px;background:var(--bg2);border:1px solid var(--bd);border-radius:6px;margin-bottom:10px;font-family:var(--mono);font-size:11px;flex-wrap:wrap}
+.fb-i{display:flex;gap:4px;align-items:center}.fb-l{color:var(--t3)}.fb-v{font-weight:700}
+.modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);z-index:500;display:flex;align-items:center;justify-content:center;animation:fi .15s}
+@keyframes fi{from{opacity:0}to{opacity:1}}
+.modal{background:var(--bg1);border:1px solid var(--bd);border-radius:12px;width:90%;max-width:700px;max-height:85vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.modal-h{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid var(--bd)}
+.modal-h h2{font-size:15px;font-weight:700}
+.modal-x{background:none;border:1px solid var(--bd);color:var(--t2);width:26px;height:26px;border-radius:6px;cursor:pointer;font-size:13px;display:flex;align-items:center;justify-content:center}
+.modal-x:hover{border-color:var(--red);color:var(--red)}
+.modal-b{padding:18px}
+.md-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0}
+.md-stat{padding:8px;background:rgba(0,0,0,.2);border-radius:6px}
+.md-stat .ms-l{font-size:9px;color:var(--t3);font-family:var(--mono);text-transform:uppercase}.md-stat .ms-v{font-size:14px;font-weight:700;font-family:var(--mono)}
+.empty{text-align:center;padding:50px 20px;color:var(--t3)}.empty p{font-size:13px;margin-bottom:4px}.empty .eh{font-size:11px;font-family:var(--mono)}
+.toast-c{position:fixed;bottom:20px;right:20px;z-index:1000;display:flex;flex-direction:column;gap:6px}
+.toast{padding:8px 14px;border-radius:6px;font-size:11px;font-family:var(--mono);background:var(--bg2);border:1px solid var(--bd);color:var(--t1);box-shadow:0 8px 24px rgba(0,0,0,.4);animation:si .2s;max-width:340px}
+.toast.success{border-color:var(--green)}.toast.error{border-color:var(--red)}.toast.info{border-color:var(--cyan)}
+@keyframes si{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
+.agent-card{background:var(--bg2);border:1px solid var(--bd);border-radius:8px;padding:16px;margin-bottom:10px;transition:border-color .15s}
+.agent-card:hover{border-color:var(--bd2)}
+.agent-card .ac-h{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.agent-card .ac-name{font-weight:600;font-size:14px}.agent-card .ac-type{font-family:var(--mono);font-size:10px;color:var(--t3);background:var(--bg0);padding:2px 6px;border-radius:3px}
+.status-pill{padding:2px 8px;border-radius:10px;font-size:9px;font-family:var(--mono);font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.st-running{background:rgba(16,185,129,.15);color:var(--green)}.st-paused{background:rgba(245,158,11,.15);color:var(--yellow)}.st-error{background:rgba(239,68,68,.15);color:var(--red)}.st-disabled{background:rgba(90,100,120,.15);color:var(--t3)}
+.agent-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:6px;margin:8px 0}
+.as-item{padding:6px 8px;background:rgba(0,0,0,.15);border-radius:4px;text-align:center}
+.as-item .as-l{font-size:8px;color:var(--t3);font-family:var(--mono);text-transform:uppercase}.as-item .as-v{font-size:14px;font-weight:700;font-family:var(--mono)}
+.approval-card{background:var(--bg2);border:1px solid var(--bd);border-radius:8px;padding:14px;margin-bottom:8px;border-left:3px solid var(--yellow)}
+.approval-card.approved{border-left-color:var(--green);opacity:.6}.approval-card.rejected{border-left-color:var(--red);opacity:.6}
+.ap-h{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px}
+.ap-title{font-weight:600;font-size:13px;flex:1}.ap-edge{font-family:var(--mono);font-size:12px;font-weight:700;color:var(--green)}
+.ap-meta{font-family:var(--mono);font-size:10px;color:var(--t3);margin-bottom:6px}
+.ap-rationale{font-size:12px;color:var(--t2);line-height:1.5;padding:8px;background:rgba(0,0,0,.15);border-radius:4px;margin-bottom:8px;font-family:var(--mono);font-size:11px}
+.ap-actions{display:flex;gap:6px}
+.commander{position:fixed;bottom:0;left:0;right:0;background:var(--bg1);border-top:1px solid var(--bd);padding:8px 24px;z-index:90;display:flex;gap:8px;align-items:center}
+.commander input{flex:1;padding:8px 12px;background:var(--bg0);border:1px solid var(--bd);border-radius:6px;color:var(--t1);font-family:var(--mono);font-size:12px;outline:none}
+.commander input:focus{border-color:var(--cyan)}
+.commander .cmd-label{font-family:var(--mono);font-size:10px;color:var(--blue);font-weight:700;letter-spacing:1px}
+.cmd-output{font-family:var(--mono);font-size:11px;color:var(--t2);max-width:600px;white-space:pre-wrap;overflow:hidden;text-overflow:ellipsis}
+.headline-box{width:100%;min-height:80px;padding:10px;background:var(--bg0);border:1px solid var(--bd);border-radius:6px;color:var(--t1);font-family:var(--mono);font-size:11px;outline:none;resize:vertical}
+.headline-box:focus{border-color:var(--cyan)}
+.whale-input{display:flex;gap:6px;margin-bottom:12px;align-items:center}
+.whale-input input{flex:1;padding:6px 10px;background:var(--bg0);border:1px solid var(--bd);border-radius:4px;color:var(--t1);font-family:var(--mono);font-size:11px;outline:none}
+.whale-input input:focus{border-color:var(--cyan)}
+.whale-event{display:flex;gap:10px;padding:8px;border-bottom:1px solid rgba(42,53,85,.3);font-size:11px;align-items:center}
+.whale-event:last-child{border-bottom:none}
+.we-alias{font-family:var(--mono);font-weight:700;color:var(--cyan);min-width:80px}
+.we-side{font-family:var(--mono);font-weight:700;font-size:10px;padding:1px 6px;border-radius:3px}
+.we-yes{background:rgba(34,197,94,.15);color:var(--green)}.we-no{background:rgba(239,68,68,.15);color:var(--red)}
+.diag-item{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;border-bottom:1px solid rgba(42,53,85,.3)}
+.diag-item:last-child{border-bottom:none}
+.diag-name{font-size:12px}.diag-status{font-family:var(--mono);font-size:10px;padding:2px 8px;border-radius:3px;font-weight:600}
+.ds-ok{background:rgba(34,197,94,.15);color:var(--green)}.ds-error{background:rgba(239,68,68,.15);color:var(--red)}.ds-missing{background:rgba(245,158,11,.15);color:var(--yellow)}.ds-configured{background:rgba(99,102,241,.15);color:var(--blue)}.ds-unknown{background:rgba(90,100,120,.15);color:var(--t3)}
+.settings-section{margin-bottom:20px}
+.settings-section h3{font-size:12px;font-weight:700;color:var(--cyan);margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px;font-family:var(--mono)}
+.settings-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:8px}
+.set-item{display:flex;flex-direction:column;gap:3px;padding:10px;background:var(--bg2);border:1px solid var(--bd);border-radius:8px}
+.set-item label{font-size:10px;font-family:var(--mono);color:var(--t3);text-transform:uppercase;letter-spacing:.5px}
+.set-item .set-d{font-size:9px;color:var(--t3);margin-bottom:3px}
+.set-item input,.set-item select{padding:6px 8px;background:var(--bg0);border:1px solid var(--bd);border-radius:4px;color:var(--t1);font-family:var(--mono);font-size:11px;outline:none}
+.set-item input:focus{border-color:var(--cyan)}
+.set-st{display:inline-flex;align-items:center;gap:3px;font-size:9px;font-family:var(--mono);padding:1px 5px;border-radius:3px}
+.set-st.ok{background:rgba(34,197,94,.1);color:var(--green)}.set-st.no{background:rgba(239,68,68,.1);color:var(--red)}
+.hub-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}@media(max-width:900px){.hub-grid{grid-template-columns:1fr}}
+.hub-card{background:var(--bg2);border:1px solid var(--bd);border-radius:10px;padding:18px}
+.hub-card.fw{grid-column:1/-1}
+.hub-card h3{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--blue);font-family:var(--mono);margin-bottom:10px}
+.hub-card p{font-size:12px;line-height:1.6;color:var(--t2);margin-bottom:6px}
+.act-feed{max-height:350px;overflow-y:auto}
+.act-entry{display:flex;gap:8px;padding:6px 0;border-bottom:1px solid rgba(42,53,85,.3);font-size:11px;align-items:flex-start}
+.act-entry:last-child{border-bottom:none}
+.act-time{font-family:var(--mono);font-size:9px;color:var(--t3);white-space:nowrap;min-width:55px}
+.act-type{font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:3px;font-weight:600;text-transform:uppercase;min-width:48px;text-align:center}
+.at-system{background:rgba(99,102,241,.15);color:var(--blue)}.at-scan{background:rgba(6,182,212,.15);color:var(--cyan)}.at-config{background:rgba(245,158,11,.15);color:var(--yellow)}.at-trade{background:rgba(34,197,94,.15);color:var(--green)}.at-decision{background:rgba(139,92,246,.15);color:var(--purple)}.at-error{background:rgba(239,68,68,.15);color:var(--red)}
+.act-msg{color:var(--t2);font-size:11px}
+@media(max-width:768px){.topbar{padding:0 10px;flex-wrap:wrap;height:auto;padding:8px 10px;gap:6px}.tabs{padding:0 10px}.tab{padding:8px 10px;font-size:11px}.content{padding:10px}.ss{grid-template-columns:repeat(2,1fr)}.mn{max-width:180px}td,thead th{padding:6px 8px}.commander{padding:6px 10px}}
+body{padding-bottom:50px}
 </style>
 </head>
 <body>
-
-  <!-- ── Top Bar ── -->
-  <div class="topbar">
-    <div class="topbar-left">
-      <div>
-        <div class="logo">ZVI v1</div>
-        <div class="logo-sub">Fund Operating System</div>
-      </div>
-    </div>
-    <div class="topbar-right">
-      <div class="secret-badges" id="secretBadges"></div>
-      <div class="mode-badge ${cfg.mode === 'OBSERVATION_ONLY' ? 'mode-observation' : 'mode-live'}" id="modeBadge">
-        ${cfg.mode === 'OBSERVATION_ONLY' ? 'Observation Only' : 'LIVE TRADING'}
-      </div>
-    </div>
+<div class="topbar">
+  <div class="topbar-left"><div><div class="logo">ZVI v1</div><div class="logo-sub">Fund Operating System</div></div></div>
+  <div class="topbar-right">
+    <div class="secret-badges" id="secBadges"></div>
+    <button class="kill-btn" id="killBtn" onclick="toggleKillSwitch()">KILL SWITCH</button>
+    <div class="mode-badge ${cfg.mode === 'OBSERVATION_ONLY' ? 'mode-obs' : 'mode-live'}" id="modeBadge">${cfg.mode === 'OBSERVATION_ONLY' ? 'OBSERVE' : 'LIVE'}</div>
   </div>
-
-  <!-- ── Founder Action Queue ── -->
-  <div class="action-queue" id="actionQueue">
-    <div class="aq-header">
-      <span class="aq-title">Founder Action Queue</span>
-      <span class="aq-progress" id="aqProgress">Loading...</span>
-    </div>
-    <div class="aq-steps" id="aqSteps">
-      <div style="color:var(--text-muted);font-family:var(--font-mono);font-size:11px;padding:8px;">Detecting blockers...</div>
-    </div>
+</div>
+<div class="aq" id="aq"><div class="aq-header"><span class="aq-title">Founder Action Queue</span><span class="aq-progress" id="aqProg">Loading...</span></div><div class="aq-steps" id="aqSteps"></div></div>
+<div class="tabs">
+  <div class="tab active" data-tab="opps">Markets <span class="cnt" id="cOpps">--</span></div>
+  <div class="tab" data-tab="agents">Agents <span class="cnt" id="cAgents">0</span></div>
+  <div class="tab" data-tab="approvals">Approvals <span class="cnt" id="cApprovals">0</span></div>
+  <div class="tab" data-tab="negrisk">NegRisk Arb</div>
+  <div class="tab" data-tab="llm">LLM Probability</div>
+  <div class="tab" data-tab="sentiment">Sentiment</div>
+  <div class="tab" data-tab="whales">Whale Watch</div>
+  <div class="tab" data-tab="hub">Explain Hub</div>
+  <div class="tab" data-tab="health">Health</div>
+  <div class="tab" data-tab="settings">Settings</div>
+</div>
+<div class="content">
+  <div class="panel active" id="panel-opps">
+    <div class="fund-bar" id="fundBar" style="display:none"></div>
+    <div class="ss" id="oppSum"></div>
+    <div class="search-bar"><input type="text" id="mSearch" placeholder="Search markets..." oninput="filterRender()"><select id="edgeF" onchange="filterRender()"><option value="0">All Edges</option><option value="0.5">> 0.5%</option><option value="1">> 1%</option><option value="2">> 2%</option></select><select id="sortM" onchange="filterRender()"><option value="edge">Sort: Edge</option><option value="volume">Sort: Volume</option><option value="confidence">Sort: Confidence</option></select><span class="rc" id="rCount"></span></div>
+    <div class="tw"><div class="th"><div class="th-title">Market Scanner</div><div class="th-actions"><span class="mono" id="rTimer" style="font-size:10px;color:var(--t3)">30s</span><button class="btn btn-p btn-sm" onclick="fetchOpps()">Refresh</button></div></div><div id="oppTable"><div class="empty"><p>Loading markets...</p></div></div></div>
   </div>
-
-  <!-- ── Tabs ── -->
-  <div class="tabs">
-    <div class="tab active" data-tab="opportunities">Opportunities <span class="count" id="countOpps">--</span></div>
-    <div class="tab" data-tab="signals">Signals <span class="count" id="countSignals">0</span></div>
-    <div class="tab" data-tab="pinned">Pinned Markets <span class="count" id="countPinned">0</span></div>
-    <div class="tab" data-tab="hub">Explain Hub</div>
-    <div class="tab" data-tab="settings">Settings</div>
-    <div class="tab" data-tab="health">Agent Health</div>
+  <div class="panel" id="panel-agents">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="font-size:15px">Strategy Agents</h3><button class="btn btn-p" onclick="showCreateAgent()">+ Create Agent</button></div>
+    <div id="agentList"></div>
   </div>
-
-  <!-- ── Content ── -->
-  <div class="content">
-
-    <!-- Opportunities Panel -->
-    <div class="panel active" id="panel-opportunities">
-      <div class="fund-bar" id="fundBar" style="display:none"></div>
-      <div class="summary-strip" id="oppSummary"></div>
-      <div class="search-bar">
-        <input type="text" id="marketSearch" placeholder="Search markets... (e.g. Bitcoin, Trump, Fed)" oninput="filterAndRender()">
-        <select id="edgeFilter" onchange="filterAndRender()">
-          <option value="0">All Edges</option>
-          <option value="0.5">Edge > 0.5%</option>
-          <option value="1">Edge > 1%</option>
-          <option value="2">Edge > 2%</option>
-          <option value="5">Edge > 5%</option>
-        </select>
-        <select id="sortMode" onchange="filterAndRender()">
-          <option value="edge">Sort: Edge</option>
-          <option value="volume">Sort: Volume</option>
-          <option value="confidence">Sort: Confidence</option>
-          <option value="liquidity">Sort: Liquidity</option>
-        </select>
-        <span class="result-count" id="resultCount"></span>
-      </div>
-      <div class="table-wrap">
-        <div class="table-header">
-          <div class="table-title">NegRisk Arbitrage Scanner</div>
-          <div class="table-actions">
-            <span class="refresh-indicator" id="refreshTimer">Refreshing in 30s</span>
-            <button class="btn btn-primary" onclick="fetchOpportunities()">Refresh Now</button>
-          </div>
-        </div>
-        <div id="oppTableBody">
-          <div class="loader">
-            <div class="spinner"></div>
-            <div class="loader-text">Scanning Polymarket...</div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Signals Panel -->
-    <div class="panel" id="panel-signals">
-      <h3 style="margin-bottom: 16px; font-size: 16px;">RPOL Threshold Alerts</h3>
-
-      <div class="signal-form">
-        <div class="form-group">
-          <label>Symbol</label>
-          <input class="form-input" id="sigSymbol" placeholder="RPOL" value="RPOL" style="width:100px">
-        </div>
-        <div class="form-group">
-          <label>Threshold Price</label>
-          <input class="form-input" id="sigPrice" type="number" step="0.01" placeholder="0.50" style="width:120px">
-        </div>
-        <div class="form-group">
-          <label>Direction</label>
-          <select class="form-input" id="sigDir">
-            <option value="above">Above</option>
-            <option value="below">Below</option>
-          </select>
-        </div>
-        <button class="btn btn-primary" onclick="addThreshold()">Add Threshold</button>
-      </div>
-
-      <div class="threshold-list" id="thresholdList"></div>
-
-      <div class="price-sim-form">
-        <div class="form-group">
-          <label>Simulate Price Update</label>
-          <input class="form-input" id="simSymbol" placeholder="RPOL" value="RPOL" style="width:100px">
-        </div>
-        <div class="form-group">
-          <label>Price</label>
-          <input class="form-input" id="simPrice" type="number" step="0.01" placeholder="0.55" style="width:120px">
-        </div>
-        <button class="btn btn-primary" onclick="simulatePrice()">Send Price Update</button>
-      </div>
-
-      <h3 style="margin: 24px 0 12px; font-size: 14px; color: var(--text-secondary);">Triggered Signals</h3>
-      <div id="signalsList">
-        <div class="empty-state">
-          <div class="empty-icon">~</div>
-          <p>No signals triggered yet</p>
-          <p class="empty-hint">Add thresholds and simulate price updates to generate signals</p>
-        </div>
-      </div>
-    </div>
-
-    <!-- Pinned Markets Panel -->
-    <div class="panel" id="panel-pinned">
-      <h3 style="margin-bottom: 16px; font-size: 16px;">Pinned Markets for LLM Analysis</h3>
-      <div class="pinned-grid" id="pinnedGrid">
-        <div class="empty-state" style="grid-column: 1 / -1;">
-          <div class="empty-icon">*</div>
-          <p>No markets pinned yet</p>
-          <p class="empty-hint">Pin markets from the Opportunities tab to track them here</p>
-        </div>
-      </div>
-    </div>
-
-    <!-- Explain Hub Panel -->
-    <div class="panel" id="panel-hub">
-      <div class="hub-grid" id="hubGrid"></div>
-    </div>
-
-    <!-- Settings Panel -->
-    <div class="panel" id="panel-settings">
-      <div id="settingsContent"></div>
-    </div>
-
-    <!-- Agent Health Panel -->
-    <div class="panel" id="panel-health">
-      <h3 style="margin-bottom: 16px; font-size: 16px;">Agent Health Monitor</h3>
-      <div class="health-grid" id="healthGrid"></div>
-    </div>
+  <div class="panel" id="panel-approvals">
+    <h3 style="font-size:15px;margin-bottom:14px">Approval Queue</h3>
+    <div id="approvalList"></div>
   </div>
-
-  <!-- Market Detail Modal -->
-  <div id="marketModal"></div>
-
-  <div class="toast-container" id="toastContainer"></div>
+  <div class="panel" id="panel-negrisk">
+    <h3 style="font-size:15px;margin-bottom:14px">NegRisk Arbitrage Scanner</h3>
+    <div id="negriskContent"><div class="empty"><p>Create a NegRisk Arb agent to start scanning</p><button class="btn btn-p" style="margin-top:10px" onclick="quickCreateAgent('negrisk_arb')">Create NegRisk Agent</button></div></div>
+  </div>
+  <div class="panel" id="panel-llm">
+    <h3 style="font-size:15px;margin-bottom:14px">LLM Probability Mispricing</h3>
+    <div id="llmContent"><div class="empty"><p>Create an LLM Probability agent to analyze markets</p><button class="btn btn-p" style="margin-top:10px" onclick="quickCreateAgent('llm_probability')">Create LLM Agent</button></div></div>
+  </div>
+  <div class="panel" id="panel-sentiment">
+    <h3 style="font-size:15px;margin-bottom:14px">Sentiment / Headlines Console</h3>
+    <p style="font-size:12px;color:var(--t2);margin-bottom:10px">Paste headlines below to analyze market impact. Uses xAI/Grok if key is set, otherwise falls back to Claude or keyword matching.</p>
+    <textarea class="headline-box" id="headlineBox" placeholder="Paste headlines here, one per line...&#10;Example: Trump announces new tariffs on Chinese goods&#10;Fed signals rate hold through Q3 2026"></textarea>
+    <div style="margin-top:8px;display:flex;gap:8px"><button class="btn btn-p" onclick="analyzeHeadlines()">Analyze Headlines</button><button class="btn" onclick="document.getElementById('headlineBox').value=''">Clear</button></div>
+    <div id="sentimentResults" style="margin-top:14px"></div>
+  </div>
+  <div class="panel" id="panel-whales">
+    <h3 style="font-size:15px;margin-bottom:14px">Whale Pocket-Watching</h3>
+    <div class="whale-input"><input type="text" id="whaleAddr" placeholder="Wallet address (0x...)"><input type="text" id="whaleAlias" placeholder="Alias (optional)" style="max-width:120px"><button class="btn btn-p btn-sm" onclick="addWhale()">Add Wallet</button></div>
+    <div id="whaleList" style="margin-bottom:14px"></div>
+    <h4 style="font-size:12px;color:var(--t2);margin-bottom:8px">Recent Whale Events</h4>
+    <div id="whaleEvents" class="tw" style="max-height:400px;overflow-y:auto"></div>
+  </div>
+  <div class="panel" id="panel-hub"><div class="hub-grid" id="hubGrid"></div></div>
+  <div class="panel" id="panel-health">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="font-size:15px">System Health & Diagnostics</h3><button class="btn btn-p btn-sm" onclick="runDiag()">Run Diagnostics</button></div>
+    <div id="diagGrid"></div>
+    <h4 style="font-size:12px;color:var(--t2);margin:14px 0 8px">Agent Health</h4>
+    <div id="healthGrid"></div>
+  </div>
+  <div class="panel" id="panel-settings"><div id="settingsContent"></div></div>
+</div>
+<div id="marketModal"></div>
+<div class="toast-c" id="toastC"></div>
+<div class="commander"><span class="cmd-label">CMD</span><input type="text" id="cmdInput" placeholder="Type command... (help for list)" onkeydown="if(event.key==='Enter')runCmd()"><span class="cmd-output" id="cmdOut"></span></div>
 
 <script>
-  // ── Server-embedded state (renders INSTANTLY, no API wait) ──
-  const __INITIAL__ = ${EMBEDDED_STATE};
-  let opportunities = __INITIAL__.opportunities || [];
-  let signals = [];
-  let thresholds = [];
-  let pinnedMarkets = new Set();
-  let refreshCountdown = 30;
-  let refreshInterval;
-  let countdownInterval;
+const __S = ${EMBEDDED};
+let opps = __S.opportunities || [];
+let agents = __S.agents || [];
+let approvals = __S.approvals || [];
+let signals = [], thresholds = [], pinnedMarkets = new Set();
+let refreshCountdown = 30, countdownInterval, founderDecisions = __S.blockers?.founder?.decisions || {}, tradingUnlocked = __S.blockers?.allClear || false, blockerData = __S.blockers || null, expandedStep = null, killSwitch = __S.killSwitch || false;
 
-  // ── Tab Navigation ──
-  document.querySelectorAll('.tab').forEach(tab => {
-    tab.addEventListener('click', () => {
-      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-      document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-      tab.classList.add('active');
-      document.getElementById('panel-' + tab.dataset.tab).classList.add('active');
-    });
+// Tab nav
+document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
+  t.classList.add('active');
+  document.getElementById('panel-' + t.dataset.tab)?.classList.add('active');
+  if (t.dataset.tab === 'hub') { fetchSysStatus(); fetchActLog(); }
+  if (t.dataset.tab === 'settings') renderSettings();
+  if (t.dataset.tab === 'agents') fetchAgents();
+  if (t.dataset.tab === 'approvals') fetchApprovals();
+  if (t.dataset.tab === 'negrisk' || t.dataset.tab === 'llm') fetchStratOpps(t.dataset.tab);
+  if (t.dataset.tab === 'whales') fetchWhaleData();
+  if (t.dataset.tab === 'health') { runDiag(); fetchAgentHealth(); }
+}));
+
+function toast(m, type='info') { const e=document.createElement('div');e.className='toast '+type;e.textContent=m;document.getElementById('toastC').appendChild(e);setTimeout(()=>e.remove(),4000); }
+function esc(s) { const d=document.createElement('div');d.textContent=s;return d.innerHTML; }
+function fmt(n) { return n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':n.toString(); }
+function api(u,o){return fetch(u,o).then(r=>r.json());}
+function post(u,b){return api(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});}
+
+// Config + badges
+async function loadCfg() {
+  try { const c = await api('/api/config');
+    const badges=[{k:'polymarketGamma',l:'Polymarket'},{k:'anthropicKey',l:'Anthropic'},{k:'polygonRpc',l:'Polygon'},{k:'xaiKey',l:'xAI'}];
+    document.getElementById('secBadges').innerHTML = badges.map(b=>'<div class="secret-badge"><span class="dot '+(c.secrets[b.k]?'dot-g':'dot-r')+'"></span>'+b.l+'</div>').join('');
+    if(c.killSwitch){killSwitch=true;document.getElementById('killBtn').classList.add('active');}
+  } catch(e){}
+}
+
+// Kill switch
+async function toggleKillSwitch(){
+  const newState = !killSwitch;
+  try { const r = await post('/api/kill-switch', {active:newState});
+    if(r.ok){killSwitch=newState;document.getElementById('killBtn').classList.toggle('active',newState);toast(newState?'KILL SWITCH ON':'Kill switch off',newState?'error':'success');}
+  } catch(e){toast('Failed','error');}
+}
+
+// Opportunities
+async function fetchOpps() {
+  try { const d = await api('/api/opportunities'); opps = d.opportunities||d; renderOpps(); refreshCountdown=30; toast('Refreshed ('+opps.length+')','success'); } catch(e){toast('Fetch failed','error');}
+}
+function renderOpps() {
+  const we = opps.filter(o=>o.edge>0.5); document.getElementById('cOpps').textContent = we.length;
+  const tv = opps.reduce((a,o)=>a+o.volume,0), ae = opps.length>0?opps.reduce((a,o)=>a+o.edge,0)/opps.length:0, me = opps.length>0?Math.max(...opps.map(o=>o.edge)):0, nr = opps.filter(o=>o.negRisk).length;
+  document.getElementById('oppSum').innerHTML = [{l:'Markets',v:opps.length,c:'blue',s:opps.some(o=>!o.demo)?'live':'demo'},{l:'Arb Opps',v:we.length,c:'green',s:'>0.5% edge'},{l:'Max Edge',v:me.toFixed(2)+'%',c:'cyan'},{l:'Avg Edge',v:ae.toFixed(2)+'%',c:'yellow'},{l:'Volume 24h',v:'$'+fmt(tv),c:'purple'},{l:'NegRisk',v:nr,c:'blue'}].map(s=>'<div class="sc '+s.c+'"><div class="sc-l">'+s.l+'</div><div class="sc-v">'+s.v+'</div>'+(s.s?'<div class="sc-s">'+s.s+'</div>':'')+'</div>').join('');
+  const fl = getFiltered(); document.getElementById('rCount').textContent = fl.length+' of '+opps.length;
+  if(!fl.length){document.getElementById('oppTable').innerHTML='<div class="empty"><p>No matches</p></div>';return;}
+  let h='<table><thead><tr><th>#</th><th>Market</th><th>Edge%</th><th>Yes/No</th><th>Vol</th><th>Liq</th><th>Conf</th><th>Action</th><th>Pin</th></tr></thead><tbody>';
+  fl.forEach((o,i)=>{
+    const ec=o.edge>=2?'edge-h':o.edge>=1?'edge-m':'edge-l', cc=o.confidence>=60?'var(--green)':o.confidence>=30?'var(--yellow)':'var(--t3)', ip=pinnedMarkets.has(o.id), dec=founderDecisions[o.id];
+    h+='<tr onclick="showDetail('+i+')"><td class="mono">'+(i+1)+'</td><td class="mn">'+esc(o.market)+(o.negRisk?'<span class="nr-tag">NR</span>':'')+(o.demo?'<span style="font-size:8px;color:var(--yellow);margin-left:3px;font-family:var(--mono)">[demo]</span>':'')+'</td><td class="'+ec+'">'+o.edge.toFixed(2)+'%</td><td class="mono">'+o.bestBid.toFixed(2)+'/'+o.bestAsk.toFixed(2)+'</td><td class="mono">$'+fmt(o.volume)+'</td><td class="mono">$'+fmt(o.liquidity)+'</td><td><div class="conf-bar"><div class="conf-track"><div class="conf-fill" style="width:'+o.confidence+'%;background:'+cc+'"></div></div><span class="conf-val">'+o.confidence.toFixed(0)+'</span></div></td>';
+    h+='<td onclick="event.stopPropagation()">';
+    if(dec){h+='<span style="font-family:var(--mono);font-size:10px;font-weight:700;color:'+(dec.verdict==='BUY'?'var(--green)':'var(--t3)')+'">'+dec.verdict+'</span>';}
+    else if(tradingUnlocked){h+='<button class="vb vb-buy" onclick="decide(\\''+o.id+'\\',\\'BUY\\',\\''+esc(o.market).replace(/'/g,"\\\\'")+'\\')">BUY</button> <button class="vb vb-pass" onclick="decide(\\''+o.id+'\\',\\'PASS\\',\\''+esc(o.market).replace(/'/g,"\\\\'")+'\\')">PASS</button>';}
+    else{h+='<span style="opacity:.3;font-family:var(--mono);font-size:9px">locked</span>';}
+    h+='</td><td onclick="event.stopPropagation()"><button class="pin-btn'+(ip?' pinned':'')+'" onclick="togglePin(\\''+o.id+'\\')">Pin</button></td></tr>';
   });
+  h+='</tbody></table>';document.getElementById('oppTable').innerHTML=h;
+}
+function filterRender(){renderOpps();}
+function getFiltered(){
+  let f=[...opps];const q=(document.getElementById('mSearch')?.value||'').toLowerCase(),me=parseFloat(document.getElementById('edgeF')?.value||'0'),sb=document.getElementById('sortM')?.value||'edge';
+  if(q)f=f.filter(o=>o.market.toLowerCase().includes(q));if(me>0)f=f.filter(o=>o.edge>=me);
+  if(sb==='volume')f.sort((a,b)=>b.volume-a.volume);else if(sb==='confidence')f.sort((a,b)=>b.confidence-a.confidence);else f.sort((a,b)=>b.edge-a.edge);return f;
+}
+function togglePin(id){if(pinnedMarkets.has(id)){pinnedMarkets.delete(id);toast('Unpinned','info');}else{pinnedMarkets.add(id);toast('Pinned','success');}renderOpps();}
+function showDetail(i){
+  const f=getFiltered(),o=f[i];if(!o)return;const ec=o.edge>=2?'edge-h':o.edge>=1?'edge-m':'edge-l';
+  document.getElementById('marketModal').innerHTML='<div class="modal-overlay" onclick="closeModal(event)"><div class="modal" onclick="event.stopPropagation()"><div class="modal-h"><h2>'+esc(o.market)+'</h2><button class="modal-x" onclick="closeModal()">X</button></div><div class="modal-b">'+(o.demo?'<div style="padding:6px 10px;background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.3);border-radius:6px;margin-bottom:10px;font-size:10px;color:var(--yellow);font-family:var(--mono)">DEMO DATA</div>':'')+(o.description?'<p style="font-size:12px;color:var(--t2);line-height:1.6;padding:10px;background:rgba(0,0,0,.15);border-radius:6px;margin-bottom:10px">'+esc(o.description)+'</p>':'')+'<div class="md-grid"><div class="md-stat"><div class="ms-l">Edge</div><div class="ms-v '+ec+'">'+o.edge.toFixed(2)+'%</div></div><div class="md-stat"><div class="ms-l">Confidence</div><div class="ms-v">'+o.confidence.toFixed(0)+'%</div></div><div class="md-stat"><div class="ms-l">Yes</div><div class="ms-v">'+o.bestBid.toFixed(4)+'</div></div><div class="md-stat"><div class="ms-l">No</div><div class="ms-v">'+o.bestAsk.toFixed(4)+'</div></div><div class="md-stat"><div class="ms-l">Volume</div><div class="ms-v">$'+fmt(o.volume)+'</div></div><div class="md-stat"><div class="ms-l">Liquidity</div><div class="ms-v">$'+fmt(o.liquidity)+'</div></div></div></div></div></div>';
+}
+function closeModal(e){if(e&&e.target!==e.currentTarget)return;document.getElementById('marketModal').innerHTML='';}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal();});
 
-  // ── Toast ──
-  function toast(msg, type = 'info') {
-    const el = document.createElement('div');
-    el.className = 'toast ' + type;
-    el.textContent = msg;
-    document.getElementById('toastContainer').appendChild(el);
-    setTimeout(() => el.remove(), 4000);
-  }
+// Decisions
+async function decide(id,v,m){try{const d=await post('/api/founder/decide',{marketId:id,verdict:v,market:m});if(d.ok){founderDecisions[id]={verdict:v};toast(v==='BUY'?'BUY — $'+(d.position?.size||'?'):'PASS',v==='BUY'?'success':'info');fetchBlockers();}}catch(e){toast('Failed','error');}}
 
-  // ── Number formatting ──
-  function fmt(n) {
-    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
-    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
-    return n.toString();
-  }
-
-  // ── Fetch config for secret badges ──
-  async function loadConfig() {
-    try {
-      const r = await fetch('/api/config');
-      const cfg = await r.json();
-
-      const badges = [
-        { key: 'polygonRpc', label: 'Polygon RPC' },
-        { key: 'anthropicKey', label: 'Anthropic' },
-        { key: 'polymarketGamma', label: 'Polymarket' },
-      ];
-
-      document.getElementById('secretBadges').innerHTML = badges.map(b => {
-        const ok = cfg.secrets[b.key];
-        return '<div class="secret-badge"><span class="dot ' + (ok ? 'dot-green' : 'dot-red') + '"></span>' + b.label + '</div>';
-      }).join('');
-    } catch (e) {
-      console.error('Config load error:', e);
+// Blockers
+async function fetchBlockers(){try{const d=await api('/api/blockers');blockerData=d;founderDecisions=d.founder?.decisions||{};tradingUnlocked=d.allClear;renderAQ();renderFundBar();if(opps.length)renderOpps();}catch(e){}}
+var expandedStep=null;
+function renderAQ(){
+  if(!blockerData)return;const{blockers:bs,currentStep:cs,allClear}=blockerData;
+  document.getElementById('aqProg').textContent=allClear?'ALL CLEAR':'Step '+cs+'/'+bs.length;
+  if(allClear){document.getElementById('aqSteps').innerHTML='<div style="display:flex;align-items:center;gap:8px;padding:8px 14px;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.25);border-radius:8px;font-family:var(--mono);font-size:11px;color:var(--green);font-weight:600">ALL SYSTEMS GO — Ready for trading decisions</div>';return;}
+  document.getElementById('aqSteps').innerHTML=bs.map((b,i)=>{
+    let sc='step-locked';if(b.status==='done')sc='step-done';else if(b.status==='blocked')sc=i===cs-1?'step-blocked step-current':'step-blocked';else if(b.status==='action-needed')sc=i===cs-1?'step-current':'';else if(b.status==='ready')sc='step-current';
+    let act='';const exp=expandedStep===b.id;
+    if(b.status!=='done'&&b.status!=='locked'){
+      if(b.id==='api-keys'){if(exp)act='<div class="aq-expanded"><div class="aq-row"><label>Key</label><input type="password" id="aq_k" placeholder="API Key"></div><div class="aq-row"><label>Secret</label><input type="password" id="aq_s" placeholder="Secret"></div><div class="aq-row"><label>Pass</label><input type="password" id="aq_p" placeholder="Passphrase"></div><div style="margin-top:6px"><button class="btn btn-p btn-sm" onclick="event.stopPropagation();saveAqKeys()">Save</button></div></div>';else if(b.missing?.length)act='<div class="aq-missing">Missing: '+b.missing.join(', ')+'</div>';}
+      else if(b.id==='wallet'){if(exp)act='<div class="aq-expanded"><div class="aq-row"><label>Key</label><input type="password" id="aq_w" placeholder="Private key"></div><div style="margin-top:6px"><button class="btn btn-p btn-sm" onclick="event.stopPropagation();saveAqWallet()">Save</button></div></div>';else if(b.missing?.length)act='<div class="aq-missing">Missing: '+b.missing.join(', ')+'</div>';}
+      else if(b.id==='capital'){act='<div class="aq-row" style="margin-top:4px"><label>$</label><input type="number" id="aqCap" value="'+(blockerData.founder?.fundSize||6000)+'" min="100" onclick="event.stopPropagation()"><button class="btn btn-p btn-sm" onclick="event.stopPropagation();setCap()">Confirm</button></div>';}
+      else if(b.id==='risks'){act='<div style="margin-top:4px"><button class="btn btn-p btn-sm" onclick="event.stopPropagation();approveRisks()">Approve Limits</button></div>';}
     }
-  }
-
-  // ── Fetch opportunities ──
-  async function fetchOpportunities() {
-    try {
-      const r = await fetch('/api/opportunities');
-      const data = await r.json();
-      opportunities = data.opportunities || data;
-      renderOpportunities();
-      refreshCountdown = 30;
-      toast('Markets refreshed (' + opportunities.length + ' scanned)', 'success');
-    } catch (e) {
-      console.error('Fetch error:', e);
-      toast('Failed to fetch opportunities', 'error');
-    }
-  }
-
-  // ── Render opportunities ──
-  function renderOpportunities() {
-    const ct = document.getElementById('countOpps');
-    const withEdge = opportunities.filter(o => o.edge > 0.5);
-    ct.textContent = withEdge.length;
-
-    // Summary — always from full dataset
-    const totalVol = opportunities.reduce((a, o) => a + o.volume, 0);
-    const avgEdge = opportunities.length > 0
-      ? opportunities.reduce((a, o) => a + o.edge, 0) / opportunities.length
-      : 0;
-    const maxEdge = opportunities.length > 0 ? Math.max(...opportunities.map(o => o.edge)) : 0;
-    const negRiskCount = opportunities.filter(o => o.negRisk).length;
-    const liveCount = opportunities.filter(o => !o.demo).length;
-    const demoCount = opportunities.filter(o => o.demo).length;
-
-    document.getElementById('oppSummary').innerHTML = [
-      { label: 'Markets Scanned', value: opportunities.length, cls: 'blue', sub: liveCount > 0 ? liveCount + ' live' : demoCount + ' demo' },
-      { label: 'Arb Opportunities', value: withEdge.length, cls: 'green', sub: '> 0.5% edge' },
-      { label: 'Max Edge', value: maxEdge.toFixed(2) + '%', cls: 'cyan' },
-      { label: 'Avg Edge', value: avgEdge.toFixed(2) + '%', cls: 'yellow' },
-      { label: 'Total Volume 24h', value: '$' + fmt(totalVol), cls: 'purple' },
-      { label: 'NegRisk Markets', value: negRiskCount, cls: 'blue' },
-    ].map(s =>
-      '<div class="summary-card ' + s.cls + '">' +
-        '<div class="summary-label">' + s.label + '</div>' +
-        '<div class="summary-value">' + s.value + '</div>' +
-        (s.sub ? '<div class="summary-sub">' + s.sub + '</div>' : '') +
-      '</div>'
-    ).join('');
-
-    // Apply search/filter
-    const filtered = getFilteredOpportunities();
-    const rcEl = document.getElementById('resultCount');
-    if (rcEl) rcEl.textContent = filtered.length + ' of ' + opportunities.length + ' markets';
-
-    if (filtered.length === 0) {
-      document.getElementById('oppTableBody').innerHTML =
-        '<div class="empty-state"><div class="empty-icon">~</div><p>No opportunities match your filters</p></div>';
-      return;
-    }
-
-    let html = '<table><thead><tr>' +
-      '<th>#</th>' +
-      '<th>Market</th>' +
-      '<th>Edge %</th>' +
-      '<th>Yes / No</th>' +
-      '<th>Volume 24h</th>' +
-      '<th>Liquidity</th>' +
-      '<th>Confidence</th>' +
-      '<th>Verdict</th>' +
-      '<th>Pin</th>' +
-      '</tr></thead><tbody>';
-
-    filtered.forEach((o, i) => {
-      const edgeClass = o.edge >= 2 ? 'edge-high' : o.edge >= 1 ? 'edge-mid' : 'edge-low';
-      const confColor = o.confidence >= 60 ? 'var(--accent-green)'
-        : o.confidence >= 30 ? 'var(--accent-yellow)' : 'var(--text-muted)';
-      const isPinned = pinnedMarkets.has(o.id);
-      const expiryTag = o.daysToExpiry !== null && o.daysToExpiry !== undefined
-        ? ' <span style="font-size:9px;color:var(--text-muted);font-family:var(--font-mono)">' + o.daysToExpiry + 'd</span>' : '';
-
-      html += '<tr onclick="showMarketDetail(' + i + ')" title="Click for details">' +
-        '<td class="price-cell">' + (i + 1) + '</td>' +
-        '<td class="market-name">' + esc(o.market) +
-          (o.negRisk ? '<span class="negrisk-tag">NegRisk</span>' : '') +
-          expiryTag +
-          (o.demo ? '<span style="font-size:9px;color:var(--accent-yellow);margin-left:4px;font-family:var(--font-mono)">[demo]</span>' : '') +
-        '</td>' +
-        '<td class="edge-cell ' + edgeClass + '">' + o.edge.toFixed(2) + '%</td>' +
-        '<td class="price-cell">' + o.bestBid.toFixed(2) + ' / ' + o.bestAsk.toFixed(2) + '</td>' +
-        '<td class="volume-cell">$' + fmt(o.volume) + '</td>' +
-        '<td class="volume-cell">$' + fmt(o.liquidity) + '</td>' +
-        '<td><div class="confidence-bar">' +
-          '<div class="confidence-track"><div class="confidence-fill" style="width:' + o.confidence + '%;background:' + confColor + '"></div></div>' +
-          '<span class="confidence-val">' + o.confidence.toFixed(0) + '</span>' +
-        '</div></td>' +
-        '<td onclick="event.stopPropagation()">' + renderVerdictCell(o) + '</td>' +
-        '<td onclick="event.stopPropagation()"><button class="pin-btn' + (isPinned ? ' pinned' : '') + '" onclick="togglePin(\\'' + o.id + '\\')">' + (isPinned ? 'Unpin' : 'Pin') + '</button></td>' +
-        '</tr>';
-    });
-
-    html += '</tbody></table>';
-    document.getElementById('oppTableBody').innerHTML = html;
-  }
-
-  function esc(s) {
-    const d = document.createElement('div');
-    d.textContent = s;
-    return d.innerHTML;
-  }
-
-  // ── Pin / Unpin ──
-  function togglePin(id) {
-    if (pinnedMarkets.has(id)) {
-      pinnedMarkets.delete(id);
-      toast('Market unpinned', 'info');
-    } else {
-      pinnedMarkets.add(id);
-      toast('Market pinned for LLM analysis', 'success');
-    }
-    renderOpportunities();
-    renderPinned();
-  }
-
-  function renderPinned() {
-    const pinned = opportunities.filter(o => pinnedMarkets.has(o.id));
-    document.getElementById('countPinned').textContent = pinned.length;
-
-    if (pinned.length === 0) {
-      document.getElementById('pinnedGrid').innerHTML =
-        '<div class="empty-state" style="grid-column:1/-1"><div class="empty-icon">*</div><p>No markets pinned yet</p><p class="empty-hint">Pin markets from the Opportunities tab to track them here</p></div>';
-      return;
-    }
-
-    document.getElementById('pinnedGrid').innerHTML = pinned.map(o => {
-      const edgeClass = o.edge >= 2 ? 'edge-high' : o.edge >= 1 ? 'edge-mid' : 'edge-low';
-      return '<div class="pinned-card">' +
-        '<div class="pc-title"><a href="' + esc(o.link) + '" target="_blank">' + esc(o.market) + '</a>' +
-          (o.negRisk ? ' <span class="negrisk-tag">NegRisk</span>' : '') +
-        '</div>' +
-        '<div class="pc-meta">' +
-          '<span class="' + edgeClass + '">Edge: ' + o.edge.toFixed(2) + '%</span>' +
-          '<span>Vol: $' + fmt(o.volume) + '</span>' +
-          '<span>Liq: $' + fmt(o.liquidity) + '</span>' +
-          '<span>Conf: ' + o.confidence.toFixed(0) + '</span>' +
-        '</div>' +
-        '<div class="pc-actions">' +
-          '<a class="btn" href="' + esc(o.link) + '" target="_blank">View on Polymarket</a>' +
-          '<button class="btn pc-unpin" onclick="togglePin(\\'' + o.id + '\\')">Unpin</button>' +
-        '</div>' +
-      '</div>';
-    }).join('');
-  }
-
-  // ── Threshold Management ──
-  async function addThreshold() {
-    const symbol = document.getElementById('sigSymbol').value.trim();
-    const price = parseFloat(document.getElementById('sigPrice').value);
-    const dir = document.getElementById('sigDir').value;
-
-    if (!symbol || isNaN(price)) {
-      toast('Please fill in symbol and price', 'error');
-      return;
-    }
-
-    try {
-      const r = await fetch('/api/signals/thresholds', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbol, thresholdPrice: price, direction: dir }),
-      });
-      const data = await r.json();
-      thresholds = data.thresholds || [];
-      renderThresholds();
-      document.getElementById('sigPrice').value = '';
-      toast('Threshold added: ' + symbol + ' ' + dir + ' ' + price, 'success');
-    } catch (e) {
-      toast('Failed to add threshold', 'error');
-    }
-  }
-
-  function renderThresholds() {
-    if (thresholds.length === 0) {
-      document.getElementById('thresholdList').innerHTML =
-        '<div style="color:var(--text-muted);font-size:12px;font-family:var(--font-mono);padding:8px 0;">No active thresholds</div>';
-      return;
-    }
-
-    document.getElementById('thresholdList').innerHTML = thresholds.map((t, i) =>
-      '<div class="threshold-item">' +
-        '<span class="th-symbol">' + esc(t.symbol) + '</span>' +
-        '<span class="th-dir">' + t.direction + '</span>' +
-        '<span class="th-price">$' + t.thresholdPrice.toFixed(2) + '</span>' +
-        '<span class="th-remove" onclick="removeThreshold(' + i + ')">x</span>' +
-      '</div>'
-    ).join('');
-  }
-
-  function removeThreshold(idx) {
-    thresholds.splice(idx, 1);
-    renderThresholds();
-    toast('Threshold removed', 'info');
-  }
-
-  // ── Price Simulation ──
-  async function simulatePrice() {
-    const symbol = document.getElementById('simSymbol').value.trim();
-    const price = parseFloat(document.getElementById('simPrice').value);
-    if (!symbol || isNaN(price)) {
-      toast('Enter symbol and price', 'error');
-      return;
-    }
-
-    try {
-      const r = await fetch('/api/price-update', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbol, price }),
-      });
-      const data = await r.json();
-      if (data.triggered && data.triggered.length > 0) {
-        signals = [...data.triggered, ...signals];
-        renderSignals();
-        toast(data.triggered.length + ' signal(s) triggered!', 'success');
-      } else {
-        toast('Price update received, no thresholds crossed', 'info');
-      }
-    } catch (e) {
-      toast('Price simulation failed', 'error');
-    }
-  }
-
-  function renderSignals() {
-    document.getElementById('countSignals').textContent = signals.length;
-
-    if (signals.length === 0) {
-      document.getElementById('signalsList').innerHTML =
-        '<div class="empty-state"><div class="empty-icon">~</div><p>No signals triggered yet</p><p class="empty-hint">Add thresholds and simulate price updates to generate signals</p></div>';
-      return;
-    }
-
-    document.getElementById('signalsList').innerHTML = signals.map(s =>
-      '<div class="signal-card">' +
-        '<div class="signal-header">' +
-          '<span class="signal-symbol">' + esc(s.symbol) + ' @ ' + s.price.toFixed(4) + '</span>' +
-          '<span class="signal-time">' + new Date(s.triggeredAt).toLocaleTimeString() + '</span>' +
-        '</div>' +
-        '<div class="signal-brief">' + esc(s.brief) + '</div>' +
-      '</div>'
-    ).join('');
-  }
-
-  // ── Signals fetch ──
-  async function fetchSignals() {
-    try {
-      const r = await fetch('/api/signals');
-      const data = await r.json();
-      signals = data.signals || [];
-      thresholds = data.thresholds || [];
-      renderSignals();
-      renderThresholds();
-    } catch (e) { /* silent */ }
-  }
-
-  // ── Health ──
-  async function fetchHealth() {
-    try {
-      const r = await fetch('/api/health');
-      const data = await r.json();
-
-      const agents = data.agents || {};
-      document.getElementById('healthGrid').innerHTML = Object.entries(agents).map(([name, info]) => {
-        const ago = Math.round((Date.now() - info.lastSeen) / 1000);
-        const statusCls = 'status-' + (info.status || 'idle');
-        return '<div class="health-card">' +
-          '<div class="hc-header">' +
-            '<span class="hc-name">' + esc(name) + '</span>' +
-            '<span class="status-pill ' + statusCls + '">' + (info.status || 'unknown') + '</span>' +
-          '</div>' +
-          '<div class="hc-row"><span class="hc-label">Last Heartbeat</span><span class="hc-val">' + ago + 's ago</span></div>' +
-          '<div class="hc-row"><span class="hc-label">Check Interval</span><span class="hc-val">' + (info.interval / 1000) + 's</span></div>' +
-          '<div class="hc-row"><span class="hc-label">Uptime Status</span><span class="hc-val">' + (ago < (info.interval / 1000) * 2 ? 'Healthy' : 'Stale') + '</span></div>' +
-        '</div>';
-      }).join('');
-    } catch (e) {
-      document.getElementById('healthGrid').innerHTML = '<div class="empty-state"><p>Failed to load health data</p></div>';
-    }
-  }
-
-  // ── Refresh countdown ──
-  function startCountdown() {
-    if (countdownInterval) clearInterval(countdownInterval);
-    refreshCountdown = 30;
-    countdownInterval = setInterval(() => {
-      refreshCountdown--;
-      const el = document.getElementById('refreshTimer');
-      if (el) el.textContent = 'Refreshing in ' + refreshCountdown + 's';
-      if (refreshCountdown <= 0) {
-        refreshCountdown = 30;
-        fetchOpportunities();
-      }
-    }, 1000);
-  }
-
-  // ── Blocker / Action Queue State (pre-loaded from server) ──
-  let blockerData = __INITIAL__.blockers || null;
-  let founderDecisions = blockerData?.founder?.decisions || {};
-  let tradingUnlocked = blockerData?.allClear || false;
-
-  async function fetchBlockers() {
-    try {
-      const r = await fetch('/api/blockers');
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      blockerData = await r.json();
-      founderDecisions = blockerData.founder?.decisions || {};
-      tradingUnlocked = blockerData.allClear;
-      renderActionQueue();
-      renderFundBar();
-      // Re-render opportunities to update verdict buttons
-      if (opportunities.length > 0) renderOpportunities();
-    } catch (e) {
-      console.error('Blocker fetch error:', e);
-      document.getElementById('aqProgress').textContent = 'Error loading';
-      document.getElementById('aqSteps').innerHTML =
-        '<div style="color:var(--accent-red);font-family:var(--font-mono);font-size:11px;padding:8px;">' +
-        'Failed to load blockers: ' + esc(e.message) + ' — check terminal</div>';
-    }
-  }
-
-  var expandedStep = null;
-
-  function renderActionQueue() {
-    if (!blockerData) return;
-    const { blockers, currentStep, totalSteps, allClear } = blockerData;
-
-    document.getElementById('aqProgress').textContent =
-      allClear ? 'ALL CLEAR' : 'Step ' + currentStep + ' of ' + totalSteps;
-
-    if (allClear) {
-      document.getElementById('aqSteps').innerHTML =
-        '<div class="aq-all-clear">' +
-          '<span style="font-size:16px">></span> ALL SYSTEMS GO — Ready to trade. ' +
-          'Scroll down to make BUY / PASS decisions.' +
-        '</div>';
-      return;
-    }
-
-    document.getElementById('aqSteps').innerHTML = blockers.map((b, i) => {
-      let stepClass = 'step-locked';
-      if (b.status === 'done') stepClass = 'step-done';
-      else if (b.status === 'blocked') stepClass = i === currentStep - 1 ? 'step-blocked step-current' : 'step-blocked';
-      else if (b.status === 'action-needed') stepClass = i === currentStep - 1 ? 'step-current' : '';
-      else if (b.status === 'ready') stepClass = 'step-current';
-
-      let statusIcon = '';
-      if (b.status === 'done') statusIcon = '[OK]';
-      else if (b.status === 'blocked') statusIcon = '[!!]';
-      else if (b.status === 'action-needed') statusIcon = '[>>]';
-      else if (b.status === 'locked') statusIcon = '[--]';
-      else if (b.status === 'ready') statusIcon = '[GO]';
-
-      // ── Interactive action forms for each blocker ──
-      var actionHtml = '';
-      var isExpanded = expandedStep === b.id;
-
-      if (b.status !== 'done' && b.status !== 'locked') {
-        if (b.id === 'api-keys') {
-          // API key blocker: show input fields inline
-          if (isExpanded) {
-            actionHtml = '<div class="aq-step-expanded">' +
-              '<div class="aq-input-row"><label>API Key</label><input type="password" id="aq_api_key" placeholder="Polymarket API Key"></div>' +
-              '<div class="aq-input-row"><label>Secret</label><input type="password" id="aq_api_secret" placeholder="API Secret"></div>' +
-              '<div class="aq-input-row"><label>Pass</label><input type="password" id="aq_api_pass" placeholder="Passphrase"></div>' +
-              '<div style="margin-top:8px;display:flex;gap:6px">' +
-                '<button class="btn btn-primary" style="font-size:10px" onclick="event.stopPropagation();saveAqApiKeys()">Save Keys</button>' +
-                '<button class="btn" style="font-size:10px" onclick="event.stopPropagation();switchToTab(\\'settings\\')">Full Settings</button>' +
-              '</div>' +
-            '</div>';
-          } else if (b.missing && b.missing.length > 0) {
-            actionHtml = '<div class="aq-missing">Missing: ' + b.missing.join(', ') + '</div>' +
-              '<div style="margin-top:4px;font-size:9px;color:var(--accent-cyan);font-family:var(--font-mono)">Click to configure</div>';
-          }
-        } else if (b.id === 'wallet') {
-          if (isExpanded) {
-            actionHtml = '<div class="aq-step-expanded">' +
-              '<div class="aq-input-row"><label>Key</label><input type="password" id="aq_wallet_key" placeholder="Polygon wallet private key"></div>' +
-              '<div style="margin-top:8px">' +
-                '<button class="btn btn-primary" style="font-size:10px" onclick="event.stopPropagation();saveAqWalletKey()">Save Wallet Key</button>' +
-              '</div>' +
-            '</div>';
-          } else if (b.missing && b.missing.length > 0) {
-            actionHtml = '<div class="aq-missing">Missing: ' + b.missing.join(', ') + '</div>' +
-              '<div style="margin-top:4px;font-size:9px;color:var(--accent-cyan);font-family:var(--font-mono)">Click to configure</div>';
-          }
-        } else if (b.id === 'capital') {
-          actionHtml =
-            '<div class="aq-capital-input">' +
-              '<span style="color:var(--text-muted);font-size:10px">$</span>' +
-              '<input type="number" id="aqCapitalInput" value="' + (blockerData.founder?.fundSize || 6000) + '" min="100" step="500" onclick="event.stopPropagation()">' +
-              '<button class="btn btn-primary" style="font-size:10px;padding:3px 8px" onclick="event.stopPropagation();setCapital()">Confirm</button>' +
-            '</div>';
-        } else if (b.id === 'risks') {
-          if (isExpanded) {
-            var limits = b.limits || {};
-            actionHtml = '<div class="aq-step-expanded">' +
-              '<div class="aq-input-row"><label>Max/Mkt</label><input type="number" id="aq_risk_max" value="' + (limits.maxExposurePerMarket || 500) + '" onclick="event.stopPropagation()"></div>' +
-              '<div class="aq-input-row"><label>Daily</label><input type="number" id="aq_risk_daily" value="' + (limits.dailyMaxExposure || 2000) + '" onclick="event.stopPropagation()"></div>' +
-              '<div class="aq-input-row"><label>Min Edge</label><input type="number" step="0.001" id="aq_risk_edge" value="' + (limits.minEdgeThreshold || 0.02) + '" onclick="event.stopPropagation()"></div>' +
-              '<div style="margin-top:8px;display:flex;gap:6px">' +
-                '<button class="btn btn-primary" style="font-size:10px" onclick="event.stopPropagation();saveAqRiskAndApprove()">Save & Approve</button>' +
-                '<button class="btn" style="font-size:10px" onclick="event.stopPropagation();approveRisks()">Approve Current</button>' +
-              '</div>' +
-            '</div>';
-          } else {
-            actionHtml =
-              '<div class="aq-step-action">' +
-                '<div style="font-size:9px;color:var(--accent-cyan);font-family:var(--font-mono);margin-bottom:4px">Click to edit limits</div>' +
-                '<button class="btn btn-primary" onclick="event.stopPropagation();approveRisks()">Approve Current Limits</button>' +
-              '</div>';
-          }
-        } else if (b.id === 'trade' && b.status === 'ready') {
-          actionHtml = '<div class="aq-step-action">' +
-            '<button class="btn btn-primary" onclick="event.stopPropagation();switchToTab(\\'opportunities\\')">Go to Opportunities</button>' +
-          '</div>';
-        }
-      }
-
-      var clickHandler = b.status !== 'done' && b.status !== 'locked'
-        ? ' onclick="toggleStepExpand(\\'' + b.id + '\\')"' : '';
-
-      return '<div class="aq-step ' + stepClass + '"' + clickHandler + '>' +
-        '<div class="aq-num">' + (b.status === 'done' ? '>' : (i + 1)) + '</div>' +
-        '<div class="aq-step-title">' + statusIcon + ' ' + esc(b.title) + '</div>' +
-        '<div class="aq-step-desc">' + esc(b.desc) + '</div>' +
-        actionHtml +
-      '</div>';
-    }).join('');
-  }
-
-  function toggleStepExpand(id) {
-    expandedStep = expandedStep === id ? null : id;
-    renderActionQueue();
-  }
-
-  async function saveAqApiKeys() {
-    var updates = {};
-    var k = document.getElementById('aq_api_key');
-    var s = document.getElementById('aq_api_secret');
-    var p = document.getElementById('aq_api_pass');
-    if (k && k.value.trim()) updates.POLYMARKET_API_KEY = k.value.trim();
-    if (s && s.value.trim()) updates.POLYMARKET_API_SECRET = s.value.trim();
-    if (p && p.value.trim()) updates.POLYMARKET_API_PASSPHRASE = p.value.trim();
-    if (Object.keys(updates).length === 0) { toast('Enter at least one key', 'error'); return; }
-    try {
-      var r = await fetch('/api/founder/update-env', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updates) });
-      var data = await r.json();
-      if (data.ok) { toast('API keys saved!', 'success'); expandedStep = null; fetchBlockers(); }
-      else toast('Failed: ' + (data.error || ''), 'error');
-    } catch (e) { toast('Save failed', 'error'); }
-  }
-
-  async function saveAqWalletKey() {
-    var el = document.getElementById('aq_wallet_key');
-    if (!el || !el.value.trim()) { toast('Enter wallet key', 'error'); return; }
-    try {
-      var r = await fetch('/api/founder/update-env', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ POLYMARKET_PRIVATE_KEY: el.value.trim() }) });
-      var data = await r.json();
-      if (data.ok) { toast('Wallet key saved!', 'success'); expandedStep = null; fetchBlockers(); }
-      else toast('Failed: ' + (data.error || ''), 'error');
-    } catch (e) { toast('Save failed', 'error'); }
-  }
-
-  async function saveAqRiskAndApprove() {
-    var updates = {};
-    var e1 = document.getElementById('aq_risk_max');
-    var e2 = document.getElementById('aq_risk_daily');
-    var e3 = document.getElementById('aq_risk_edge');
-    if (e1) updates.MAX_EXPOSURE_PER_MARKET = e1.value;
-    if (e2) updates.DAILY_MAX_EXPOSURE = e2.value;
-    if (e3) updates.MIN_EDGE_THRESHOLD = e3.value;
-    try {
-      await fetch('/api/founder/update-env', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updates) });
-      await approveRisks();
-      expandedStep = null;
-    } catch (e) { toast('Save failed', 'error'); }
-  }
-
-  function renderFundBar() {
-    const bar = document.getElementById('fundBar');
-    if (!blockerData || !blockerData.founder) { bar.style.display = 'none'; return; }
-    const f = blockerData.founder;
-    if (!f.capitalAllocated) { bar.style.display = 'none'; return; }
-
-    const remaining = f.fundSize - f.capitalDeployed;
-    const pctUsed = ((f.capitalDeployed / f.fundSize) * 100).toFixed(0);
-    const decisions = Object.values(f.decisions || {});
-    const buys = decisions.filter(d => d.verdict === 'BUY').length;
-    const passes = decisions.filter(d => d.verdict === 'PASS').length;
-    const remainClass = remaining > f.fundSize * 0.3 ? 'fb-green' : remaining > f.fundSize * 0.1 ? 'fb-yellow' : 'fb-red';
-
-    bar.style.display = 'flex';
-    bar.innerHTML =
-      '<div class="fb-item"><span class="fb-label">Fund:</span><span class="fb-value">$' + f.fundSize.toLocaleString() + '</span></div>' +
-      '<div class="fb-item"><span class="fb-label">Deployed:</span><span class="fb-value fb-yellow">$' + f.capitalDeployed.toLocaleString() + ' (' + pctUsed + '%)</span></div>' +
-      '<div class="fb-item"><span class="fb-label">Remaining:</span><span class="fb-value ' + remainClass + '">$' + remaining.toLocaleString() + '</span></div>' +
-      '<div class="fb-item"><span class="fb-label">Decisions:</span><span class="fb-value">' + buys + ' BUY / ' + passes + ' PASS</span></div>';
-  }
-
-  // ── Verdict rendering per opportunity ──
-  function renderVerdictCell(o) {
-    const decision = founderDecisions[o.id];
-
-    if (decision) {
-      if (decision.verdict === 'BUY') {
-        return '<div class="verdict-decided decided-buy">BUY</div>';
-      }
-      return '<div class="verdict-decided decided-pass">PASS</div>';
-    }
-
-    if (!tradingUnlocked) {
-      return '<div class="verdict-cell verdict-locked">' +
-        '<button class="verdict-btn vb-buy" disabled>BUY</button>' +
-        '<button class="verdict-btn vb-pass" disabled>PASS</button>' +
-      '</div>';
-    }
-
-    return '<div class="verdict-cell">' +
-      '<button class="verdict-btn vb-buy" onclick="founderDecide(\\'' + o.id + '\\', \\'BUY\\', \\'' + esc(o.market).replace(/'/g, "\\\\'") + '\\')">BUY</button>' +
-      '<button class="verdict-btn vb-pass" onclick="founderDecide(\\'' + o.id + '\\', \\'PASS\\', \\'' + esc(o.market).replace(/'/g, "\\\\'") + '\\')">PASS</button>' +
-    '</div>';
-  }
-
-  async function founderDecide(marketId, verdict, market) {
-    try {
-      const r = await fetch('/api/founder/decide', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ marketId, verdict, market }),
-      });
-      const data = await r.json();
-      if (data.ok) {
-        founderDecisions[marketId] = { verdict };
-        if (verdict === 'BUY' && data.position) {
-          toast('BUY — Recommended: $' + data.position.size + ' (' + data.position.pctOfFund + '% of fund)', 'success');
-        } else {
-          toast('PASS — Market skipped', 'info');
-        }
-        await fetchBlockers();
-      }
-    } catch (e) {
-      toast('Decision failed', 'error');
-    }
-  }
-
-  async function setCapital() {
-    const input = document.getElementById('aqCapitalInput');
-    const size = parseInt(input?.value);
-    if (!size || size < 100) { toast('Fund size must be >= $100', 'error'); return; }
-
-    try {
-      const r = await fetch('/api/founder/set-capital', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fundSize: size }),
-      });
-      const data = await r.json();
-      if (data.ok) {
-        blockerData = data.blockers;
-        toast('Fund capital set: $' + size.toLocaleString(), 'success');
-        renderActionQueue();
-        renderFundBar();
-      }
-    } catch (e) {
-      toast('Failed to set capital', 'error');
-    }
-  }
-
-  async function approveRisks() {
-    try {
-      const r = await fetch('/api/founder/approve-risks', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
-      });
-      const data = await r.json();
-      if (data.ok) {
-        blockerData = data.blockers;
-        tradingUnlocked = data.blockers.allClear;
-        toast('Risk limits approved', 'success');
-        renderActionQueue();
-        if (opportunities.length > 0) renderOpportunities();
-      }
-    } catch (e) {
-      toast('Failed to approve risks', 'error');
-    }
-  }
-
-  // ── Search / Filter ──
-  function filterAndRender() {
-    renderOpportunities();
-  }
-
-  function getFilteredOpportunities() {
-    let filtered = [...opportunities];
-    const query = (document.getElementById('marketSearch')?.value || '').toLowerCase();
-    const minEdge = parseFloat(document.getElementById('edgeFilter')?.value || '0');
-    const sortBy = document.getElementById('sortMode')?.value || 'edge';
-
-    if (query) {
-      filtered = filtered.filter(o => o.market.toLowerCase().includes(query));
-    }
-    if (minEdge > 0) {
-      filtered = filtered.filter(o => o.edge >= minEdge);
-    }
-    if (sortBy === 'volume') filtered.sort((a, b) => b.volume - a.volume);
-    else if (sortBy === 'confidence') filtered.sort((a, b) => b.confidence - a.confidence);
-    else if (sortBy === 'liquidity') filtered.sort((a, b) => b.liquidity - a.liquidity);
-    else filtered.sort((a, b) => b.edge - a.edge);
-
-    return filtered;
-  }
-
-  // ── Market Detail Modal ──
-  function showMarketDetail(idx) {
-    const filtered = getFilteredOpportunities();
-    const o = filtered[idx];
-    if (!o) return;
-
-    const edgeClass = o.edge >= 2 ? 'edge-high' : o.edge >= 1 ? 'edge-mid' : 'edge-low';
-    const isDemo = o.demo || false;
-    const expiryText = o.daysToExpiry !== null && o.daysToExpiry !== undefined ? o.daysToExpiry + ' days' : 'N/A';
-    const decision = founderDecisions[o.id];
-
-    document.getElementById('marketModal').innerHTML =
-      '<div class="modal-overlay" onclick="closeMarketModal(event)">' +
-        '<div class="modal" onclick="event.stopPropagation()">' +
-          '<div class="modal-header">' +
-            '<h2>' + esc(o.market) + '</h2>' +
-            '<button class="modal-close" onclick="closeMarketModal()">X</button>' +
-          '</div>' +
-          '<div class="modal-body">' +
-            (isDemo ? '<div style="padding:8px 12px;background:rgba(245,158,11,0.1);border:1px solid rgba(245,158,11,0.3);border-radius:6px;margin-bottom:12px;font-size:11px;color:var(--accent-yellow);font-family:var(--font-mono)">DEMO DATA — Connect Polymarket API for live markets</div>' : '') +
-            (o.description ? '<div class="md-desc">' + esc(o.description) + '</div>' : '') +
-            '<div class="md-grid">' +
-              '<div class="md-stat"><div class="ms-label">Edge</div><div class="ms-val ' + edgeClass + '">' + o.edge.toFixed(2) + '%</div></div>' +
-              '<div class="md-stat"><div class="ms-label">Confidence</div><div class="ms-val">' + o.confidence.toFixed(0) + '%</div></div>' +
-              '<div class="md-stat"><div class="ms-label">Yes Price</div><div class="ms-val">' + o.bestBid.toFixed(4) + '</div></div>' +
-              '<div class="md-stat"><div class="ms-label">No Price</div><div class="ms-val">' + o.bestAsk.toFixed(4) + '</div></div>' +
-              '<div class="md-stat"><div class="ms-label">Price Sum</div><div class="ms-val">' + o.priceSum.toFixed(4) + '</div></div>' +
-              '<div class="md-stat"><div class="ms-label">Volume 24h</div><div class="ms-val">$' + fmt(o.volume) + '</div></div>' +
-              '<div class="md-stat"><div class="ms-label">Liquidity</div><div class="ms-val">$' + fmt(o.liquidity) + '</div></div>' +
-              '<div class="md-stat"><div class="ms-label">Expires</div><div class="ms-val">' + expiryText + '</div></div>' +
-            '</div>' +
-            '<div style="margin-top:12px">' +
-              '<div style="font-size:11px;color:var(--text-muted);font-family:var(--font-mono);margin-bottom:6px">OUTCOMES: ' + (o.outcomes || []).join(' / ') + '</div>' +
-              (o.negRisk ? '<span class="negrisk-tag" style="margin-bottom:8px;display:inline-block">NegRisk Market</span>' : '') +
-              (decision ? '<div style="margin-top:8px;font-family:var(--font-mono);font-size:12px;font-weight:700;color:' + (decision.verdict === 'BUY' ? 'var(--accent-green)' : 'var(--text-muted)') + '">Decision: ' + decision.verdict + '</div>' : '') +
-            '</div>' +
-            '<div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">' +
-              (o.link !== 'https://polymarket.com' ? '<a class="md-link" href="' + esc(o.link) + '" target="_blank" rel="noopener">View on Polymarket</a>' : '') +
-              (!decision && tradingUnlocked ? '<button class="btn btn-primary" style="padding:8px 16px" onclick="founderDecide(\\'' + o.id + '\\', \\'BUY\\', \\'' + esc(o.market).replace(/'/g, "\\\\'") + '\\');closeMarketModal()">BUY</button>' +
-                '<button class="btn" style="padding:8px 16px" onclick="founderDecide(\\'' + o.id + '\\', \\'PASS\\', \\'' + esc(o.market).replace(/'/g, "\\\\'") + '\\');closeMarketModal()">PASS</button>' : '') +
-            '</div>' +
-          '</div>' +
-        '</div>' +
-      '</div>';
-  }
-
-  function closeMarketModal(event) {
-    if (event && event.target !== event.currentTarget) return;
-    document.getElementById('marketModal').innerHTML = '';
-  }
-
-  // ── Explain Hub ──
-  let hubData = null;
-
-  async function fetchSystemStatus() {
-    try {
-      const r = await fetch('/api/system-status');
-      hubData = await r.json();
-      renderHub();
-    } catch (e) {
-      console.error('Hub fetch error:', e);
-    }
-  }
-
-  async function fetchActivityLog() {
-    try {
-      const r = await fetch('/api/activity-log');
-      const data = await r.json();
-      renderActivityFeed(data.log || []);
-    } catch (e) { /* silent */ }
-  }
-
-  function renderHub() {
-    if (!hubData) {
-      document.getElementById('hubGrid').innerHTML = '<div class="loader"><div class="spinner"></div><div class="loader-text">Loading system status...</div></div>';
-      return;
-    }
-    const h = hubData;
-
-    // System overview card
-    let html = '<div class="hub-card">' +
-      '<h3>System Overview</h3>' +
-      '<p>ZVI v1 is a Polymarket Fund Operating System. It continuously scans prediction markets for mispriced opportunities, computes edge and confidence scores, and surfaces them for founder decision-making.</p>' +
-      '<div class="hub-status-grid">' +
-        '<div class="hub-stat"><div class="hs-label">Uptime</div><div class="hs-val">' + esc(h.uptimeFormatted) + '</div></div>' +
-        '<div class="hub-stat"><div class="hs-label">Mode</div><div class="hs-val">' + (h.mode === 'OBSERVATION_ONLY' ? 'Observe' : 'LIVE') + '</div></div>' +
-        '<div class="hub-stat"><div class="hs-label">Data Source</div><div class="hs-val">' + (h.dataSource === 'live' ? 'Polymarket API' : 'Demo Data') + '</div></div>' +
-        '<div class="hub-stat"><div class="hs-label">Markets Cached</div><div class="hs-val">' + h.marketsInCache + '</div></div>' +
-        '<div class="hub-stat"><div class="hs-label">Total Scans</div><div class="hs-val">' + h.totalScans + '</div></div>' +
-        '<div class="hub-stat"><div class="hs-label">Markets Scanned</div><div class="hs-val">' + h.totalMarketsScanned + '</div></div>' +
-      '</div>' +
-    '</div>';
-
-    // Setup progress
-    var secretsList = [
-      { key: 'polygonRpc', label: 'Polygon RPC' },
-      { key: 'anthropicKey', label: 'Anthropic LLM' },
-      { key: 'polymarketGamma', label: 'Polymarket API' },
-      { key: 'polymarketClob', label: 'CLOB Trading' },
-      { key: 'polymarketPrivateKey', label: 'Wallet Key' },
-      { key: 'telegram', label: 'Telegram Alerts' },
-    ];
-    html += '<div class="hub-card">' +
-      '<h3>Setup Progress</h3>';
-    for (var si = 0; si < secretsList.length; si++) {
-      var s = secretsList[si];
-      var ok = h.secrets[s.key];
-      html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid rgba(42,53,85,0.3)">' +
-        '<span style="font-size:12px">' + s.label + '</span>' +
-        '<span class="setting-status ' + (ok ? 'connected' : 'missing') + '">' + (ok ? 'Connected' : 'Missing') + '</span>' +
-      '</div>';
-    }
-    html += '<div style="margin-top:12px"><button class="btn btn-primary" onclick="switchToTab(\\'settings\\')">Configure in Settings</button></div>' +
-    '</div>';
-
-    // Founder state
-    html += '<div class="hub-card">' +
-      '<h3>Founder Status</h3>' +
-      '<div class="hub-status-grid">' +
-        '<div class="hub-stat"><div class="hs-label">Fund Size</div><div class="hs-val" style="color:var(--accent-green)">$' + h.founder.fundSize.toLocaleString() + '</div></div>' +
-        '<div class="hub-stat"><div class="hs-label">Capital Deployed</div><div class="hs-val" style="color:var(--accent-yellow)">$' + h.founder.capitalDeployed.toLocaleString() + '</div></div>' +
-        '<div class="hub-stat"><div class="hs-label">Decisions Made</div><div class="hs-val">' + h.founder.totalDecisions + '</div></div>' +
-        '<div class="hub-stat"><div class="hs-label">BUY / PASS</div><div class="hs-val">' + h.founder.buys + ' / ' + h.founder.passes + '</div></div>' +
-      '</div>' +
-    '</div>';
-
-    // Glossary
-    html += '<div class="hub-card">' +
-      '<h3>Key Concepts</h3>' +
-      '<div class="glossary-item"><div class="gi-term">Edge %</div><div class="gi-def">The pricing inefficiency. Calculated as |1.0 - (YES price + NO price)| x 100. Markets should sum to exactly 1.0. Any deviation = potential arbitrage.</div></div>' +
-      '<div class="glossary-item"><div class="gi-term">Confidence Score</div><div class="gi-def">Composite metric: 40% edge magnitude + 35% volume + 25% liquidity. Higher = more reliable opportunity.</div></div>' +
-      '<div class="glossary-item"><div class="gi-term">NegRisk</div><div class="gi-def">Polymarket markets using the NegRisk adapter contract. These allow multi-outcome events and have specific arbitrage patterns.</div></div>' +
-      '<div class="glossary-item"><div class="gi-term">Kelly Sizing</div><div class="gi-def">Position size = edge x confidence x fund_size x 0.25 (quarter-Kelly). Caps at max per market. Conservative approach for capital preservation.</div></div>' +
-      '<div class="glossary-item"><div class="gi-term">Price Sum</div><div class="gi-def">YES + NO prices. Should equal 1.0. When below 1.0: buy-all-YES arb opportunity. When above 1.0: buy-all-NO + convert opportunity.</div></div>' +
-    '</div>';
-
-    // Roadmap
-    html += '<div class="hub-card">' +
-      '<h3>Development Roadmap</h3>' +
-      '<div class="roadmap-phase active">' +
-        '<div class="rp-title"><span class="rp-tag current">NOW</span>Phase 1 — Foundation</div>' +
-        '<div class="rp-desc">Live market scanning, founder decision queue, basic analytics. Dashboard operational with Polymarket API integration.</div>' +
-      '</div>' +
-      '<div class="roadmap-phase next">' +
-        '<div class="rp-title"><span class="rp-tag upcoming">NEXT</span>Phase 2 — Execution</div>' +
-        '<div class="rp-desc">CLOB order execution (dry-run first), basket execution for multi-leg arbs, simulate button showing expected fills without placing orders.</div>' +
-      '</div>' +
-      '<div class="roadmap-phase next">' +
-        '<div class="rp-title"><span class="rp-tag upcoming">NEXT</span>Phase 3 — LLM Engine</div>' +
-        '<div class="rp-desc">Claude/GPT probability estimates, mispricing alerts when model-vs-market gap > 10%, auto-generated RP Optical-style research briefs.</div>' +
-      '</div>' +
-      '<div class="roadmap-phase future">' +
-        '<div class="rp-title"><span class="rp-tag planned">PLANNED</span>Phase 4 — Risk & Scale</div>' +
-        '<div class="rp-desc">P&L tracking, position-aware risk checks, multi-exchange arb (Polymarket + Kalshi + Metaculus), portfolio optimization, mobile alerts.</div>' +
-      '</div>' +
-    '</div>';
-
-    // Activity Feed
-    html += '<div class="hub-card full-width">' +
-      '<h3>Activity Log</h3>' +
-      '<div class="activity-feed" id="activityFeed">' +
-        '<div style="color:var(--text-muted);font-family:var(--font-mono);font-size:11px">Loading...</div>' +
-      '</div>' +
-    '</div>';
-
-    document.getElementById('hubGrid').innerHTML = html;
-    fetchActivityLog();
-  }
-
-  function renderActivityFeed(log) {
-    var feedEl = document.getElementById('activityFeed');
-    if (!feedEl) return;
-    if (log.length === 0) {
-      feedEl.innerHTML = '<div style="color:var(--text-muted);font-family:var(--font-mono);font-size:11px;padding:8px">No activity yet</div>';
-      return;
-    }
-    feedEl.innerHTML = log.slice(0, 100).map(function(entry) {
-      var time = new Date(entry.timestamp).toLocaleTimeString();
-      var typeCls = 'at-' + entry.type;
-      return '<div class="activity-entry">' +
-        '<span class="activity-time">' + time + '</span>' +
-        '<span class="activity-type ' + typeCls + '">' + esc(entry.type) + '</span>' +
-        '<span class="activity-msg">' + esc(entry.message) + '</span>' +
-      '</div>';
-    }).join('');
-  }
-
-  function switchToTab(tabName) {
-    document.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('active'); });
-    document.querySelectorAll('.panel').forEach(function(p) { p.classList.remove('active'); });
-    var tabEl = document.querySelector('.tab[data-tab="' + tabName + '"]');
-    if (tabEl) tabEl.classList.add('active');
-    var panelEl = document.getElementById('panel-' + tabName);
-    if (panelEl) panelEl.classList.add('active');
-    if (tabName === 'hub') { fetchSystemStatus(); fetchActivityLog(); }
-    if (tabName === 'settings') renderSettings();
-  }
-
-  // ── Settings ──
-  function renderSettings() {
-    var cfg = null;
-    fetch('/api/config').then(function(r) { return r.json(); }).then(function(data) {
-      cfg = data;
-      doRenderSettings(cfg);
-    }).catch(function() {
-      document.getElementById('settingsContent').innerHTML = '<div class="empty-state"><p>Failed to load settings</p></div>';
-    });
-  }
-
-  function doRenderSettings(cfg) {
-    var html = '';
-
-    // API Keys section
-    html += '<div class="settings-section">' +
-      '<h3>API Connections</h3>' +
-      '<div class="settings-grid">' +
-        settingInput('POLYMARKET_API_KEY', 'Polymarket API Key', 'CLOB API key for order placement', cfg.secrets.polymarketClob, 'password') +
-        settingInput('POLYMARKET_API_SECRET', 'Polymarket API Secret', 'CLOB API secret', cfg.secrets.polymarketClob, 'password') +
-        settingInput('POLYMARKET_API_PASSPHRASE', 'Polymarket Passphrase', 'CLOB API passphrase', cfg.secrets.polymarketClob, 'password') +
-        settingInput('POLYMARKET_PRIVATE_KEY', 'Wallet Private Key', 'Polygon wallet key for signing txns', cfg.secrets.polymarketPrivateKey, 'password') +
-        settingInput('ANTHROPIC_API_KEY', 'Anthropic API Key', 'Claude LLM for probability estimates', cfg.secrets.anthropicKey, 'password') +
-        settingInput('POLYGON_RPC_URL', 'Polygon RPC URL', 'Alchemy/Infura Polygon endpoint', cfg.secrets.polygonRpc, 'text') +
-        settingInput('TELEGRAM_BOT_TOKEN', 'Telegram Bot Token', 'For alert notifications', cfg.secrets.telegram, 'password') +
-        settingInput('TELEGRAM_CHAT_ID', 'Telegram Chat ID', 'Chat to receive alerts', cfg.secrets.telegram, 'text') +
-      '</div>' +
-      '<div style="margin-top:12px"><button class="btn btn-primary" onclick="saveApiKeys()">Save API Keys</button></div>' +
-    '</div>';
-
-    // Risk Limits
-    html += '<div class="settings-section">' +
-      '<h3>Risk Limits</h3>' +
-      '<div class="settings-grid">' +
-        settingNumInput('MAX_EXPOSURE_PER_MARKET', 'Max Per Market ($)', 'Maximum USDC exposure per single market', cfg.riskLimits.maxExposurePerMarket) +
-        settingNumInput('DAILY_MAX_EXPOSURE', 'Daily Max Exposure ($)', 'Maximum total USDC deployed per day', cfg.riskLimits.dailyMaxExposure) +
-        settingNumInput('MIN_EDGE_THRESHOLD', 'Min Edge Threshold', 'Minimum edge % to consider (0.02 = 2%)', cfg.riskLimits.minEdgeThreshold) +
-        settingNumInput('MIN_DEPTH_USDC', 'Min Depth (USDC)', 'Minimum market depth to trade', cfg.riskLimits.minDepthUsdc) +
-      '</div>' +
-      '<div style="margin-top:12px"><button class="btn btn-primary" onclick="saveRiskLimits()">Save Risk Limits</button></div>' +
-    '</div>';
-
-    // Scan Settings
-    html += '<div class="settings-section">' +
-      '<h3>Scanner Settings</h3>' +
-      '<div class="settings-grid">' +
-        '<div class="setting-item">' +
-          '<label>Market Scan Limit</label>' +
-          '<div class="setting-desc">Number of markets to scan per cycle (no hard cap)</div>' +
-          '<input type="number" id="set_marketLimit" value="200" min="10" max="5000">' +
-        '</div>' +
-        '<div class="setting-item">' +
-          '<label>Refresh Interval (seconds)</label>' +
-          '<div class="setting-desc">Auto-refresh interval for market data</div>' +
-          '<input type="number" id="set_refreshInterval" value="30" min="10" max="300">' +
-        '</div>' +
-        '<div class="setting-item">' +
-          '<label>Scan Mode</label>' +
-          '<div class="setting-desc">How to prioritize markets</div>' +
-          '<select id="set_scanMode">' +
-            '<option value="volume">By Volume (default)</option>' +
-            '<option value="newest">Newest First</option>' +
-            '<option value="ending-soon">Ending Soon</option>' +
-          '</select>' +
-        '</div>' +
-      '</div>' +
-      '<div style="margin-top:12px"><button class="btn btn-primary" onclick="saveScanSettings()">Save Scan Settings</button></div>' +
-    '</div>';
-
-    // Operation Mode
-    html += '<div class="settings-section">' +
-      '<h3>Operation Mode</h3>' +
-      '<div class="settings-grid">' +
-        '<div class="setting-item">' +
-          '<label>Trading Mode</label>' +
-          '<select id="set_observationOnly">' +
-            '<option value="true" ' + (cfg.mode === 'OBSERVATION_ONLY' ? 'selected' : '') + '>Observation Only (safe)</option>' +
-            '<option value="false" ' + (cfg.mode !== 'OBSERVATION_ONLY' ? 'selected' : '') + '>Live Trading</option>' +
-          '</select>' +
-        '</div>' +
-        '<div class="setting-item">' +
-          '<label>Manual Approval</label>' +
-          '<select id="set_manualApproval">' +
-            '<option value="true" selected>Required (recommended)</option>' +
-            '<option value="false">Auto-execute</option>' +
-          '</select>' +
-        '</div>' +
-      '</div>' +
-      '<div style="margin-top:12px"><button class="btn btn-primary" onclick="saveOperationMode()">Save Mode</button></div>' +
-    '</div>';
-
-    document.getElementById('settingsContent').innerHTML = html;
-
-    // Load current scan settings
-    fetch('/api/settings').then(function(r) { return r.json(); }).then(function(s) {
-      var el1 = document.getElementById('set_marketLimit');
-      var el2 = document.getElementById('set_refreshInterval');
-      var el3 = document.getElementById('set_scanMode');
-      if (el1 && s.marketLimit) el1.value = s.marketLimit;
-      if (el2 && s.refreshInterval) el2.value = s.refreshInterval;
-      if (el3 && s.scanMode) el3.value = s.scanMode;
-    }).catch(function() {});
-  }
-
-  function settingInput(envKey, label, desc, isConnected, type) {
-    return '<div class="setting-item">' +
-      '<label>' + label + ' <span class="setting-status ' + (isConnected ? 'connected' : 'missing') + '">' + (isConnected ? 'OK' : 'MISSING') + '</span></label>' +
-      '<div class="setting-desc">' + desc + '</div>' +
-      '<input type="' + type + '" id="set_' + envKey + '" placeholder="Enter ' + label + '...">' +
-    '</div>';
-  }
-
-  function settingNumInput(envKey, label, desc, currentVal) {
-    return '<div class="setting-item">' +
-      '<label>' + label + '</label>' +
-      '<div class="setting-desc">' + desc + '</div>' +
-      '<input type="number" id="set_' + envKey + '" value="' + currentVal + '" step="any">' +
-    '</div>';
-  }
-
-  async function saveApiKeys() {
-    var keys = ['POLYMARKET_API_KEY','POLYMARKET_API_SECRET','POLYMARKET_API_PASSPHRASE','POLYMARKET_PRIVATE_KEY','ANTHROPIC_API_KEY','POLYGON_RPC_URL','TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID'];
-    var updates = {};
-    for (var i = 0; i < keys.length; i++) {
-      var el = document.getElementById('set_' + keys[i]);
-      if (el && el.value.trim()) updates[keys[i]] = el.value.trim();
-    }
-    if (Object.keys(updates).length === 0) { toast('No values to save', 'info'); return; }
-    try {
-      var r = await fetch('/api/founder/update-env', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updates),
-      });
-      var data = await r.json();
-      if (data.ok) {
-        toast('Saved ' + data.updated.length + ' key(s). Restart may be needed for some changes.', 'success');
-        // Clear inputs
-        for (var j = 0; j < keys.length; j++) {
-          var el2 = document.getElementById('set_' + keys[j]);
-          if (el2) el2.value = '';
-        }
-        renderSettings();
-        fetchBlockers();
-      } else {
-        toast('Save failed: ' + (data.error || 'Unknown'), 'error');
-      }
-    } catch (e) { toast('Save failed', 'error'); }
-  }
-
-  async function saveRiskLimits() {
-    var updates = {};
-    var el1 = document.getElementById('set_MAX_EXPOSURE_PER_MARKET');
-    var el2 = document.getElementById('set_DAILY_MAX_EXPOSURE');
-    var el3 = document.getElementById('set_MIN_EDGE_THRESHOLD');
-    var el4 = document.getElementById('set_MIN_DEPTH_USDC');
-    if (el1) updates.MAX_EXPOSURE_PER_MARKET = el1.value;
-    if (el2) updates.DAILY_MAX_EXPOSURE = el2.value;
-    if (el3) updates.MIN_EDGE_THRESHOLD = el3.value;
-    if (el4) updates.MIN_DEPTH_USDC = el4.value;
-    try {
-      var r = await fetch('/api/founder/update-env', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updates),
-      });
-      var data = await r.json();
-      if (data.ok) { toast('Risk limits saved', 'success'); fetchBlockers(); }
-      else toast('Failed: ' + (data.error || ''), 'error');
-    } catch (e) { toast('Save failed', 'error'); }
-  }
-
-  async function saveScanSettings() {
-    var marketLimit = parseInt(document.getElementById('set_marketLimit')?.value) || 200;
-    var refreshInterval = parseInt(document.getElementById('set_refreshInterval')?.value) || 30;
-    var scanMode = document.getElementById('set_scanMode')?.value || 'volume';
-    try {
-      var r = await fetch('/api/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ marketLimit: marketLimit, refreshInterval: refreshInterval, scanMode: scanMode }),
-      });
-      var data = await r.json();
-      if (data.ok) {
-        toast('Scan settings saved — limit: ' + marketLimit + ', interval: ' + refreshInterval + 's', 'success');
-        // Update refresh interval
-        if (countdownInterval) clearInterval(countdownInterval);
-        refreshCountdown = refreshInterval;
-        startCountdown();
-      } else toast('Failed', 'error');
-    } catch (e) { toast('Save failed', 'error'); }
-  }
-
-  async function saveOperationMode() {
-    var updates = {};
-    var el1 = document.getElementById('set_observationOnly');
-    var el2 = document.getElementById('set_manualApproval');
-    if (el1) updates.OBSERVATION_ONLY = el1.value;
-    if (el2) updates.MANUAL_APPROVAL_REQUIRED = el2.value;
-    try {
-      var r = await fetch('/api/founder/update-env', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updates),
-      });
-      var data = await r.json();
-      if (data.ok) {
-        toast('Mode saved. Restart server for full effect.', 'success');
-        loadConfig();
-      }
-    } catch (e) { toast('Save failed', 'error'); }
-  }
-
-  // ── Init ──
-  function init() {
-    loadConfig();
-
-    // RENDER IMMEDIATELY from server-embedded state (zero API wait)
-    renderActionQueue();
-    renderFundBar();
-    renderOpportunities();
-
-    // Background refresh — updates if Polymarket is reachable, otherwise keeps demo data
-    fetchBlockers().catch(e => console.error('blockers:', e));
-    fetchOpportunities().catch(e => console.error('opps:', e));
-    fetchSignals().catch(() => {});
-    fetchHealth().catch(() => {});
-    startCountdown();
-
-    setInterval(fetchHealth, 30000);
-    setInterval(fetchBlockers, 30000);
-
-    // Keyboard shortcut: Escape closes modal
-    document.addEventListener('keydown', function(e) {
-      if (e.key === 'Escape') closeMarketModal();
-    });
-  }
-
-  init();
+    const clk=b.status!=='done'&&b.status!=='locked'?' onclick="toggleExp(\\''+b.id+'\\')"':'';
+    return '<div class="aq-step '+sc+'"'+clk+'><div class="aq-num">'+(b.status==='done'?'>':i+1)+'</div><div class="aq-step-title">'+esc(b.title)+'</div><div class="aq-step-desc">'+esc(b.desc)+'</div>'+act+'</div>';
+  }).join('');
+}
+function toggleExp(id){expandedStep=expandedStep===id?null:id;renderAQ();}
+async function saveAqKeys(){const u={};const k=document.getElementById('aq_k'),s=document.getElementById('aq_s'),p=document.getElementById('aq_p');if(k?.value.trim())u.POLYMARKET_API_KEY=k.value.trim();if(s?.value.trim())u.POLYMARKET_API_SECRET=s.value.trim();if(p?.value.trim())u.POLYMARKET_API_PASSPHRASE=p.value.trim();if(!Object.keys(u).length){toast('Enter keys','error');return;}try{const r=await post('/api/founder/update-env',u);if(r.ok){toast('Saved','success');expandedStep=null;fetchBlockers();}}catch(e){toast('Failed','error');}}
+async function saveAqWallet(){const el=document.getElementById('aq_w');if(!el?.value.trim()){toast('Enter key','error');return;}try{const r=await post('/api/founder/update-env',{POLYMARKET_PRIVATE_KEY:el.value.trim()});if(r.ok){toast('Saved','success');expandedStep=null;fetchBlockers();}}catch(e){toast('Failed','error');}}
+async function setCap(){const v=parseInt(document.getElementById('aqCap')?.value);if(!v||v<100){toast('Min $100','error');return;}try{const r=await post('/api/founder/set-capital',{fundSize:v});if(r.ok){blockerData=r.blockers;toast('Fund: $'+v.toLocaleString(),'success');renderAQ();renderFundBar();}}catch(e){toast('Failed','error');}}
+async function approveRisks(){try{const r=await post('/api/founder/approve-risks',{});if(r.ok){blockerData=r.blockers;tradingUnlocked=r.blockers.allClear;toast('Risks approved','success');renderAQ();if(opps.length)renderOpps();}}catch(e){toast('Failed','error');}}
+function renderFundBar(){const b=document.getElementById('fundBar');if(!blockerData?.founder?.capitalAllocated){b.style.display='none';return;}const f=blockerData.founder,rem=f.fundSize-f.capitalDeployed;b.style.display='flex';b.innerHTML='<div class="fb-i"><span class="fb-l">Fund:</span><span class="fb-v">$'+f.fundSize.toLocaleString()+'</span></div><div class="fb-i"><span class="fb-l">Deployed:</span><span class="fb-v" style="color:var(--yellow)">$'+f.capitalDeployed.toLocaleString()+'</span></div><div class="fb-i"><span class="fb-l">Remaining:</span><span class="fb-v" style="color:'+(rem>f.fundSize*.3?'var(--green)':'var(--red)')+'">$'+rem.toLocaleString()+'</span></div>';}
+
+// Agents
+async function fetchAgents(){try{const d=await api('/api/agents');agents=d.agents||[];renderAgents();}catch(e){}}
+function renderAgents(){
+  document.getElementById('cAgents').textContent=agents.length;
+  if(!agents.length){document.getElementById('agentList').innerHTML='<div class="empty"><p>No agents created yet</p><p class="eh">Click "+ Create Agent" to deploy a strategy</p></div>';return;}
+  document.getElementById('agentList').innerHTML=agents.map(a=>{
+    const sc='st-'+(a.status||'disabled');
+    return '<div class="agent-card"><div class="ac-h"><div><span class="ac-name">'+esc(a.name)+'</span> <span class="ac-type">'+a.strategyType+'</span></div><div style="display:flex;gap:6px;align-items:center"><span class="status-pill '+sc+'">'+(a.status||'?')+'</span><button class="btn btn-sm" onclick="toggleAgentStatus(\\''+a.id+'\\')">'+((a.status==='running')?'Pause':'Resume')+'</button><button class="btn btn-sm btn-r" onclick="deleteAgentUI(\\''+a.id+'\\')">Del</button></div></div><div class="agent-stats"><div class="as-item"><div class="as-l">Scanned</div><div class="as-v">'+a.stats.scanned+'</div></div><div class="as-item"><div class="as-l">Opportunities</div><div class="as-v">'+a.stats.opportunities+'</div></div><div class="as-item"><div class="as-l">Pending</div><div class="as-v">'+a.stats.approvalsPending+'</div></div><div class="as-item"><div class="as-l">Executed</div><div class="as-v">'+a.stats.executed+'</div></div><div class="as-item"><div class="as-l">Mode</div><div class="as-v" style="font-size:10px">'+a.config.mode+'</div></div><div class="as-item"><div class="as-l">Budget</div><div class="as-v">$'+a.config.budgetUSDC+'</div></div></div><div style="font-size:10px;color:var(--t3);font-family:var(--mono)">Last run: '+(a.health.lastRunAt?new Date(a.health.lastRunAt).toLocaleTimeString():'never')+' | Min edge: '+a.config.minEdgePct+'% | Refresh: '+a.config.refreshSec+'s</div></div>';
+  }).join('');
+}
+function showCreateAgent(){
+  document.getElementById('marketModal').innerHTML='<div class="modal-overlay" onclick="closeModal(event)"><div class="modal" onclick="event.stopPropagation()" style="max-width:500px"><div class="modal-h"><h2>Create Agent</h2><button class="modal-x" onclick="closeModal()">X</button></div><div class="modal-b"><div style="display:grid;gap:10px"><div class="set-item"><label>Strategy</label><select id="ca_strat"><option value="negrisk_arb">NegRisk Arbitrage</option><option value="llm_probability">LLM Probability</option><option value="sentiment">Sentiment/Headlines</option><option value="whale_watch">Whale Watch</option></select></div><div class="set-item"><label>Name</label><input id="ca_name" placeholder="My Agent"></div><div class="set-item"><label>Budget (USDC)</label><input type="number" id="ca_budget" value="1000"></div><div class="set-item"><label>Min Edge %</label><input type="number" step="0.1" id="ca_edge" value="1.0"></div><div class="set-item"><label>Refresh (sec)</label><input type="number" id="ca_refresh" value="60"></div><button class="btn btn-p" onclick="doCreateAgent()">Create & Start (OBSERVE mode)</button></div></div></div></div>';
+}
+async function doCreateAgent(){
+  const cfg={strategyType:document.getElementById('ca_strat').value,name:document.getElementById('ca_name').value||undefined,budgetUSDC:parseInt(document.getElementById('ca_budget').value)||1000,minEdgePct:parseFloat(document.getElementById('ca_edge').value)||1.0,refreshSec:parseInt(document.getElementById('ca_refresh').value)||60};
+  try{const r=await post('/api/agents',cfg);if(r.agent){toast('Agent created: '+r.agent.name,'success');closeModal();fetchAgents();}}catch(e){toast('Failed','error');}
+}
+async function quickCreateAgent(strat){try{const r=await post('/api/agents',{strategyType:strat});if(r.agent){toast('Created '+r.agent.name,'success');fetchAgents();}}catch(e){toast('Failed','error');}}
+async function toggleAgentStatus(id){const a=agents.find(x=>x.id===id);if(!a)return;const ns=a.status==='running'?'paused':'running';try{await post('/api/agents/'+id,{status:ns});toast(ns==='running'?'Resumed':'Paused','info');fetchAgents();}catch(e){toast('Failed','error');}}
+async function deleteAgentUI(id){try{await fetch('/api/agents/'+id,{method:'DELETE'});toast('Deleted','info');fetchAgents();}catch(e){toast('Failed','error');}}
+
+// Approvals
+async function fetchApprovals(){try{const d=await api('/api/approvals');approvals=d.approvals||[];renderApprovals();}catch(e){}}
+function renderApprovals(){
+  document.getElementById('cApprovals').textContent=approvals.filter(a=>a.status==='pending').length;
+  if(!approvals.length){document.getElementById('approvalList').innerHTML='<div class="empty"><p>No approvals yet</p><p class="eh">Strategy agents will submit opportunities here for your review</p></div>';return;}
+  document.getElementById('approvalList').innerHTML=approvals.map(a=>{
+    const sc=a.status==='approved'?'approved':a.status==='rejected'?'rejected':'';
+    return '<div class="approval-card '+sc+'"><div class="ap-h"><div class="ap-title">'+esc(a.payload?.title||a.rationale||'Unknown')+'</div><div class="ap-edge">'+(a.expectedEdge?a.expectedEdge.toFixed(2)+'%':'')+'</div></div><div class="ap-meta">Agent: '+(a.agentId?.slice(0,8)||'?')+' | Action: '+esc(a.actionType||'?')+' | '+new Date(a.ts).toLocaleTimeString()+'</div><div class="ap-rationale">'+esc(a.rationale||'')+'</div>'+(a.status==='pending'?'<div class="ap-actions"><button class="btn btn-g btn-sm" onclick="approveItem(\\''+a.id+'\\')">Approve</button><button class="btn btn-r btn-sm" onclick="rejectItem(\\''+a.id+'\\')">Reject</button><button class="btn btn-sm" onclick="showExplain(\\''+a.id+'\\')">Explain</button></div>':'<div style="font-family:var(--mono);font-size:10px;color:var(--t3)">Status: '+a.status+'</div>')+'</div>';
+  }).join('');
+}
+async function approveItem(id){try{await post('/api/approvals/'+id+'/approve',{});toast('Approved','success');fetchApprovals();}catch(e){toast('Failed','error');}}
+async function rejectItem(id){try{await post('/api/approvals/'+id+'/reject',{});toast('Rejected','info');fetchApprovals();}catch(e){toast('Failed','error');}}
+function showExplain(id){
+  const a=approvals.find(x=>x.id===id);if(!a||!a.payload?.explain)return;const ex=a.payload.explain;
+  document.getElementById('marketModal').innerHTML='<div class="modal-overlay" onclick="closeModal(event)"><div class="modal" onclick="event.stopPropagation()"><div class="modal-h"><h2>Explain: '+esc(a.payload?.title||'')+'</h2><button class="modal-x" onclick="closeModal()">X</button></div><div class="modal-b"><h4 style="color:var(--cyan);font-family:var(--mono);font-size:11px;margin-bottom:8px">MATH</h4><pre style="background:rgba(0,0,0,.2);padding:10px;border-radius:6px;font-family:var(--mono);font-size:11px;color:var(--t2);overflow-x:auto;white-space:pre-wrap">'+esc(ex.math||'N/A')+'</pre><h4 style="color:var(--cyan);font-family:var(--mono);font-size:11px;margin:12px 0 8px">INPUTS</h4><pre style="background:rgba(0,0,0,.2);padding:10px;border-radius:6px;font-family:var(--mono);font-size:10px;color:var(--t2);overflow-x:auto;white-space:pre-wrap">'+esc(JSON.stringify(ex.inputs||{},null,2))+'</pre><h4 style="color:var(--cyan);font-family:var(--mono);font-size:11px;margin:12px 0 8px">ASSUMPTIONS</h4><ul style="padding-left:16px;font-size:11px;color:var(--t2)">'+(ex.assumptions||[]).map(a=>'<li>'+esc(a)+'</li>').join('')+'</ul><h4 style="color:var(--red);font-family:var(--mono);font-size:11px;margin:12px 0 8px">FAILURE MODES</h4><ul style="padding-left:16px;font-size:11px;color:var(--t2)">'+(ex.failureModes||[]).map(f=>'<li>'+esc(f)+'</li>').join('')+'</ul></div></div></div>';
+}
+
+// Strategy tabs
+async function fetchStratOpps(tab){
+  try{const d=await api('/api/strategy-opportunities?type='+(tab==='negrisk'?'negrisk_arb':'llm_probability'));
+    const el=document.getElementById(tab+'Content');
+    const items=d.opportunities||[];
+    if(!items.length){el.innerHTML='<div class="empty"><p>No opportunities yet. Create an agent or wait for next scan.</p></div>';return;}
+    el.innerHTML='<div class="tw"><table><thead><tr><th>Market</th><th>Edge%</th><th>Action</th><th>Confidence</th><th>Rationale</th></tr></thead><tbody>'+items.map(o=>'<tr><td class="mn">'+esc(o.title||'')+'</td><td class="'+(o.edgePct>=2?'edge-h':o.edgePct>=1?'edge-m':'edge-l')+'">'+(o.edgePct?.toFixed(2)||'?')+'%</td><td class="mono">'+esc(o.action||'')+'</td><td class="mono">'+(o.confidence?.toFixed(0)||'?')+'</td><td style="font-size:11px;color:var(--t2);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(o.rationaleSummary||'')+'</td></tr>').join('')+'</tbody></table></div>';
+  }catch(e){}}
+
+// Sentiment
+async function analyzeHeadlines(){
+  const text=document.getElementById('headlineBox').value.trim();if(!text){toast('Paste headlines first','error');return;}
+  const lines=text.split('\\n').filter(l=>l.trim());
+  try{const r=await post('/api/headlines',{headlines:lines});toast('Analyzing '+lines.length+' headlines...','info');
+    if(r.results){document.getElementById('sentimentResults').innerHTML=r.results.map(x=>'<div style="padding:10px;background:var(--bg2);border:1px solid var(--bd);border-radius:6px;margin-bottom:6px"><div style="font-weight:600;font-size:12px;margin-bottom:4px">'+esc(x.headline||'')+'</div><div style="font-size:11px;color:var(--t2)">Direction: <span style="color:'+(x.direction==='bullish_yes'?'var(--green)':x.direction==='bearish_yes'?'var(--red)':'var(--t3)')+'">'+esc(x.direction||'?')+'</span> | Confidence: '+((x.confidence||0)*100).toFixed(0)+'%</div>'+(x.impactedMarkets?.length?'<div style="font-size:10px;color:var(--t3);margin-top:4px">Markets: '+x.impactedMarkets.map(m=>esc(m)).join(', ')+'</div>':'')+(x.rationale?'<div style="font-size:10px;color:var(--t2);margin-top:4px;font-style:italic">'+esc(x.rationale)+'</div>':'')+'</div>').join('');}
+  }catch(e){toast('Failed','error');}
+}
+
+// Whales
+async function fetchWhaleData(){try{const d=await api('/api/whales');renderWhales(d);}catch(e){}}
+function renderWhales(d){
+  const wallets=d?.wallets||[],events=d?.events||[];
+  document.getElementById('whaleList').innerHTML=wallets.length?wallets.map(w=>'<div style="display:flex;gap:8px;align-items:center;padding:4px 0;font-size:11px"><span style="font-family:var(--mono);color:var(--cyan);font-weight:700">'+(w.alias||w.address.slice(0,8))+'</span><span class="mono">'+w.address.slice(0,10)+'...'+w.address.slice(-6)+'</span><button class="btn btn-sm btn-r" onclick="removeWhale(\\''+w.address+'\\')">x</button></div>').join(''):'<div style="font-size:11px;color:var(--t3);font-family:var(--mono)">No wallets tracked</div>';
+  document.getElementById('whaleEvents').innerHTML=events.length?events.slice(0,50).map(e=>'<div class="whale-event"><span class="we-alias">'+esc(e.alias||e.wallet?.slice(0,8)||'?')+'</span><span class="we-side '+(e.side==='YES'?'we-yes':'we-no')+'">'+esc(e.side||'?')+'</span><span style="flex:1;font-size:11px;color:var(--t2)">'+esc(e.market||'')+'</span><span class="mono" style="font-size:9px">'+new Date(e.timestamp).toLocaleTimeString()+'</span>'+(e.source==='stub'?'<span style="font-size:8px;color:var(--yellow);font-family:var(--mono)">[stub]</span>':'')+'</div>').join(''):'<div class="empty" style="padding:20px"><p>No events yet</p></div>';
+}
+async function addWhale(){const addr=document.getElementById('whaleAddr').value.trim(),alias=document.getElementById('whaleAlias').value.trim();if(!addr){toast('Enter address','error');return;}try{await post('/api/whales',{address:addr,alias:alias||addr.slice(0,8)});toast('Wallet added','success');document.getElementById('whaleAddr').value='';document.getElementById('whaleAlias').value='';fetchWhaleData();}catch(e){toast('Failed','error');}}
+async function removeWhale(addr){try{await post('/api/whales/remove',{address:addr});toast('Removed','info');fetchWhaleData();}catch(e){toast('Failed','error');}}
+
+// Health + Diagnostics
+async function runDiag(){try{const d=await api('/api/diagnostics');renderDiag(d.results||{});}catch(e){}}
+function renderDiag(r){
+  document.getElementById('diagGrid').innerHTML='<div class="tw" style="margin-bottom:10px">'+Object.entries(r).map(([k,v])=>'<div class="diag-item"><span class="diag-name">'+esc(k)+'</span><div><span class="diag-status ds-'+(v.status||'unknown')+'">'+esc(v.status||'?')+'</span> <span style="font-size:10px;color:var(--t3);margin-left:6px">'+esc(v.message||'')+'</span></div></div>').join('')+'</div>';
+}
+async function fetchAgentHealth(){try{const d=await api('/api/health');const ag=d.agents||{};document.getElementById('healthGrid').innerHTML=Object.entries(ag).map(([n,i])=>{const ago=Math.round((Date.now()-i.lastSeen)/1000);return '<div class="agent-card" style="margin-bottom:8px"><div class="ac-h"><span class="ac-name">'+esc(n)+'</span><span class="status-pill st-'+(i.status||'idle')+'">'+(i.status||'?')+'</span></div><div style="font-size:11px;color:var(--t3);font-family:var(--mono)">Last seen: '+ago+'s ago | Interval: '+(i.interval/1000)+'s</div></div>';}).join('');}catch(e){}}
+
+// Hub
+async function fetchSysStatus(){try{const d=await api('/api/system-status');renderHub(d);}catch(e){}}
+async function fetchActLog(){try{const d=await api('/api/activity-log');renderActFeed(d.log||[]);}catch(e){}}
+function renderHub(h){
+  let html='<div class="hub-card"><h3>System Overview</h3><p>ZVI v1 Fund OS. Scans prediction markets, runs strategy agents, surfaces opportunities with explainability.</p><div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px">'+[['Uptime',h.uptimeFormatted],['Mode',h.mode],['Data',h.dataSource],['Markets',h.marketsInCache],['Agents',h.agentsCount],['Approvals',h.pendingApprovals],['Scans',h.totalScans],['Kill Switch',h.killSwitch?'ON':'OFF']].map(([l,v])=>'<div style="padding:6px 8px;background:rgba(0,0,0,.2);border-radius:4px"><div style="font-size:8px;color:var(--t3);font-family:var(--mono);text-transform:uppercase">'+l+'</div><div style="font-size:14px;font-weight:700;font-family:var(--mono)">'+v+'</div></div>').join('')+'</div></div>';
+  html+='<div class="hub-card"><h3>Founder Status</h3><div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">'+[['Fund','$'+(h.founder?.fundSize||0).toLocaleString()],['Deployed','$'+(h.founder?.capitalDeployed||0).toLocaleString()],['Decisions',h.founder?.totalDecisions||0],['BUY/PASS',(h.founder?.buys||0)+'/'+(h.founder?.passes||0)]].map(([l,v])=>'<div style="padding:6px 8px;background:rgba(0,0,0,.2);border-radius:4px"><div style="font-size:8px;color:var(--t3);font-family:var(--mono);text-transform:uppercase">'+l+'</div><div style="font-size:14px;font-weight:700;font-family:var(--mono)">'+v+'</div></div>').join('')+'</div></div>';
+  html+='<div class="hub-card fw"><h3>Activity Log</h3><div class="act-feed" id="actFeed"><div style="color:var(--t3);font-size:11px;font-family:var(--mono)">Loading...</div></div></div>';
+  document.getElementById('hubGrid').innerHTML=html;fetchActLog();
+}
+function renderActFeed(log){const el=document.getElementById('actFeed');if(!el)return;if(!log.length){el.innerHTML='<div style="color:var(--t3);font-family:var(--mono);font-size:11px">No activity</div>';return;}el.innerHTML=log.slice(0,80).map(e=>'<div class="act-entry"><span class="act-time">'+new Date(e.timestamp).toLocaleTimeString()+'</span><span class="act-type at-'+e.type+'">'+esc(e.type)+'</span><span class="act-msg">'+esc(e.message)+'</span></div>').join('');}
+
+// Settings
+function renderSettings(){
+  api('/api/config').then(c=>{
+    let h='<div class="settings-section"><h3>API Connections</h3><div class="settings-grid">'+
+      sI('POLYMARKET_API_KEY','Polymarket API Key',c.secrets.polymarketClob,'password')+sI('POLYMARKET_API_SECRET','Polymarket Secret',c.secrets.polymarketClob,'password')+sI('POLYMARKET_API_PASSPHRASE','Polymarket Passphrase',c.secrets.polymarketClob,'password')+sI('POLYMARKET_PRIVATE_KEY','Wallet Private Key',c.secrets.polymarketPrivateKey,'password')+sI('ANTHROPIC_API_KEY','Anthropic Key',c.secrets.anthropicKey,'password')+sI('OPENAI_API_KEY','OpenAI Key',c.secrets.openaiKey,'password')+sI('XAI_API_KEY','xAI/Grok Key',c.secrets.xaiKey,'password')+sI('POLYGON_RPC_URL','Polygon RPC URL',c.secrets.polygonRpc,'text')+
+      '</div><div style="margin-top:10px"><button class="btn btn-p" onclick="saveKeys()">Save API Keys</button></div></div>';
+    h+='<div class="settings-section"><h3>Risk Limits</h3><div class="settings-grid">'+sN('MAX_EXPOSURE_PER_MARKET','Max Per Market ($)',c.riskLimits.maxExposurePerMarket)+sN('DAILY_MAX_EXPOSURE','Daily Max ($)',c.riskLimits.dailyMaxExposure)+sN('MIN_EDGE_THRESHOLD','Min Edge',c.riskLimits.minEdgeThreshold)+sN('MIN_DEPTH_USDC','Min Depth ($)',c.riskLimits.minDepthUsdc)+'</div><div style="margin-top:10px"><button class="btn btn-p" onclick="saveRiskLimits()">Save Limits</button></div></div>';
+    h+='<div class="settings-section"><h3>Trading Mode</h3><div class="settings-grid"><div class="set-item"><label>Mode</label><select id="set_mode"><option value="true" '+(c.mode==='OBSERVATION_ONLY'?'selected':'')+'>Observation Only</option><option value="false" '+(c.mode!=='OBSERVATION_ONLY'?'selected':'')+'>Live Trading</option></select></div></div><div style="margin-top:10px"><button class="btn btn-p" onclick="saveMode()">Save Mode</button></div></div>';
+    document.getElementById('settingsContent').innerHTML=h;
+  }).catch(()=>{document.getElementById('settingsContent').innerHTML='<div class="empty"><p>Failed to load</p></div>';});
+}
+function sI(k,l,ok,t){return '<div class="set-item"><label>'+l+' <span class="set-st '+(ok?'ok':'no')+'">'+(ok?'OK':'MISSING')+'</span></label><input type="'+t+'" id="set_'+k+'" placeholder="'+l+'..."></div>';}
+function sN(k,l,v){return '<div class="set-item"><label>'+l+'</label><input type="number" id="set_'+k+'" value="'+v+'" step="any"></div>';}
+async function saveKeys(){const ks=['POLYMARKET_API_KEY','POLYMARKET_API_SECRET','POLYMARKET_API_PASSPHRASE','POLYMARKET_PRIVATE_KEY','ANTHROPIC_API_KEY','OPENAI_API_KEY','XAI_API_KEY','POLYGON_RPC_URL'];const u={};ks.forEach(k=>{const el=document.getElementById('set_'+k);if(el?.value.trim())u[k]=el.value.trim();});if(!Object.keys(u).length){toast('Nothing to save','info');return;}try{const r=await post('/api/founder/update-env',u);if(r.ok){toast('Saved '+r.updated.length+' keys','success');ks.forEach(k=>{const el=document.getElementById('set_'+k);if(el)el.value='';});renderSettings();fetchBlockers();}}catch(e){toast('Failed','error');}}
+async function saveRiskLimits(){const u={};['MAX_EXPOSURE_PER_MARKET','DAILY_MAX_EXPOSURE','MIN_EDGE_THRESHOLD','MIN_DEPTH_USDC'].forEach(k=>{const el=document.getElementById('set_'+k);if(el)u[k]=el.value;});try{const r=await post('/api/founder/update-env',u);if(r.ok)toast('Saved','success');}catch(e){toast('Failed','error');}}
+async function saveMode(){const el=document.getElementById('set_mode');if(el)try{await post('/api/founder/update-env',{OBSERVATION_ONLY:el.value});toast('Mode saved. Restart for full effect.','success');loadCfg();}catch(e){toast('Failed','error');}}
+
+// Commander
+async function runCmd(){const inp=document.getElementById('cmdInput'),txt=inp.value.trim();if(!txt)return;inp.value='';document.getElementById('cmdOut').textContent='Running...';try{const r=await post('/api/command',{text:txt});document.getElementById('cmdOut').textContent=r.message||r.error||'Done';if(r.type==='created'||r.type==='kill')fetchAgents();}catch(e){document.getElementById('cmdOut').textContent='Error';}}
+
+// Countdown
+function startCountdown(){if(countdownInterval)clearInterval(countdownInterval);refreshCountdown=30;countdownInterval=setInterval(()=>{refreshCountdown--;const el=document.getElementById('rTimer');if(el)el.textContent=refreshCountdown+'s';if(refreshCountdown<=0){refreshCountdown=30;fetchOpps();}},1000);}
+
+// Init
+function init(){
+  loadCfg();renderAQ();renderFundBar();renderOpps();
+  fetchBlockers().catch(()=>{});fetchOpps().catch(()=>{});startCountdown();
+  setInterval(fetchBlockers,30000);setInterval(()=>{agents.length&&fetchAgents();},30000);
+  // Auto-run diagnostics on startup
+  setTimeout(()=>api('/api/diagnostics').catch(()=>{}),2000);
+}
+init();
 </script>
 </body>
 </html>`;
 }
 
-// ─── Route handler ───────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// API ROUTES
+// ═══════════════════════════════════════════════════════════════════════════════
+
 async function handleRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost:3000'}`);
   const method = req.method;
   const pathname = url.pathname;
 
-  // CORS preflight
   if (method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-    });
+    res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' });
     return res.end();
   }
 
   try {
-    // ── API routes ──
-    if (pathname === '/api/health' && method === 'GET') {
-      return json(res, {
-        status: 'ok',
-        uptime: process.uptime(),
-        timestamp: new Date().toISOString(),
-        mode: process.env.OBSERVATION_ONLY === 'true' ? 'OBSERVATION_ONLY' : 'LIVE',
-        agents: state.agentHeartbeats,
-      });
-    }
+    // Health
+    if (pathname === '/api/health' && method === 'GET') return jsonResp(res, { status: 'ok', uptime: process.uptime(), agents: store.agentHeartbeats });
 
+    // Opportunities
     if (pathname === '/api/opportunities' && method === 'GET') {
-      const opps = await fetchOpportunities();
-      return json(res, {
-        opportunities: opps,
-        count: opps.length,
-        fetchedAt: new Date(state.opportunityCache.fetchedAt).toISOString(),
-      });
+      const opps = await fetchMarkets();
+      return jsonResp(res, { opportunities: opps, count: opps.length });
     }
 
-    if (pathname === '/api/signals' && method === 'GET') {
-      return json(res, {
-        signals: state.signals,
-        thresholds: state.thresholds,
-      });
+    // Agents CRUD
+    if (pathname === '/api/agents' && method === 'GET') return jsonResp(res, { agents: store.agents });
+    if (pathname === '/api/agents' && method === 'POST') {
+      const body = await readBody(req);
+      const agent = createAgent(body);
+      // Run immediately
+      setTimeout(() => runAgent(agent.id).catch(() => {}), 100);
+      return jsonResp(res, { ok: true, agent });
+    }
+    if (pathname.startsWith('/api/agents/') && method === 'POST') {
+      const id = pathname.split('/')[3];
+      const body = await readBody(req);
+      const agent = updateAgent(id, body);
+      return agent ? jsonResp(res, { ok: true, agent }) : jsonResp(res, { error: 'Not found' }, 404);
+    }
+    if (pathname.startsWith('/api/agents/') && method === 'DELETE') {
+      const id = pathname.split('/')[3];
+      return jsonResp(res, { ok: deleteAgent(id) });
     }
 
+    // Approvals
+    if (pathname === '/api/approvals' && method === 'GET') return jsonResp(res, { approvals: store.approvalsQueue });
+    if (pathname.match(/^\/api\/approvals\/[^/]+\/approve$/) && method === 'POST') {
+      const id = pathname.split('/')[3];
+      const item = store.approvalsQueue.find(a => a.id === id);
+      if (!item) return jsonResp(res, { error: 'Not found' }, 404);
+      item.status = 'approved';
+      audit('info', 'approval_approved', { id, rationale: item.rationale });
+      logActivity('decision', 'Approved: ' + (item.payload?.title || item.rationale || ''));
+      // If in simulate mode, simulate; otherwise execute if live
+      const agent = store.agents.find(a => a.id === item.agentId);
+      if (agent && item.payload) {
+        const { canTrade } = canExecuteTrades();
+        if (canTrade && agent.config.mode === 'LIVE' && agent.config.allowLive) {
+          // Would execute real trade here
+          agent.stats.executed++;
+        } else {
+          // Simulate
+          audit('info', 'trade_simulated_on_approve', item.payload);
+        }
+      }
+      markDirty();
+      return jsonResp(res, { ok: true });
+    }
+    if (pathname.match(/^\/api\/approvals\/[^/]+\/reject$/) && method === 'POST') {
+      const id = pathname.split('/')[3];
+      const item = store.approvalsQueue.find(a => a.id === id);
+      if (!item) return jsonResp(res, { error: 'Not found' }, 404);
+      item.status = 'rejected';
+      audit('info', 'approval_rejected', { id });
+      logActivity('decision', 'Rejected: ' + (item.payload?.title || ''));
+      markDirty();
+      return jsonResp(res, { ok: true });
+    }
+
+    // Strategy opportunities
+    if (pathname === '/api/strategy-opportunities' && method === 'GET') {
+      const type = url.searchParams.get('type');
+      const opps = type ? store.strategyOpportunities.filter(o => o.strategyType === type) : store.strategyOpportunities;
+      return jsonResp(res, { opportunities: opps });
+    }
+
+    // Kill switch
+    if (pathname === '/api/kill-switch' && method === 'POST') {
+      const body = await readBody(req);
+      store.killSwitch = !!body.active;
+      if (store.killSwitch) { store.agents.forEach(a => { a.status = 'paused'; }); }
+      audit(store.killSwitch ? 'warn' : 'info', store.killSwitch ? 'kill_switch_on' : 'kill_switch_off', {});
+      logActivity('system', store.killSwitch ? 'KILL SWITCH ACTIVATED' : 'Kill switch off');
+      markDirty();
+      return jsonResp(res, { ok: true, killSwitch: store.killSwitch });
+    }
+
+    // Headlines
+    if (pathname === '/api/headlines' && method === 'POST') {
+      const body = await readBody(req);
+      const lines = body.headlines || [];
+      store.headlines = lines.map(t => ({ text: t, source: 'manual', ts: new Date().toISOString() }));
+      // Trigger sentiment agent if exists
+      const sentAgent = store.agents.find(a => a.strategyType === 'sentiment' && a.status === 'running');
+      let results = [];
+      if (sentAgent) {
+        const opps = await runAgent(sentAgent.id);
+        results = store.sentimentResults;
+      } else {
+        // Auto-create and run
+        const agent = createAgent({ strategyType: 'sentiment', name: 'sentiment-auto' });
+        await runAgent(agent.id);
+        results = store.sentimentResults;
+      }
+      return jsonResp(res, { ok: true, results, count: results.length });
+    }
+
+    // Whales
+    if (pathname === '/api/whales' && method === 'GET') {
+      return jsonResp(res, { wallets: store.whaleWallets, events: store.whaleEvents.slice(0, 50) });
+    }
+    if (pathname === '/api/whales' && method === 'POST') {
+      const body = await readBody(req);
+      if (!body.address) return jsonResp(res, { error: 'Address required' }, 400);
+      if (!store.whaleWallets.find(w => w.address === body.address)) {
+        store.whaleWallets.push({ address: body.address, alias: body.alias || body.address.slice(0, 8), addedAt: new Date().toISOString() });
+        markDirty();
+      }
+      return jsonResp(res, { ok: true, wallets: store.whaleWallets });
+    }
+    if (pathname === '/api/whales/remove' && method === 'POST') {
+      const body = await readBody(req);
+      store.whaleWallets = store.whaleWallets.filter(w => w.address !== body.address);
+      markDirty();
+      return jsonResp(res, { ok: true, wallets: store.whaleWallets });
+    }
+
+    // Diagnostics
+    if (pathname === '/api/diagnostics' && method === 'GET') {
+      const results = await runDiagnostics();
+      return jsonResp(res, { results, lastRun: store.diagnostics.lastRun });
+    }
+
+    // Commander
+    if (pathname === '/api/command' && method === 'POST') {
+      const body = await readBody(req);
+      const result = await parseCommand(body.text || '');
+      return jsonResp(res, result);
+    }
+
+    // Signals
+    if (pathname === '/api/signals' && method === 'GET') return jsonResp(res, { signals: store.signals, thresholds: store.thresholds });
     if (pathname === '/api/signals/thresholds' && method === 'POST') {
       const body = await readBody(req);
-      const { symbol, thresholdPrice, direction } = body;
-
-      if (!symbol || typeof thresholdPrice !== 'number' || !['above', 'below'].includes(direction)) {
-        return json(res, { error: 'Invalid threshold. Requires: symbol, thresholdPrice (number), direction (above|below)' }, 400);
-      }
-
-      state.thresholds.push({
-        id: crypto.randomUUID(),
-        symbol,
-        thresholdPrice,
-        direction,
-        createdAt: new Date().toISOString(),
-      });
-
-      return json(res, { ok: true, thresholds: state.thresholds });
+      store.thresholds.push({ id: crypto.randomUUID(), symbol: body.symbol, thresholdPrice: body.thresholdPrice, direction: body.direction, createdAt: new Date().toISOString() });
+      return jsonResp(res, { ok: true, thresholds: store.thresholds });
     }
-
     if (pathname === '/api/price-update' && method === 'POST') {
       const body = await readBody(req);
-      const { symbol, price } = body;
-
-      if (!symbol || typeof price !== 'number') {
-        return json(res, { error: 'Invalid. Requires: symbol, price (number)' }, 400);
-      }
-
-      const triggered = checkThresholds(symbol, price);
-      return json(res, {
-        ok: true,
-        symbol,
-        price,
-        thresholdsChecked: state.thresholds.length,
-        triggered,
-      });
+      const triggered = checkThresholds(body.symbol, body.price);
+      return jsonResp(res, { ok: true, triggered });
     }
 
-    if (pathname === '/api/config' && method === 'GET') {
-      return json(res, getConfig());
-    }
-
-    // ── System Status & Activity Log ──
-    if (pathname === '/api/system-status' && method === 'GET') {
-      return json(res, getSystemStatus());
-    }
-
-    if (pathname === '/api/activity-log' && method === 'GET') {
-      const limit = parseInt(url.searchParams.get('limit')) || 100;
-      return json(res, { log: activityLog.slice(0, limit), total: activityLog.length });
-    }
-
-    // ── Settings ──
-    if (pathname === '/api/settings' && method === 'GET') {
-      return json(res, state.settings);
-    }
-
+    // Config
+    if (pathname === '/api/config' && method === 'GET') return jsonResp(res, getConfig());
+    if (pathname === '/api/system-status' && method === 'GET') return jsonResp(res, getSystemStatus());
+    if (pathname === '/api/activity-log' && method === 'GET') return jsonResp(res, { log: activityLog.slice(0, 100), total: activityLog.length });
+    if (pathname === '/api/settings' && method === 'GET') return jsonResp(res, store.settings);
     if (pathname === '/api/settings' && method === 'POST') {
       const body = await readBody(req);
-      if (body.marketLimit !== undefined) state.settings.marketLimit = Math.max(10, Math.min(5000, parseInt(body.marketLimit) || 200));
-      if (body.refreshInterval !== undefined) state.settings.refreshInterval = Math.max(10, Math.min(300, parseInt(body.refreshInterval) || 30));
-      if (body.scanMode !== undefined && ['volume', 'newest', 'ending-soon'].includes(body.scanMode)) state.settings.scanMode = body.scanMode;
-      if (body.minEdgeDisplay !== undefined) state.settings.minEdgeDisplay = parseFloat(body.minEdgeDisplay) || 0;
-      logActivity('config', 'Settings updated: ' + JSON.stringify(state.settings));
-      return json(res, { ok: true, settings: state.settings });
+      if (body.marketLimit !== undefined) store.settings.marketLimit = Math.max(10, Math.min(5000, parseInt(body.marketLimit) || 200));
+      if (body.refreshInterval !== undefined) store.settings.refreshInterval = Math.max(10, Math.min(300, parseInt(body.refreshInterval) || 30));
+      if (body.scanMode !== undefined) store.settings.scanMode = body.scanMode;
+      return jsonResp(res, { ok: true, settings: store.settings });
     }
-
-    // ── Env file updater ──
     if (pathname === '/api/founder/update-env' && method === 'POST') {
       const body = await readBody(req);
-      const result = updateEnvFile(body);
-      return json(res, result, result.ok ? 200 : 400);
+      return jsonResp(res, updateEnvFile(body));
     }
-
-    // ── Founder Blocker / Action Queue ──
-    if (pathname === '/api/blockers' && method === 'GET') {
-      return json(res, getBlockers());
-    }
-
+    if (pathname === '/api/blockers' && method === 'GET') return jsonResp(res, getBlockers());
     if (pathname === '/api/founder/set-capital' && method === 'POST') {
       const body = await readBody(req);
       const size = parseInt(body.fundSize);
-      if (!size || size < 100) {
-        return json(res, { error: 'Fund size must be >= $100' }, 400);
-      }
-      state.founder.fundSize = size;
-      state.founder.capitalAllocated = true;
-      if (!state.founder.completedSteps.includes('capital')) {
-        state.founder.completedSteps.push('capital');
-      }
-      logActivity('config', 'Fund capital set: $' + size.toLocaleString());
-      return json(res, { ok: true, fundSize: size, blockers: getBlockers() });
+      if (!size || size < 100) return jsonResp(res, { error: 'Min $100' }, 400);
+      store.founder.fundSize = size;
+      store.founder.capitalAllocated = true;
+      logActivity('config', 'Fund capital: $' + size.toLocaleString());
+      markDirty();
+      return jsonResp(res, { ok: true, blockers: getBlockers() });
     }
-
     if (pathname === '/api/founder/approve-risks' && method === 'POST') {
-      state.founder.risksApproved = true;
-      if (!state.founder.completedSteps.includes('risks')) {
-        state.founder.completedSteps.push('risks');
-      }
+      store.founder.risksApproved = true;
       logActivity('config', 'Risk limits approved');
-      return json(res, { ok: true, blockers: getBlockers() });
+      markDirty();
+      return jsonResp(res, { ok: true, blockers: getBlockers() });
     }
-
     if (pathname === '/api/founder/decide' && method === 'POST') {
       const body = await readBody(req);
       const { marketId, verdict, market } = body;
-      if (!marketId || !['BUY', 'PASS'].includes(verdict)) {
-        return json(res, { error: 'Requires marketId and verdict (BUY|PASS)' }, 400);
-      }
-      state.founder.decisions[marketId] = {
-        verdict,
-        market: market || '',
-        timestamp: new Date().toISOString(),
-      };
+      if (!marketId || !['BUY', 'PASS'].includes(verdict)) return jsonResp(res, { error: 'Invalid' }, 400);
+      store.founder.decisions[marketId] = { verdict, market: market || '', timestamp: new Date().toISOString() };
       logActivity('decision', verdict + ': ' + (market || marketId));
-      // If BUY, compute position recommendation
       let position = null;
       if (verdict === 'BUY') {
-        const opp = state.opportunityCache.data.find(o => o.id === marketId);
-        if (opp) {
-          position = recommendPosition(opp);
-          state.founder.positions[marketId] = {
-            side: 'YES',
-            recommendedSize: position.size,
-            entryEdge: opp.edge,
-            timestamp: new Date().toISOString(),
-          };
-          state.founder.capitalDeployed += position.size;
-        }
+        const opp = store.marketCache.data.find(o => o.id === marketId);
+        if (opp) { position = recommendPosition(opp); store.founder.capitalDeployed += position.size; }
       }
-      return json(res, {
-        ok: true,
-        marketId,
-        verdict,
-        position,
-        decisions: state.founder.decisions,
-        capitalDeployed: state.founder.capitalDeployed,
-      });
+      markDirty();
+      return jsonResp(res, { ok: true, position, decisions: store.founder.decisions, capitalDeployed: store.founder.capitalDeployed });
     }
 
-    // ── Dashboard ──
+    // Audit log
+    if (pathname === '/api/audit-log' && method === 'GET') {
+      const limit = parseInt(url.searchParams.get('limit')) || 100;
+      return jsonResp(res, { log: store.auditLog.slice(-limit).reverse() });
+    }
+
+    // Trade execution
+    if (pathname === '/api/trade/order' && method === 'POST') {
+      const body = await readBody(req);
+      const result = await createClobOrder(body);
+      return jsonResp(res, result);
+    }
+    if (pathname === '/api/trade/cancel' && method === 'POST') {
+      const body = await readBody(req);
+      const result = await cancelClobOrder(body.orderId);
+      return jsonResp(res, result);
+    }
+    if (pathname === '/api/trade/orders' && method === 'GET') {
+      const orders = await fetchOpenOrders();
+      return jsonResp(res, { orders });
+    }
+
+    // Dashboard
     if (pathname === '/' || pathname === '/index.html') {
       const html = dashboardHTML();
-      res.writeHead(200, {
-        'Content-Type': 'text/html; charset=utf-8',
-        'Content-Length': Buffer.byteLength(html),
-        'Cache-Control': 'no-store',
-      });
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': Buffer.byteLength(html), 'Cache-Control': 'no-store' });
       return res.end(html);
     }
 
-    // ── 404 ──
-    json(res, { error: 'Not found', path: pathname }, 404);
-
+    jsonResp(res, { error: 'Not found', path: pathname }, 404);
   } catch (err) {
-    console.error('[server] Request error:', err);
-    json(res, { error: 'Internal server error', message: err.message }, 500);
+    console.error('[server] Error:', err);
+    jsonResp(res, { error: 'Internal error', message: err.message }, 500);
   }
 }
 
-// ─── Server startup ──────────────────────────────────────────────────────────
-const PORT = parseInt(process.env.PORT) || 3000;
+// ═══════════════════════════════════════════════════════════════════════════════
+// SERVER STARTUP
+// ═══════════════════════════════════════════════════════════════════════════════
 
+const PORT = parseInt(process.env.PORT) || 3000;
 const server = http.createServer(handleRequest);
 
 server.listen(PORT, () => {
   logActivity('system', 'Server started on port ' + PORT);
+  startAgentScheduler();
+  // Auto-run diagnostics
+  setTimeout(() => runDiagnostics().catch(() => {}), 3000);
   console.log('');
-  console.log('  ╔══════════════════════════════════════════════╗');
-  console.log('  ║   ZVI v1 — Fund Operating System Dashboard   ║');
-  console.log('  ╠══════════════════════════════════════════════╣');
-  console.log(`  ║   http://localhost:${PORT}                      ║`);
-  console.log('  ║   Mode: ' + (process.env.OBSERVATION_ONLY === 'true' ? 'OBSERVATION ONLY' : 'LIVE') + '                       ║');
-  console.log('  ║   Node: ' + process.version + '                          ║');
-  console.log('  ╚══════════════════════════════════════════════╝');
+  console.log('  ╔══════════════════════════════════════════════════════════════╗');
+  console.log('  ║   ZVI v1 — Fund Operating System                           ║');
+  console.log('  ╠══════════════════════════════════════════════════════════════╣');
+  console.log(`  ║   http://localhost:${PORT}                                    ║`);
+  console.log('  ║   Mode: ' + (process.env.OBSERVATION_ONLY === 'true' ? 'OBSERVATION ONLY' : 'LIVE') + '                                         ║');
+  console.log('  ║   Strategies: NegRisk Arb | LLM Prob | Sentiment | Whales  ║');
+  console.log('  ║   Agents: ' + store.agents.length + ' loaded | Kill Switch: ' + (store.killSwitch ? 'ON' : 'OFF') + '                       ║');
+  console.log('  ╚══════════════════════════════════════════════════════════════╝');
   console.log('');
-  console.log('  Secrets loaded:');
-  console.log('    Polygon RPC:  ' + (process.env.POLYGON_RPC_URL ? 'YES' : 'NO'));
-  console.log('    Anthropic:    ' + (process.env.ANTHROPIC_API_KEY ? 'YES' : 'NO'));
-  console.log('    Polymarket:   ' + (process.env.POLYMARKET_GAMMA_URL ? 'YES' : 'NO'));
+  console.log('  Keys: Polygon=' + (process.env.POLYGON_RPC_URL ? 'YES' : 'NO') + ' Anthropic=' + (process.env.ANTHROPIC_API_KEY ? 'YES' : 'NO') + ' Polymarket=' + (process.env.POLYMARKET_API_KEY ? 'YES' : 'NO') + ' xAI=' + (process.env.XAI_API_KEY ? 'YES' : 'NO'));
   console.log('');
 });
 
 server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(`[fatal] Port ${PORT} is already in use. Kill the existing process or set PORT env var.`);
-    process.exit(1);
-  }
-  console.error('[fatal] Server error:', err);
-  process.exit(1);
+  if (err.code === 'EADDRINUSE') { console.error(`[fatal] Port ${PORT} in use`); process.exit(1); }
+  console.error('[fatal]', err); process.exit(1);
 });
 
-// Graceful shutdown
-process.on('SIGINT', () => {
-  console.log('\n[shutdown] Received SIGINT, shutting down...');
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 3000);
-});
-
-process.on('SIGTERM', () => {
-  console.log('\n[shutdown] Received SIGTERM, shutting down...');
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 3000);
-});
+process.on('SIGINT', () => { console.log('\n[shutdown] Saving state...'); saveState(); server.close(() => process.exit(0)); setTimeout(() => process.exit(1), 3000); });
+process.on('SIGTERM', () => { console.log('\n[shutdown] Saving state...'); saveState(); server.close(() => process.exit(0)); setTimeout(() => process.exit(1), 3000); });
