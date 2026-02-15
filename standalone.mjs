@@ -1264,7 +1264,7 @@ function dashboardHTML() {
   const cfg = getConfig();
   const initialBlockers = getBlockers();
   const initialOpps = getDemoOpportunities();
-  const EMBEDDED = JSON.stringify({ blockers: initialBlockers, opportunities: initialOpps, agents: store.agents, approvals: store.approvalsQueue.filter(a => a.status === 'pending'), killSwitch: store.killSwitch });
+  const EMBEDDED = JSON.stringify({ blockers: initialBlockers, opportunities: initialOpps, agents: store.agents, approvals: store.approvalsQueue.filter(a => a.status === 'pending'), killSwitch: store.killSwitch }).replace(/<\//g, '<\\/');
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1722,12 +1722,17 @@ async function runCmd(){const inp=document.getElementById('cmdInput'),txt=inp.va
 function startCountdown(){if(countdownInterval)clearInterval(countdownInterval);refreshCountdown=30;countdownInterval=setInterval(()=>{refreshCountdown--;const el=document.getElementById('rTimer');if(el)el.textContent=refreshCountdown+'s';if(refreshCountdown<=0){refreshCountdown=30;fetchOpps();}},1000);}
 
 // Init
+window.onerror=function(msg,src,line,col,err){document.getElementById('oppTable').innerHTML='<div class="empty" style="color:var(--red)"><p>JS Error: '+msg+'</p><p style="font-size:10px">'+src+':'+line+':'+col+'</p></div>';};
 function init(){
-  loadCfg();renderAQ();renderFundBar();renderOpps();
-  fetchBlockers().catch(()=>{});fetchOpps().catch(()=>{});startCountdown();
-  setInterval(fetchBlockers,30000);setInterval(()=>{agents.length&&fetchAgents();},30000);
-  // Auto-run diagnostics on startup
-  setTimeout(()=>api('/api/diagnostics').catch(()=>{}),2000);
+  try{
+    loadCfg();renderAQ();renderFundBar();renderOpps();
+    fetchBlockers().catch(()=>{});fetchOpps().catch(()=>{});startCountdown();
+    setInterval(fetchBlockers,30000);setInterval(()=>{agents.length&&fetchAgents();},30000);
+    setTimeout(()=>api('/api/diagnostics').catch(()=>{}),2000);
+  }catch(e){
+    console.error('[init]',e);
+    document.getElementById('oppTable').innerHTML='<div class="empty" style="color:var(--red)"><p>Init error: '+e.message+'</p></div>';
+  }
 }
 init();
 </script>
