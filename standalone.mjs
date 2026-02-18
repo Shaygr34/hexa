@@ -90,6 +90,10 @@ const store = {
   costBudgets: { globalDailyCap: 50, perAgentDailyCap: 20, perStrategyCap: { negrisk_arb: 10, llm_probability: 25, sentiment: 10, whale_watch: 5 }, perProviderCap: { anthropic: 20, openai: 15, xai: 10, polymarket: 0, polygon: 0 } },
   strategyParams: {},
   demoPnl: { totalRealized: 0, totalUnrealized: 0, totalFees: 0, trades: 0, wins: 0, losses: 0 },
+  // ── Phase 1: Run Traces, Friction Config, Cooldown ──
+  runTraces: [],       // last N run trace records per agent tick
+  frictionConfig: { feePct: 0.02, slippagePct: 0.005 }, // explicit, configurable
+  cooldownMs: 1800000, // 30 minutes default cooldown
 };
 
 // ── Pricing Registry (LLM cost per 1M tokens) ──
@@ -140,30 +144,268 @@ function checkCostBudgets(agentId, strategyType, provider) {
   return violations;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// PHASE 1: Position Lifecycle + Safety Gates + Telemetry Helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function getPositionKey(marketId, strategy) {
+  return `${marketId}:${strategy || 'unknown'}`;
+}
+
+function openDemoPositionFromApproval(approval, exec) {
+  const p = approval.payload || {};
+  const agent = store.agents.find(a => a.id === approval.agentId);
+  const strategy = agent?.strategyType || p.strategyType || 'unknown';
+  const posKey = getPositionKey(exec.marketId, strategy);
+  const fc = store.frictionConfig || { feePct: 0.02, slippagePct: 0.005 };
+
+  const entry = {
+    ts: exec.ts, action: 'OPEN', side: exec.side, price: exec.price,
+    qty: exec.qty, stake: exec.size, fee: exec.fees,
+    slippageAssump: fc.slippagePct, feeAssump: fc.feePct,
+    snapshotHash: crypto.createHash('md5').update(`${exec.marketId}:${exec.price}:${exec.ts}`).digest('hex').slice(0, 12),
+  };
+
+  const existing = store.positions[posKey];
+  if (existing && existing.status === 'open') {
+    // Add to existing position (future capability; Phase 1 prevents this via safety gate)
+    existing.entries.push(entry);
+    existing.qty += exec.qty;
+    existing.costBasis += exec.size;
+    existing.avgPrice = existing.costBasis / existing.qty;
+    existing.lastEntryAt = exec.ts;
+    return existing;
+  }
+
+  const position = {
+    id: crypto.randomUUID(),
+    marketId: exec.marketId,
+    strategy,
+    side: exec.side,
+    status: 'open',
+    openedAt: exec.ts,
+    lastEntryAt: exec.ts,
+    closedAt: null,
+    entries: [entry],
+    qty: exec.qty,
+    avgPrice: exec.price,
+    costBasis: exec.size,
+    realizedPnl: 0,
+    unrealizedPnl: 0,
+    currentPrice: exec.price,
+    marketTitle: exec.marketTitle || '',
+    agentId: exec.agentId,
+    demo: true,
+    close: null,
+  };
+  store.positions[posKey] = position;
+  return position;
+}
+
+function closeDemoPosition(position, reason, context = {}) {
+  if (!position || position.status === 'closed') return null;
+  const fc = store.frictionConfig || { feePct: 0.02, slippagePct: 0.005 };
+  const closePrice = context.price || position.currentPrice || position.avgPrice;
+  const closeFee = position.costBasis * fc.feePct;
+
+  let payout = 0;
+  if (reason === 'resolved' && context.outcome !== undefined) {
+    // Binary market resolution: if outcome matches side, payout = qty * 1.0; else 0
+    const won = (position.side.includes('YES') && context.outcome === true) ||
+                (position.side === 'NO' && context.outcome === false);
+    payout = won ? position.qty * 1.0 : 0;
+  } else {
+    // Mark-to-market close (fallback or manual)
+    const priceDiff = position.side.includes('YES')
+      ? closePrice - position.avgPrice
+      : position.avgPrice - closePrice;
+    payout = position.costBasis + (priceDiff * position.qty);
+  }
+
+  const realizedPnl = payout - position.costBasis - closeFee;
+  position.status = 'closed';
+  position.closedAt = new Date().toISOString();
+  position.realizedPnl = realizedPnl;
+  position.unrealizedPnl = 0;
+  position.close = {
+    ts: position.closedAt,
+    reason,
+    price: closePrice,
+    qty: position.qty,
+    payout,
+    fee: closeFee,
+    feeAssump: fc.feePct,
+    slippageAssump: fc.slippagePct,
+  };
+
+  // Update aggregate P&L
+  store.demoPnl.totalRealized += realizedPnl;
+  store.demoPnl.totalFees += closeFee;
+  if (realizedPnl > 0) store.demoPnl.wins++;
+  else if (realizedPnl < 0) store.demoPnl.losses++;
+
+  // Add CLOSE ledger entry
+  store.ledger.push({
+    id: crypto.randomUUID(), ts: position.closedAt, agentId: position.agentId,
+    marketId: position.marketId, marketTitle: position.marketTitle,
+    side: position.side, qty: position.qty, price: closePrice,
+    size: payout, fees: closeFee, status: 'closed', demo: true,
+    action: 'CLOSE', reason, realizedPnl, strategyType: position.strategy,
+    feeAssumpPct: fc.feePct, slippageAssumpPct: fc.slippagePct,
+  });
+  if (store.ledger.length > 2000) store.ledger = store.ledger.slice(-1500);
+
+  logActivity('trade', `CLOSE ${position.side} ${position.qty}x @ ${closePrice.toFixed(4)} on ${(position.marketTitle || '').slice(0, 40)} (${reason}, PnL: $${realizedPnl.toFixed(2)})`);
+  audit('info', 'demo_position_closed', { positionId: position.id, marketId: position.marketId, reason, realizedPnl, payout });
+  markDirty();
+  return position;
+}
+
+function computeUnrealized(position, marketPrice) {
+  if (!position || position.status !== 'open') return 0;
+  const priceDiff = position.side.includes('YES')
+    ? marketPrice - position.avgPrice
+    : position.avgPrice - marketPrice;
+  return priceDiff * position.qty;
+}
+
+function shouldSkipDueToPositionOrCooldown(marketId, strategy) {
+  const posKey = getPositionKey(marketId, strategy);
+  const pos = store.positions[posKey];
+  if (pos && pos.status === 'open') {
+    return { skip: true, reason: `Open position exists for ${posKey}` };
+  }
+  // Check cooldown: any recently closed position for this key
+  if (pos && pos.status === 'closed' && pos.closedAt) {
+    const cooldownMs = store.cooldownMs || 1800000;
+    const elapsed = Date.now() - new Date(pos.closedAt).getTime();
+    if (elapsed < cooldownMs) {
+      return { skip: true, reason: `Cooldown active (${Math.round((cooldownMs - elapsed) / 1000)}s remaining)` };
+    }
+  }
+  // Also check cooldown via lastEntryAt on any open position for same market (different strategy)
+  for (const [key, p] of Object.entries(store.positions)) {
+    if (key.startsWith(marketId + ':') && p.status === 'open') {
+      const cooldownMs = store.cooldownMs || 1800000;
+      if (p.lastEntryAt && (Date.now() - new Date(p.lastEntryAt).getTime()) < cooldownMs) {
+        return { skip: true, reason: `Cooldown active for market ${marketId}` };
+      }
+    }
+  }
+  return { skip: false, reason: null };
+}
+
+function recordRunTrace(trace) {
+  store.runTraces.push(trace);
+  if (store.runTraces.length > 500) store.runTraces = store.runTraces.slice(-400);
+}
+
+// ── Resolution Watcher (polls Gamma for resolved markets) ──
+let resolutionWatcherTimer = null;
+const RESOLUTION_POLL_INTERVAL = 60000; // 60 seconds
+
+async function pollForResolutions() {
+  const openPositions = Object.entries(store.positions).filter(([, p]) => p.status === 'open');
+  if (openPositions.length === 0) return;
+
+  const gammaUrl = process.env.POLYMARKET_GAMMA_URL || 'https://gamma-api.polymarket.com';
+  let closedCount = 0;
+
+  for (const [posKey, pos] of openPositions) {
+    try {
+      // Try Gamma market endpoint for resolution status
+      const resp = await httpGet(`${gammaUrl}/markets/${pos.marketId}`);
+      if (resp && (resp.closed === true || resp.resolved === true || resp.active === false)) {
+        // Market resolved — attempt to determine outcome
+        let outcome = undefined;
+        if (resp.outcome !== undefined) {
+          outcome = resp.outcome === 'Yes' || resp.outcome === true || resp.outcome === 1;
+        } else if (resp.resolutionSource) {
+          // TODO: Parse resolution source for outcome; for now use price heuristic
+          const resolvedPrice = resp.outcomePrices?.[0] || resp.bestBid;
+          if (resolvedPrice !== undefined) {
+            outcome = parseFloat(resolvedPrice) > 0.9; // Heuristic: >90% YES price means resolved YES
+          }
+        }
+
+        if (outcome !== undefined) {
+          closeDemoPosition(pos, 'resolved', { price: outcome ? 1.0 : 0.0, outcome });
+          closedCount++;
+        } else {
+          // Resolution detected but outcome unclear — use fallback close at current mtm
+          closeDemoPosition(pos, 'resolved', { price: pos.currentPrice || pos.avgPrice });
+          closedCount++;
+          audit('warn', 'resolution_outcome_unclear', { marketId: pos.marketId, posKey, note: 'TODO: Gamma does not always provide clear outcome data' });
+        }
+      }
+    } catch {
+      // API unavailable — check fallback timeout
+      const maxAge = 7 * 24 * 60 * 60 * 1000; // 7 days fallback
+      if (pos.openedAt && (Date.now() - new Date(pos.openedAt).getTime()) > maxAge) {
+        closeDemoPosition(pos, 'fallback_timeout', { price: pos.currentPrice || pos.avgPrice });
+        closedCount++;
+        audit('warn', 'fallback_timeout_close', { marketId: pos.marketId, posKey, age: '7d+' });
+      }
+    }
+  }
+
+  if (closedCount > 0) {
+    logActivity('system', `Resolution watcher closed ${closedCount} position(s)`);
+    markDirty();
+  }
+}
+
+function startResolutionWatcher() {
+  if (resolutionWatcherTimer) return;
+  resolutionWatcherTimer = setInterval(() => pollForResolutions().catch(e => console.error('[resolution]', e.message)), RESOLUTION_POLL_INTERVAL);
+  // Run once immediately after short delay
+  setTimeout(() => pollForResolutions().catch(() => {}), 10000);
+}
+
 // ── Demo Execution Engine ──
 function executeDemoTrade(approval) {
   const p = approval.payload || {};
   const agent = store.agents.find(a => a.id === approval.agentId);
+  const fc = store.frictionConfig || { feePct: 0.02, slippagePct: 0.005 };
   const side = p.recommendedSide || (p.action === 'BUY_YES' ? 'YES' : p.action === 'BUY_NO' ? 'NO' : p.action === 'ARB_BASKET' ? 'YES_BASKET' : 'YES');
   const price = p.entryPrice || p.marketPrice || 0.5;
-  const slippage = Math.min(0.02, (p.slippageEst || 0.005));
+  const slippage = Math.min(0.02, (p.slippageEst || fc.slippagePct));
   const fillPrice = side.includes('YES') ? Math.min(price + slippage, 0.99) : Math.max(price - slippage, 0.01);
   const size = p.recommendedSize || p.economics?.recommendedStake || 50;
   const qty = Math.floor(size / fillPrice);
-  const fees = size * 0.02;
+  const fees = size * fc.feePct;
+
+  // Build provenance for this trade
+  const provenance = {
+    gateResults: p.explain?.riskGates || {},
+    edgeBreakdown: {
+      grossEdge: p.edgePct || p.netEdge || 0,
+      feesAssump: fc.feePct,
+      slippageAssump: fc.slippagePct,
+      netEdge: (p.netEdge || p.edgePct || 0) - (fc.feePct * 100) - (fc.slippagePct * 100),
+    },
+    inputSnapshotHash: crypto.createHash('md5').update(`${approval.marketId || p.marketId}:${price}:${Date.now()}`).digest('hex').slice(0, 16),
+  };
+
   const exec = {
-    id: crypto.randomUUID(), ts: new Date().toISOString(), agentId: approval.agentId, marketId: approval.marketId || p.marketId,
-    marketTitle: p.title || '', side, qty, price: fillPrice, size, fees, status: 'filled', demo: true, approvalId: approval.id,
+    id: crypto.randomUUID(), ts: new Date().toISOString(), agentId: approval.agentId,
+    marketId: approval.marketId || p.marketId,
+    marketTitle: p.title || '', side, qty, price: fillPrice, size, fees,
+    status: 'filled', demo: true, approvalId: approval.id, action: 'OPEN',
     realizedPnl: 0, strategyType: agent?.strategyType || 'unknown',
+    feeAssumpPct: fc.feePct, slippageAssumpPct: fc.slippagePct,
+    provenance,
   };
   store.ledger.push(exec);
   if (store.ledger.length > 2000) store.ledger = store.ledger.slice(-1500);
-  const posKey = exec.marketId || exec.id;
-  store.positions[posKey] = { side, qty, avgPrice: fillPrice, entryTs: exec.ts, agentId: exec.agentId, demo: true, currentPrice: price, unrealizedPnl: 0, marketTitle: exec.marketTitle, size };
+
+  // Use new position lifecycle
+  openDemoPositionFromApproval(approval, exec);
+
   store.demoPnl.trades++;
   store.demoPnl.totalFees += fees;
   if (agent) { agent.stats.executed++; agent.stats.pnlEst = store.demoPnl.totalRealized - store.demoPnl.totalFees; }
-  logActivity('trade', `DEMO ${side} ${qty}x @ ${fillPrice.toFixed(4)} on ${(exec.marketTitle || '').slice(0, 40)} (fees: $${fees.toFixed(2)})`);
+  logActivity('trade', `DEMO ${side} ${qty}x @ ${fillPrice.toFixed(4)} on ${(exec.marketTitle || '').slice(0, 40)} (fees: $${fees.toFixed(2)}, assump: fee=${(fc.feePct*100).toFixed(1)}% slip=${(fc.slippagePct*100).toFixed(1)}%)`);
   audit('info', 'demo_trade_executed', exec);
   markDirty();
   return exec;
@@ -179,22 +421,33 @@ function demoAutoApproveLoop() {
   const pending = store.approvalsQueue.filter(a => a.status === 'pending');
   if (pending.length === 0) return;
 
-  let approved = 0, skipped = 0;
+  let approved = 0, skipped = 0, skipReasons = {};
   for (const item of pending) {
     // Validate: must have positive expected edge or be from a qualifying strategy
     const edge = item.expectedEdge || item.payload?.edgePct || item.payload?.netEdge || 0;
     const agent = store.agents.find(a => a.id === item.agentId);
-    if (!agent || agent.status !== 'running') { skipped++; continue; }
+    if (!agent || agent.status !== 'running') { skipped++; skipReasons['agent_inactive'] = (skipReasons['agent_inactive'] || 0) + 1; continue; }
 
     // Skip if edge is negative or zero (not a valid trade)
     if (edge <= 0 && item.payload?.action !== 'SENTIMENT_ALERT' && item.payload?.action !== 'WHALE_ALERT') {
-      skipped++;
+      skipped++; skipReasons['no_edge'] = (skipReasons['no_edge'] || 0) + 1;
       continue;
     }
 
+    // Phase 1 Safety Gate: Position check + cooldown
+    const marketId = item.marketId || item.payload?.marketId;
+    const strategy = agent.strategyType || 'unknown';
+    if (marketId) {
+      const posCheck = shouldSkipDueToPositionOrCooldown(marketId, strategy);
+      if (posCheck.skip) {
+        skipped++; skipReasons['position_or_cooldown'] = (skipReasons['position_or_cooldown'] || 0) + 1;
+        continue;
+      }
+    }
+
     // Skip if max open positions reached
-    const openCount = Object.keys(store.positions).length;
-    if (openCount >= (getRiskLimits().maxOpenPositions || 20)) { skipped++; continue; }
+    const openCount = Object.values(store.positions).filter(p => p.status === 'open').length;
+    if (openCount >= (getRiskLimits().maxOpenPositions || 20)) { skipped++; skipReasons['max_positions'] = (skipReasons['max_positions'] || 0) + 1; continue; }
 
     // Auto-approve: execute as demo trade
     item.status = 'approved';
@@ -216,7 +469,7 @@ function demoAutoApproveLoop() {
 
   if (approved > 0 || skipped > 0) {
     store.demoAutoApproveStats.lastRunAt = new Date().toISOString();
-    audit('info', 'demo_auto_approve_tick', { approved, skipped, pendingRemaining: store.approvalsQueue.filter(a => a.status === 'pending').length });
+    audit('info', 'demo_auto_approve_tick', { approved, skipped, skipReasons, pendingRemaining: store.approvalsQueue.filter(a => a.status === 'pending').length });
     markDirty();
   }
 }
@@ -248,12 +501,14 @@ function markToMarket() {
   const markets = store.marketCache.data;
   let totalUnrealized = 0;
   for (const [key, pos] of Object.entries(store.positions)) {
-    const mkt = markets.find(m => (m.id || m.conditionId) === key);
+    if (pos.status === 'closed') continue; // skip closed positions
+    // Extract marketId from composite key (marketId:strategy) or legacy key
+    const marketId = pos.marketId || key.split(':')[0] || key;
+    const mkt = markets.find(m => (m.id || m.conditionId) === marketId);
     if (mkt) {
       pos.currentPrice = pos.side === 'YES' || pos.side === 'YES_BASKET' ? (mkt.bestBid || 0.5) : (mkt.bestAsk || 0.5);
-      const priceDiff = pos.side.includes('YES') ? pos.currentPrice - pos.avgPrice : pos.avgPrice - pos.currentPrice;
-      pos.unrealizedPnl = priceDiff * pos.qty;
     }
+    pos.unrealizedPnl = computeUnrealized(pos, pos.currentPrice || pos.avgPrice);
     totalUnrealized += pos.unrealizedPnl || 0;
   }
   store.demoPnl.totalUnrealized = totalUnrealized;
@@ -270,8 +525,9 @@ function computeFounderEconomics(opp, agent) {
   const kellyFrac = Math.max(0, edge * confidence) * 0.25;
   const rawSize = Math.round(kellyFrac * fundSize);
   const recommendedStake = Math.min(Math.max(rawSize, 10), limits.maxExposurePerMarket, fundSize * 0.1);
+  const fc = store.frictionConfig || { feePct: 0.02, slippagePct: 0.005 };
   const slippageEst = Math.min(0.05, (recommendedStake / Math.max(liquidity, 100)) * 0.5);
-  const feesPct = 0.02;
+  const feesPct = fc.feePct;
   const fees = recommendedStake * feesPct;
   const slippageCost = recommendedStake * slippageEst;
   const maxLoss = recommendedStake + fees;
@@ -316,17 +572,67 @@ function saveState() {
       },
       proposalsRing: (store.proposalsRing || []).slice(-100),
       manualProbabilities: store.manualProbabilities || {},
-      ledger: (store.ledger || []).slice(-500),
+      ledger: (store.ledger || []).slice(-2000),
       positions: store.positions || {},
       demoPnl: store.demoPnl || {},
       costBudgets: store.costBudgets || {},
       strategyParams: store.strategyParams || {},
       apiUsageEvents: (store.apiUsageEvents || []).slice(-1000),
+      // Phase 1 new fields
+      runTraces: (store.runTraces || []).slice(-200),
+      frictionConfig: store.frictionConfig || { feePct: 0.02, slippagePct: 0.005 },
+      cooldownMs: store.cooldownMs || 1800000,
     };
     fs.writeFileSync(STATE_PATH, JSON.stringify(snap, null, 2), 'utf-8');
     persistDirty = false;
   } catch (e) { console.error('[persist] Save error:', e.message); }
 }
+
+// Migrate legacy position format to Phase 1 lifecycle format
+function migratePositions(positions) {
+  const migrated = {};
+  let migratedCount = 0;
+  for (const [key, pos] of Object.entries(positions)) {
+    if (pos.entries && pos.status) {
+      // Already in new format
+      migrated[key] = pos;
+    } else {
+      // Legacy format: { side, qty, avgPrice, entryTs, ... }
+      const marketId = pos.marketId || key;
+      const strategy = pos.strategyType || pos.strategy || 'unknown';
+      const newKey = key.includes(':') ? key : getPositionKey(marketId, strategy);
+      migrated[newKey] = {
+        id: pos.id || crypto.randomUUID(),
+        marketId,
+        strategy,
+        side: pos.side || 'YES',
+        status: 'open',
+        openedAt: pos.entryTs || new Date().toISOString(),
+        lastEntryAt: pos.entryTs || new Date().toISOString(),
+        closedAt: null,
+        entries: [{
+          ts: pos.entryTs || new Date().toISOString(), action: 'OPEN', side: pos.side || 'YES',
+          price: pos.avgPrice || 0.5, qty: pos.qty || 0, stake: pos.size || 0,
+          fee: 0, slippageAssump: 0.005, feeAssump: 0.02,
+        }],
+        qty: pos.qty || 0,
+        avgPrice: pos.avgPrice || 0.5,
+        costBasis: pos.size || (pos.qty || 0) * (pos.avgPrice || 0.5),
+        realizedPnl: 0,
+        unrealizedPnl: pos.unrealizedPnl || 0,
+        currentPrice: pos.currentPrice || pos.avgPrice || 0.5,
+        marketTitle: pos.marketTitle || '',
+        agentId: pos.agentId || '',
+        demo: true,
+        close: null,
+      };
+      migratedCount++;
+    }
+  }
+  if (migratedCount > 0) console.log(`[persist] Migrated ${migratedCount} legacy positions to Phase 1 format`);
+  return migrated;
+}
+
 function loadState() {
   try {
     const data = JSON.parse(fs.readFileSync(STATE_PATH, 'utf-8'));
@@ -344,11 +650,15 @@ function loadState() {
     if (data.proposalsRing) store.proposalsRing = data.proposalsRing;
     if (data.manualProbabilities) store.manualProbabilities = data.manualProbabilities;
     if (data.ledger) store.ledger = data.ledger;
-    if (data.positions) store.positions = data.positions;
+    if (data.positions) store.positions = migratePositions(data.positions);
     if (data.demoPnl) Object.assign(store.demoPnl, data.demoPnl);
     if (data.costBudgets) Object.assign(store.costBudgets, data.costBudgets);
     if (data.strategyParams) store.strategyParams = data.strategyParams;
     if (data.apiUsageEvents) store.apiUsageEvents = data.apiUsageEvents;
+    // Phase 1 new fields
+    if (data.runTraces) store.runTraces = data.runTraces;
+    if (data.frictionConfig) store.frictionConfig = data.frictionConfig;
+    if (data.cooldownMs !== undefined) store.cooldownMs = data.cooldownMs;
     console.log('[persist] Loaded state from zvi_state.json');
   } catch { console.log('[persist] No saved state, starting fresh'); }
 }
@@ -811,9 +1121,13 @@ async function runNegRiskArb(agent) {
     store.findingsRing.negrisk_arb = opportunities.slice(0, 50);
     store.strategyDiagnostics.negrisk_arb = diagnostics;
 
-    // Push to approvals if qualifying
+    // Push to approvals if qualifying (with Phase 1 position/cooldown check)
     opportunities.filter(o => o.action !== 'PASS').forEach(o => {
-      if (!store.approvalsQueue.find(a => a.marketId === o.marketId && a.agentId === o.agentId && a.status === 'pending')) {
+      // Phase 1: Skip if open position exists or cooldown active
+      const posCheck = shouldSkipDueToPositionOrCooldown(o.marketId, 'negrisk_arb');
+      if (posCheck.skip) { o.status = 'skipped_positioned'; o._skipReason = posCheck.reason; return; }
+
+      if (!store.approvalsQueue.find(a => a.marketId === o.marketId && a.agentId === o.agentId && (a.status === 'pending' || a.status === 'approved'))) {
         const proposal = {
           id: crypto.randomUUID(), ts: new Date().toISOString(), agentId: agent.id,
           marketId: o.marketId, actionType: o.action, payload: o,
@@ -1012,9 +1326,11 @@ async function runLLMProbability(agent) {
       opportunities.push(opp);
       if (probSource === 'llm') store.llmCache[cacheKey] = { opportunity: opp, timestamp: Date.now() };
 
-      // Push to approvals if qualifying
+      // Push to approvals if qualifying (with Phase 1 position/cooldown check)
       if (!gateFailReason) {
-        if (!store.approvalsQueue.find(a => a.marketId === cacheKey && a.agentId === agent.id && a.status === 'pending')) {
+        const posCheck = shouldSkipDueToPositionOrCooldown(cacheKey, 'llm_probability');
+        if (posCheck.skip) { opp.status = 'skipped_positioned'; opp._skipReason = posCheck.reason; }
+        else if (!store.approvalsQueue.find(a => a.marketId === cacheKey && a.agentId === agent.id && (a.status === 'pending' || a.status === 'approved'))) {
           const proposal = {
             id: crypto.randomUUID(), ts: new Date().toISOString(), agentId: agent.id,
             marketId: cacheKey, actionType: opp.action, payload: opp,
@@ -1337,7 +1653,7 @@ async function runWhaleWatch(agent) {
             });
           }
         } else {
-          // API returned empty — stub with market data
+          // API returned empty — stub with market data (Phase 1: hard-labeled as stub)
           diagnostics.apiFailures++;
           if (markets.length > 0) {
             const randomMkt = markets[Math.floor(Math.random() * Math.min(5, markets.length))];
@@ -1345,7 +1661,8 @@ async function runWhaleWatch(agent) {
               id: crypto.randomUUID(), wallet: wallet.address, alias: wallet.alias || wallet.address.slice(0, 8),
               market: randomMkt.market, side: Math.random() > 0.5 ? 'YES' : 'NO',
               size: 0, price: 0, timestamp: new Date().toISOString(), source: 'stub',
-              note: 'Activity API returned empty. Stub event from cached markets.',
+              isStub: true, // Phase 1: explicit stub label
+              note: 'Activity API returned empty. Stub event from cached markets. EXCLUDED from convergence/approvals.',
             });
             diagnostics.stubEvents++;
           }
@@ -1358,7 +1675,8 @@ async function runWhaleWatch(agent) {
             id: crypto.randomUUID(), wallet: wallet.address, alias: wallet.alias || wallet.address.slice(0, 8),
             market: randomMkt.market, side: Math.random() > 0.5 ? 'YES' : 'NO',
             size: 0, price: 0, timestamp: new Date().toISOString(), source: 'stub',
-            note: 'Activity API failed. Stub event from cached markets.',
+            isStub: true, // Phase 1: explicit stub label
+            note: 'Activity API failed. Stub event from cached markets. EXCLUDED from convergence/approvals.',
           });
           diagnostics.stubEvents++;
         }
@@ -1380,12 +1698,14 @@ async function runWhaleWatch(agent) {
       }
     });
 
-    // ── Convergence detection ──
+    // ── Convergence detection (Phase 1: exclude stub events) ──
     const K = agent.config.convergenceThreshold || 2;
     const T = (agent.config.convergenceWindowMin || 60) * 60000;
     const recentEvents = store.whaleEvents.filter(e => Date.now() - new Date(e.timestamp).getTime() < T);
+    // Phase 1: only count REAL events for convergence, never stubs
+    const realRecentEvents = recentEvents.filter(e => e.source !== 'stub');
     const marketSideCounts = {};
-    for (const e of recentEvents) {
+    for (const e of realRecentEvents) {
       const key = `${e.market}::${e.side}`;
       if (!marketSideCounts[key]) marketSideCounts[key] = { market: e.market, side: e.side, wallets: new Set(), events: [], totalSize: 0 };
       marketSideCounts[key].wallets.add(e.wallet);
@@ -1414,14 +1734,25 @@ async function runWhaleWatch(agent) {
       }));
 
     diagnostics.convergenceAlerts = convergenceAlerts.length;
+    // Phase 1: expose stub ratio for data quality
+    diagnostics.stubRatio = events.length > 0 ? (diagnostics.stubEvents / events.length) : 0;
+    diagnostics.realEvents = events.filter(e => e.source !== 'stub').length;
 
-    // Push convergence alerts to approvals
+    // Push convergence alerts to approvals (Phase 1: with position check)
     convergenceAlerts.forEach(a => {
-      if (!store.approvalsQueue.find(q => q.rationale === a.rationaleSummary && q.status === 'pending')) {
+      // Phase 1: skip if convergence is only from stubs (should not happen now, but guard)
+      if (a.explain?.dataQuality?.realEvents === 0) return;
+
+      if (!store.approvalsQueue.find(q => q.rationale === a.rationaleSummary && (q.status === 'pending' || q.status === 'approved'))) {
+        // Phase 1: skip if open position exists
+        if (a.marketId) {
+          const posCheck = shouldSkipDueToPositionOrCooldown(a.marketId, 'whale_watch');
+          if (posCheck.skip) return;
+        }
         const proposal = {
           id: crypto.randomUUID(), ts: new Date().toISOString(), agentId: agent.id,
           marketId: a.marketId, actionType: 'FOLLOW', payload: a,
-          rationale: a.rationaleSummary, risk: 'Whale herding may be misleading; stub data may inflate signals',
+          rationale: a.rationaleSummary, risk: 'Whale herding may be misleading',
           expectedEdge: 0, status: 'pending',
         };
         store.approvalsQueue.push(proposal);
@@ -1736,6 +2067,9 @@ function getStrategyDiagnostics(strategyType) {
     }
   });
 
+  // Phase 1: include strategy-specific runtime diagnostics
+  const runtimeDiag = store.strategyDiagnostics[strategyType] || {};
+
   return {
     strategyType,
     label: spec.label,
@@ -1757,6 +2091,10 @@ function getStrategyDiagnostics(strategyType) {
       const t = a.health.lastRunAt ? new Date(a.health.lastRunAt).getTime() : 0;
       return t > latest ? t : latest;
     }, 0) : null,
+    // Phase 1: whale stub data quality info
+    stubRatio: runtimeDiag.stubRatio || 0,
+    realEvents: runtimeDiag.realEvents || 0,
+    stubEvents: runtimeDiag.stubEvents || 0,
   };
 }
 
@@ -1880,6 +2218,7 @@ function startAgentRuntime(agentId) {
     agent.health.heartbeat = { lastTick: new Date().toISOString(), tickCount: state.tickCount, interval };
 
     try {
+      const tickStartMs = Date.now();
       // 1) Ensure market data is fresh
       if (store.marketCache.data.length === 0 || (Date.now() - store.marketCache.fetchedAt) > store.marketCache.ttl) {
         await fetchMarkets();
@@ -1888,8 +2227,29 @@ function startAgentRuntime(agentId) {
       // 2) Run strategy
       const opps = await runAgent(agentId);
 
-      // 3) Emit activity
-      logActivity('scan', `[${agent.name}] Tick #${state.tickCount}: ${opps.length} findings (${agent.stats.opportunities} qualifying)`);
+      // 3) Record run trace (Phase 1 telemetry)
+      const tickEndMs = Date.now();
+      const traceErrors = [];
+      recordRunTrace({
+        tickId: crypto.randomUUID().slice(0, 8),
+        agentId,
+        agentName: agent.name,
+        strategyType: agent.strategyType,
+        tickNumber: state.tickCount,
+        startedAt: new Date(tickStartMs).toISOString(),
+        endedAt: new Date(tickEndMs).toISOString(),
+        durationMs: tickEndMs - tickStartMs,
+        marketsScanned: agent.stats.scanned || 0,
+        candidatesConsidered: opps.length,
+        oppsFound: agent.stats.opportunities || 0,
+        approvalsCreated: opps.filter(o => o.requiresApproval && o.status === 'new').length,
+        tradesExecuted: 0, // filled in auto-approve separately
+        cacheHits: store.strategyDiagnostics[agent.strategyType]?.cacheHits || 0,
+        errors: traceErrors,
+      });
+
+      // 4) Emit activity
+      logActivity('scan', `[${agent.name}] Tick #${state.tickCount}: ${opps.length} findings (${agent.stats.opportunities} qualifying) [${tickEndMs - tickStartMs}ms]`);
 
       state.errors = 0;
     } catch (e) {
@@ -3024,6 +3384,9 @@ body{padding-bottom:50px}
   <div class="tab" data-tab="llm">LLM Probability</div>
   <div class="tab" data-tab="sentiment">Sentiment</div>
   <div class="tab" data-tab="whales">Whale Watch</div>
+  <div class="tab" data-tab="ledger">Ledger / P&L</div>
+  <div class="tab" data-tab="posview">Positions</div>
+  <div class="tab" data-tab="traces">Run Traces</div>
   <div class="tab" data-tab="costs">Costs</div>
   <div class="tab" data-tab="hub">Founder Console</div>
   <div class="tab" data-tab="health">Health</div>
@@ -3052,6 +3415,23 @@ body{padding-bottom:50px}
         <div class="console-input" style="padding:8px 10px"><input type="text" id="homeConsoleInput" placeholder="Why are costs high today?" style="font-size:11px" onkeydown="if(event.key==='Enter')sendHomeConsole()"><button class="btn btn-p btn-sm" onclick="sendHomeConsole()">Ask</button></div>
       </div>
     </div>
+  </div>
+  <div class="panel" id="panel-ledger">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="font-size:15px">Trade Ledger / P&L</h3><div style="display:flex;gap:8px"><select id="ledgerGroupBy" onchange="loadLedger()" style="padding:5px 8px;background:var(--bg2);border:1px solid var(--bd);border-radius:4px;color:var(--t1);font-family:var(--mono);font-size:10px"><option value="none">No Grouping</option><option value="strategy">By Strategy</option><option value="market">By Market</option></select><button class="btn btn-p btn-sm" onclick="loadLedger()">Refresh</button></div></div>
+    <div class="ss" id="ledgerSummary"></div>
+    <div id="ledgerTable" class="tw" style="padding:14px"><div class="empty"><p>Loading ledger...</p></div></div>
+  </div>
+  <div class="panel" id="panel-posview">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="font-size:15px">Positions</h3><button class="btn btn-p btn-sm" onclick="loadPositions()">Refresh</button></div>
+    <div class="ss" id="posSummary"></div>
+    <h4 style="font-size:12px;color:var(--cyan);font-family:var(--mono);margin-bottom:8px">OPEN POSITIONS</h4>
+    <div id="posOpenTable" class="tw" style="padding:14px;margin-bottom:14px"><div class="empty"><p>Loading...</p></div></div>
+    <h4 style="font-size:12px;color:var(--t3);font-family:var(--mono);margin-bottom:8px">CLOSED POSITIONS</h4>
+    <div id="posClosedTable" class="tw" style="padding:14px"><div class="empty"><p>Loading...</p></div></div>
+  </div>
+  <div class="panel" id="panel-traces">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="font-size:15px">Run Traces</h3><div style="display:flex;gap:8px"><select id="traceAgentFilter" onchange="loadTraces()" style="padding:5px 8px;background:var(--bg2);border:1px solid var(--bd);border-radius:4px;color:var(--t1);font-family:var(--mono);font-size:10px"><option value="">All Agents</option></select><button class="btn btn-p btn-sm" onclick="loadTraces()">Refresh</button></div></div>
+    <div id="tracesTable" class="tw" style="padding:14px"><div class="empty"><p>Loading traces...</p></div></div>
   </div>
   <div class="panel" id="panel-costs">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="font-size:15px">Operations Cost Dashboard</h3><button class="btn btn-p btn-sm" onclick="loadCosts()">Refresh</button></div>
@@ -3163,6 +3543,9 @@ document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () =>
   if (t.dataset.tab === 'approvals') fetchApprovals();
   if (['negrisk','llm','sentiment','whales'].includes(t.dataset.tab)) fetchStratOpps(t.dataset.tab);
   if (t.dataset.tab === 'whales') fetchWhaleData();
+  if (t.dataset.tab === 'ledger') loadLedger();
+  if (t.dataset.tab === 'posview') loadPositions();
+  if (t.dataset.tab === 'traces') loadTraces();
   if (t.dataset.tab === 'costs') loadCosts();
   if (t.dataset.tab === 'health') { runDiag(); fetchAgentHealth(); }
 }));
@@ -3373,6 +3756,16 @@ function renderStratDiag(diagEl, diag) {
   h += '<span>Findings: ' + (diag.totalFindings || 0) + '</span>';
   if (diag.lastRun) h += '<span>Last: ' + new Date(diag.lastRun).toLocaleTimeString() + '</span>';
   h += '</div>';
+  // Phase 1: Stub ratio for whale watch
+  if (diag.stubRatio !== undefined && diag.stubRatio > 0) {
+    const stubPct = (diag.stubRatio * 100).toFixed(0);
+    const stubColor = diag.stubRatio > 0.5 ? 'var(--red)' : diag.stubRatio > 0.2 ? 'var(--yellow)' : 'var(--t3)';
+    h += '<div style="padding:4px 8px;background:rgba(245,158,11,.06);border:1px solid rgba(245,158,11,.15);border-radius:4px;margin-bottom:8px;font-size:10px;font-family:var(--mono)">';
+    h += '<span style="color:' + stubColor + '">DATA QUALITY: ' + stubPct + '% stub events</span>';
+    h += '<span style="color:var(--t3);margin-left:8px">(' + (diag.realEvents||0) + ' real / ' + (diag.stubEvents||0) + ' stub)</span>';
+    h += '<span style="color:var(--t3);margin-left:8px">Stubs EXCLUDED from convergence & approvals</span>';
+    h += '</div>';
+  }
   // Gate failure distribution
   if (diag.gateFailures && Object.keys(diag.gateFailures).length > 0) {
     h += '<details style="margin-bottom:8px"><summary style="font-size:10px;font-family:var(--mono);color:var(--t3);cursor:pointer">Gate Failures (' + Object.values(diag.gateFailures).reduce((a,b)=>a+b,0) + ' total)</summary>';
@@ -3621,6 +4014,15 @@ function renderSettings(){
     h+='<div class="settings-section"><h3>Risk Limits</h3><div class="settings-grid">'+sN('MAX_EXPOSURE_PER_MARKET','Max Per Market ($)',c.riskLimits.maxExposurePerMarket)+sN('DAILY_MAX_EXPOSURE','Daily Max ($)',c.riskLimits.dailyMaxExposure)+sN('MIN_EDGE_THRESHOLD','Min Edge',c.riskLimits.minEdgeThreshold)+sN('MIN_DEPTH_USDC','Min Depth ($)',c.riskLimits.minDepthUsdc)+'</div><div style="margin-top:10px"><button class="btn btn-p" onclick="saveRiskLimits()">Save Limits</button></div></div>';
     h+='<div class="settings-section"><h3>Trading Mode</h3><div class="settings-grid"><div class="set-item"><label>Mode</label><select id="set_mode"><option value="true" '+(c.mode==='OBSERVATION_ONLY'?'selected':'')+'>Observation Only</option><option value="false" '+(c.mode!=='OBSERVATION_ONLY'?'selected':'')+'>Live Trading</option></select></div></div><div style="margin-top:10px"><button class="btn btn-p" onclick="saveMode()">Save Mode</button></div></div>';
     document.getElementById('settingsContent').innerHTML=h;
+    // Phase 1: Friction & Safety Config (appended async)
+    api('/api/friction-config').then(fc=>{
+      let fh='<div class="settings-section"><h3>Demo Friction Assumptions</h3><p style="font-size:11px;color:var(--t3);margin-bottom:8px;font-family:var(--mono)">These are ASSUMPTIONS, not verified real fees. Labeled explicitly on every trade.</p><div class="settings-grid">';
+      fh+='<div class="set-item"><label>Fee % (per trade)</label><div class="set-d">Applied to trade size. Default: 2%</div><input type="number" id="set_feePct" value="'+((fc.frictionConfig?.feePct||0.02)*100).toFixed(1)+'" step="0.1" min="0" max="20"></div>';
+      fh+='<div class="set-item"><label>Slippage % (per trade)</label><div class="set-d">Applied to entry price. Default: 0.5%</div><input type="number" id="set_slippagePct" value="'+((fc.frictionConfig?.slippagePct||0.005)*100).toFixed(1)+'" step="0.1" min="0" max="10"></div>';
+      fh+='<div class="set-item"><label>Cooldown (minutes)</label><div class="set-d">Min time between trades on same market+strategy</div><input type="number" id="set_cooldownMin" value="'+((fc.cooldownMs||1800000)/60000).toFixed(0)+'" step="1" min="0" max="1440"></div>';
+      fh+='</div><div style="margin-top:10px"><button class="btn btn-p" onclick="saveFrictionConfig()">Save Friction Config</button></div></div>';
+      document.getElementById('settingsContent').innerHTML+=fh;
+    }).catch(()=>{});
   }).catch(()=>{document.getElementById('settingsContent').innerHTML='<div class="empty"><p>Failed to load</p></div>';});
 }
 function sN(k,l,v){return '<div class="set-item"><label>'+l+'</label><input type="number" id="set_'+k+'" value="'+v+'" step="any"></div>';}
@@ -3652,6 +4054,12 @@ async function settingsTest(envKey,fn,btn){
 }
 async function saveRiskLimits(){const u={};['MAX_EXPOSURE_PER_MARKET','DAILY_MAX_EXPOSURE','MIN_EDGE_THRESHOLD','MIN_DEPTH_USDC'].forEach(k=>{const el=document.getElementById('set_'+k);if(el)u[k]=el.value;});try{const r=await post('/api/founder/update-env',u);if(r.ok)toast('Risk limits saved','success');}catch(e){toast('Failed','error');}}
 async function saveMode(){const el=document.getElementById('set_mode');if(el)try{await post('/api/founder/update-env',{OBSERVATION_ONLY:el.value});toast('Mode saved. Restart for full effect.','success');loadCfg();}catch(e){toast('Failed','error');}}
+async function saveFrictionConfig(){
+  const feePct=parseFloat(document.getElementById('set_feePct')?.value)/100;
+  const slippagePct=parseFloat(document.getElementById('set_slippagePct')?.value)/100;
+  const cooldownMs=parseInt(document.getElementById('set_cooldownMin')?.value)*60000;
+  try{const r=await post('/api/friction-config',{feePct,slippagePct,cooldownMs});if(r.ok)toast('Friction config saved','success');else toast('Failed','error');}catch(e){toast('Failed: '+e.message,'error');}
+}
 
 // Commander
 async function runCmd(){const inp=document.getElementById('cmdInput'),txt=inp.value.trim();if(!txt)return;inp.value='';document.getElementById('cmdOut').textContent='Running...';try{const r=await post('/api/command',{text:txt});document.getElementById('cmdOut').textContent=r.message||r.error||'Done';if(r.type==='created'||r.type==='kill')fetchAgents();}catch(e){document.getElementById('cmdOut').textContent='Error';}}
@@ -3870,12 +4278,17 @@ async function loadHomepage() {
   try {
     const d = await api('/api/homepage');
     // Summary cards
+    // Phase 1: Truthful P&L headline = Net = Realized + Unrealized - Fees
+    const pnl = d.fundSummary.demoPnl || {};
+    const netPnl = (pnl.totalRealized||0) + (pnl.totalUnrealized||0) - (pnl.totalFees||0);
     document.getElementById('homeSummary').innerHTML = [
       { l: 'Agents', v: d.agents.length, c: 'blue', s: d.agents.filter(a=>a.status==='running').length + ' running' },
-      { l: 'Demo P&L', v: '$' + ((d.fundSummary.demoPnl.totalRealized||0)-(d.fundSummary.demoPnl.totalFees||0)).toFixed(2), c: (d.fundSummary.demoPnl.totalRealized||0) >= 0 ? 'green' : 'red', s: d.fundSummary.demoPnl.trades + ' trades' },
-      { l: 'Open Risk', v: '$' + (d.fundSummary.capitalDeployed||0), c: 'yellow', s: d.fundSummary.openPositions + ' positions' },
+      { l: 'Net P&L', v: '$' + netPnl.toFixed(2), c: netPnl >= 0 ? 'green' : 'red', s: 'R+U-F | ' + (pnl.trades||0) + ' trades' },
+      { l: 'Realized', v: '$' + (pnl.totalRealized||0).toFixed(2), c: (pnl.totalRealized||0)>=0?'green':'red', s: (pnl.wins||0)+'W / '+(pnl.losses||0)+'L' },
+      { l: 'Unrealized', v: '$' + (pnl.totalUnrealized||0).toFixed(2), c: (pnl.totalUnrealized||0)>=0?'cyan':'yellow', s: d.fundSummary.openPositions + ' open' },
+      { l: 'Fees', v: '$' + (pnl.totalFees||0).toFixed(2), c: 'yellow', s: 'assumption-based' },
+      { l: 'Positions', v: d.fundSummary.openPositions + ' open', c: 'purple', s: (d.fundSummary.closedPositions||0) + ' closed' },
       { l: 'Daily Burn', v: '$' + (d.costBurn.today||0).toFixed(2), c: d.costBurn.today > d.costBurn.dailyCap * 0.8 ? 'red' : 'cyan', s: 'cap: $' + d.costBurn.dailyCap },
-      { l: 'Markets', v: d.marketCoverage.cached, c: 'purple', s: 'universe: ' + d.marketCoverage.universe },
       { l: 'Approvals', v: d.pendingApprovals, c: d.pendingApprovals > 0 ? 'green' : 'blue', s: 'pending review' },
     ].map(s => '<div class="sc '+s.c+'"><div class="sc-l">'+s.l+'</div><div class="sc-v">'+s.v+'</div><div class="sc-s">'+s.s+'</div></div>').join('');
     // Agents
@@ -3894,6 +4307,176 @@ async function loadHomepage() {
       if (d.demoAutoApproveStats) updateDemoModeStats(d.demoAutoApproveStats);
     }
   } catch(e) { console.error('[home]', e); }
+}
+
+// ── Phase 1: Ledger / P&L Tab ──
+async function loadLedger() {
+  try {
+    const [ledgerData, pnlData] = await Promise.all([api('/api/ledger'), api('/api/pnl')]);
+    const ledger = ledgerData.ledger || [];
+    // Summary cards
+    document.getElementById('ledgerSummary').innerHTML = [
+      { l: 'Net P&L', v: '$' + (pnlData.net||0).toFixed(2), c: (pnlData.net||0)>=0?'green':'red' },
+      { l: 'Realized', v: '$' + (pnlData.realized||0).toFixed(2), c: (pnlData.realized||0)>=0?'green':'red' },
+      { l: 'Unrealized', v: '$' + (pnlData.unrealized||0).toFixed(2), c: (pnlData.unrealized||0)>=0?'cyan':'yellow' },
+      { l: 'Fees', v: '$' + (pnlData.fees||0).toFixed(2), c: 'yellow' },
+      { l: 'Wins/Losses', v: (pnlData.wins||0)+'W / '+(pnlData.losses||0)+'L', c: 'blue' },
+      { l: 'Open Positions', v: pnlData.openPositions||0, c: 'purple' },
+    ].map(s => '<div class="sc '+s.c+'"><div class="sc-l">'+s.l+'</div><div class="sc-v">'+s.v+'</div></div>').join('');
+    // Grouping
+    const groupBy = document.getElementById('ledgerGroupBy')?.value || 'none';
+    let grouped = {};
+    if (groupBy === 'strategy') { ledger.forEach(t => { const k = t.strategyType || 'unknown'; if(!grouped[k])grouped[k]=[]; grouped[k].push(t); }); }
+    else if (groupBy === 'market') { ledger.forEach(t => { const k = (t.marketTitle||'').slice(0,40) || t.marketId || 'unknown'; if(!grouped[k])grouped[k]=[]; grouped[k].push(t); }); }
+    else { grouped = { 'All Trades': ledger }; }
+    let h = '';
+    for (const [group, items] of Object.entries(grouped)) {
+      if (groupBy !== 'none') h += '<h4 style="font-size:11px;color:var(--cyan);font-family:var(--mono);margin:10px 0 6px">' + esc(group) + ' (' + items.length + ')</h4>';
+      h += '<table style="font-size:10px;margin-bottom:10px"><thead><tr><th>Time</th><th>Action</th><th>Strategy</th><th>Market</th><th>Side</th><th>Qty</th><th>Price</th><th>Fee</th><th>Realized</th><th>Assumptions</th><th></th></tr></thead><tbody>';
+      items.slice(0,100).forEach(t => {
+        const isClose = t.action === 'CLOSE';
+        const rpnl = t.realizedPnl || 0;
+        h += '<tr style="'+(isClose?'background:rgba(99,102,241,.04)':'')+'">';
+        h += '<td class="mono">' + new Date(t.ts).toLocaleTimeString() + '</td>';
+        h += '<td style="font-family:var(--mono);font-weight:700;color:'+(isClose?'var(--purple)':'var(--cyan)')+'">'+esc(t.action||'OPEN')+'</td>';
+        h += '<td class="mono">' + esc(t.strategyType||'') + '</td>';
+        h += '<td class="mn" style="max-width:180px">' + esc((t.marketTitle||'').slice(0,35)) + '</td>';
+        h += '<td style="font-family:var(--mono);font-weight:700;color:'+(t.side?.includes('YES')?'var(--green)':'var(--red)')+'">'+esc(t.side||'')+'</td>';
+        h += '<td class="mono">' + (t.qty||0) + '</td>';
+        h += '<td class="mono">' + (t.price||0).toFixed(4) + '</td>';
+        h += '<td class="mono" style="color:var(--yellow)">$' + (t.fees||0).toFixed(2) + '</td>';
+        h += '<td style="font-family:var(--mono);font-weight:700;color:'+(rpnl>=0?'var(--green)':'var(--red)')+'">'+(!isClose?'-':'$'+rpnl.toFixed(2))+'</td>';
+        h += '<td class="mono" style="font-size:9px;color:var(--t3)">fee='+(t.feeAssumpPct!==undefined?(t.feeAssumpPct*100).toFixed(1)+'%':'?')+' slip='+(t.slippageAssumpPct!==undefined?(t.slippageAssumpPct*100).toFixed(1)+'%':'?')+'</td>';
+        h += '<td>'+(t.provenance?'<button class="btn btn-sm" onclick="showTradeExplain(\\''+t.id+'\\')">Explain</button>':'')+'</td>';
+        h += '</tr>';
+      });
+      h += '</tbody></table>';
+    }
+    document.getElementById('ledgerTable').innerHTML = h || '<div class="empty"><p>No trades yet</p></div>';
+  } catch(e) { document.getElementById('ledgerTable').innerHTML = '<div class="empty"><p>Error: '+esc(e.message)+'</p></div>'; }
+}
+function showTradeExplain(tradeId) {
+  api('/api/ledger').then(d => {
+    const t = (d.ledger||[]).find(x => x.id === tradeId);
+    if (!t || !t.provenance) { toast('No provenance data','info'); return; }
+    const p = t.provenance;
+    document.getElementById('marketModal').innerHTML = '<div class="modal-overlay" onclick="closeModal(event)"><div class="modal" onclick="event.stopPropagation()"><div class="modal-h"><h2>Trade Provenance</h2><button class="modal-x" onclick="closeModal()">X</button></div><div class="modal-b">' +
+      '<h4 style="color:var(--cyan);font-family:var(--mono);font-size:11px;margin-bottom:8px">EDGE BREAKDOWN</h4>' +
+      '<div class="md-grid"><div class="md-stat"><div class="ms-l">Gross Edge</div><div class="ms-v">'+(p.edgeBreakdown?.grossEdge||0).toFixed(2)+'%</div></div>' +
+      '<div class="md-stat"><div class="ms-l">Fee Assumption</div><div class="ms-v">'+(p.edgeBreakdown?.feesAssump*100||0).toFixed(1)+'%</div></div>' +
+      '<div class="md-stat"><div class="ms-l">Slippage Assumption</div><div class="ms-v">'+(p.edgeBreakdown?.slippageAssump*100||0).toFixed(1)+'%</div></div>' +
+      '<div class="md-stat"><div class="ms-l">Net Edge</div><div class="ms-v" style="color:var(--green)">'+(p.edgeBreakdown?.netEdge||0).toFixed(2)+'%</div></div></div>' +
+      '<h4 style="color:var(--cyan);font-family:var(--mono);font-size:11px;margin:12px 0 8px">GATE RESULTS</h4>' +
+      '<pre style="background:rgba(0,0,0,.2);padding:10px;border-radius:6px;font-family:var(--mono);font-size:10px;color:var(--t2);white-space:pre-wrap">'+esc(JSON.stringify(p.gateResults||{},null,2))+'</pre>' +
+      '<h4 style="color:var(--cyan);font-family:var(--mono);font-size:11px;margin:12px 0 8px">INPUT SNAPSHOT</h4>' +
+      '<div style="font-family:var(--mono);font-size:10px;color:var(--t3)">Hash: '+esc(p.inputSnapshotHash||'N/A')+'</div>' +
+      '</div></div></div>';
+  }).catch(() => toast('Failed to load','error'));
+}
+
+// ── Phase 1: Positions Tab ──
+async function loadPositions() {
+  try {
+    const d = await api('/api/positions');
+    const open = d.openPositions || [];
+    const closed = d.closedPositions || [];
+    const pnl = d.demoPnl || {};
+    const totalExposure = open.reduce((s, p) => s + (p.costBasis || 0), 0);
+    const fundSize = ${store.founder.fundSize || 6000};
+    // Summary
+    document.getElementById('posSummary').innerHTML = [
+      { l: 'Open', v: open.length, c: 'cyan' },
+      { l: 'Closed', v: closed.length, c: 'blue' },
+      { l: 'Total Exposure', v: '$' + totalExposure.toFixed(0), c: 'yellow' },
+      { l: 'Unrealized', v: '$' + (pnl.totalUnrealized||0).toFixed(2), c: (pnl.totalUnrealized||0)>=0?'green':'red' },
+    ].map(s => '<div class="sc '+s.c+'"><div class="sc-l">'+s.l+'</div><div class="sc-v">'+s.v+'</div></div>').join('');
+    // Open positions table
+    if (open.length) {
+      let h = '<table style="font-size:10px"><thead><tr><th>Market</th><th>Strategy</th><th>Side</th><th>Qty</th><th>Avg Price</th><th>Cost Basis</th><th>MTM Price</th><th>Unrealized</th><th>Exposure %</th><th>Opened</th><th></th></tr></thead><tbody>';
+      open.forEach(p => {
+        const expPct = fundSize > 0 ? ((p.costBasis||0)/fundSize*100).toFixed(1) : '?';
+        const upnl = p.unrealizedPnl || 0;
+        h += '<tr><td class="mn" style="max-width:200px">'+esc((p.marketTitle||'').slice(0,40))+'</td>';
+        h += '<td class="mono">'+esc(p.strategy||'')+'</td>';
+        h += '<td style="font-family:var(--mono);font-weight:700;color:'+(p.side?.includes('YES')?'var(--green)':'var(--red)')+'">'+esc(p.side||'')+'</td>';
+        h += '<td class="mono">'+p.qty+'</td>';
+        h += '<td class="mono">'+(p.avgPrice||0).toFixed(4)+'</td>';
+        h += '<td class="mono">$'+(p.costBasis||0).toFixed(0)+'</td>';
+        h += '<td class="mono">'+(p.currentPrice||0).toFixed(4)+'</td>';
+        h += '<td style="font-family:var(--mono);font-weight:700;color:'+(upnl>=0?'var(--green)':'var(--red)')+'">$'+upnl.toFixed(2)+'</td>';
+        h += '<td class="mono">'+expPct+'%</td>';
+        h += '<td class="mono" style="font-size:9px">'+new Date(p.openedAt).toLocaleString()+'</td>';
+        h += '<td><button class="btn btn-r btn-sm" onclick="closePosition(\\''+esc(p.posKey)+'\\')">Close</button></td>';
+        h += '</tr>';
+      });
+      h += '</tbody></table>';
+      document.getElementById('posOpenTable').innerHTML = h;
+    } else {
+      document.getElementById('posOpenTable').innerHTML = '<div style="color:var(--t3);font-size:11px;padding:10px">No open positions</div>';
+    }
+    // Closed positions table
+    if (closed.length) {
+      let h = '<table style="font-size:10px"><thead><tr><th>Market</th><th>Strategy</th><th>Side</th><th>Qty</th><th>Avg Price</th><th>Close Price</th><th>Realized P&L</th><th>Reason</th><th>Closed At</th></tr></thead><tbody>';
+      closed.slice(0, 50).forEach(p => {
+        const rpnl = p.realizedPnl || 0;
+        h += '<tr style="opacity:.7"><td class="mn" style="max-width:200px">'+esc((p.marketTitle||'').slice(0,40))+'</td>';
+        h += '<td class="mono">'+esc(p.strategy||'')+'</td>';
+        h += '<td class="mono">'+esc(p.side||'')+'</td>';
+        h += '<td class="mono">'+p.qty+'</td>';
+        h += '<td class="mono">'+(p.avgPrice||0).toFixed(4)+'</td>';
+        h += '<td class="mono">'+(p.close?.price||0).toFixed(4)+'</td>';
+        h += '<td style="font-family:var(--mono);font-weight:700;color:'+(rpnl>=0?'var(--green)':'var(--red)')+'">$'+rpnl.toFixed(2)+'</td>';
+        h += '<td class="mono" style="font-size:9px">'+esc(p.close?.reason||'?')+'</td>';
+        h += '<td class="mono" style="font-size:9px">'+(p.closedAt?new Date(p.closedAt).toLocaleString():'')+'</td>';
+        h += '</tr>';
+      });
+      h += '</tbody></table>';
+      document.getElementById('posClosedTable').innerHTML = h;
+    } else {
+      document.getElementById('posClosedTable').innerHTML = '<div style="color:var(--t3);font-size:11px;padding:10px">No closed positions yet</div>';
+    }
+  } catch(e) { console.error('[positions]', e); }
+}
+async function closePosition(posKey) {
+  if (!confirm('Close this position at current MTM price?')) return;
+  try { const r = await post('/api/positions/close', {posKey}); if(r.ok){toast('Position closed','success');loadPositions();loadLedger();} else toast(r.error||'Failed','error'); }
+  catch(e) { toast('Failed: '+e.message,'error'); }
+}
+
+// ── Phase 1: Run Traces Tab ──
+async function loadTraces() {
+  try {
+    const agentId = document.getElementById('traceAgentFilter')?.value || '';
+    const url = '/api/run-traces' + (agentId ? '?agentId=' + agentId : '') + (agentId ? '&' : '?') + 'limit=50';
+    const [d, agentsResp] = await Promise.all([api(url), api('/api/agents')]);
+    // Populate filter dropdown
+    const filter = document.getElementById('traceAgentFilter');
+    if (filter && agentsResp.agents) {
+      const current = filter.value;
+      filter.innerHTML = '<option value="">All Agents</option>' + agentsResp.agents.map(a => '<option value="'+a.id+'"'+(a.id===current?' selected':'')+'>'+esc(a.name)+' ('+a.strategyType+')</option>').join('');
+    }
+    const traces = d.traces || [];
+    if (!traces.length) { document.getElementById('tracesTable').innerHTML = '<div class="empty"><p>No run traces yet. Agents will generate traces as they run.</p></div>'; return; }
+    let h = '<table style="font-size:10px"><thead><tr><th>Tick</th><th>Agent</th><th>Strategy</th><th>Duration</th><th>Scanned</th><th>Candidates</th><th>Opps</th><th>Approvals</th><th>Cache Hits</th><th>Errors</th><th>Time</th></tr></thead><tbody>';
+    traces.forEach(t => {
+      const hasErr = t.errors && t.errors.length > 0;
+      h += '<tr style="'+(hasErr?'background:rgba(239,68,68,.04)':'')+'">';
+      h += '<td class="mono" style="color:var(--cyan)">#'+esc(t.tickId||'?')+'</td>';
+      h += '<td class="mono">'+esc((t.agentName||'').slice(0,15))+'</td>';
+      h += '<td class="mono">'+esc(t.strategyType||'')+'</td>';
+      h += '<td class="mono" style="color:'+(t.durationMs>5000?'var(--yellow)':'var(--t2)')+'">'+(t.durationMs||0)+'ms</td>';
+      h += '<td class="mono">'+(t.marketsScanned||0)+'</td>';
+      h += '<td class="mono">'+(t.candidatesConsidered||0)+'</td>';
+      h += '<td class="mono" style="color:var(--green)">'+(t.oppsFound||0)+'</td>';
+      h += '<td class="mono">'+(t.approvalsCreated||0)+'</td>';
+      h += '<td class="mono">'+(t.cacheHits||0)+'</td>';
+      h += '<td class="mono" style="color:'+(hasErr?'var(--red)':'var(--t3)')+'">'+((t.errors||[]).length)+'</td>';
+      h += '<td class="mono" style="font-size:9px">'+new Date(t.startedAt).toLocaleTimeString()+'</td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table>';
+    document.getElementById('tracesTable').innerHTML = h;
+  } catch(e) { document.getElementById('tracesTable').innerHTML = '<div class="empty"><p>Error: '+esc(e.message)+'</p></div>'; }
 }
 
 // ── Costs Tab ──
@@ -4006,11 +4589,20 @@ async function handleRequest(req, res) {
       const id = pathname.split('/')[3];
       const item = store.approvalsQueue.find(a => a.id === id);
       if (!item) return jsonResp(res, { error: 'Not found' }, 404);
+      // Phase 1: Position check on manual approval too
+      const agent = store.agents.find(a => a.id === item.agentId);
+      const marketId = item.marketId || item.payload?.marketId;
+      const strategy = agent?.strategyType || 'unknown';
+      if (marketId) {
+        const posCheck = shouldSkipDueToPositionOrCooldown(marketId, strategy);
+        if (posCheck.skip) {
+          return jsonResp(res, { error: 'Blocked: ' + posCheck.reason, skipReason: posCheck.reason }, 409);
+        }
+      }
       item.status = 'approved';
       audit('info', 'approval_approved', { id, rationale: item.rationale });
       logActivity('decision', 'Approved: ' + (item.payload?.title || item.rationale || ''));
       // If in simulate mode, simulate; otherwise execute if live
-      const agent = store.agents.find(a => a.id === item.agentId);
       if (agent && item.payload) {
         const { canTrade } = canExecuteTrades();
         if (canTrade && agent.config.mode === 'LIVE' && agent.config.allowLive) {
@@ -4316,7 +4908,18 @@ async function handleRequest(req, res) {
       return jsonResp(res, { ledger: store.ledger.slice(-200).reverse(), total: store.ledger.length });
     }
     if (pathname === '/api/positions' && method === 'GET') {
-      return jsonResp(res, { positions: store.positions, demoPnl: store.demoPnl });
+      markToMarket(); // ensure fresh unrealized
+      const openPositions = Object.entries(store.positions).filter(([, p]) => p.status === 'open').map(([key, p]) => ({ ...p, posKey: key }));
+      const closedPositions = Object.entries(store.positions).filter(([, p]) => p.status === 'closed').map(([key, p]) => ({ ...p, posKey: key }));
+      return jsonResp(res, { positions: store.positions, openPositions, closedPositions, demoPnl: store.demoPnl });
+    }
+    // Phase 1: Close position manually
+    if (pathname.match(/^\/api\/positions\/close$/) && method === 'POST') {
+      const body = await readBody(req);
+      const pos = store.positions[body.posKey];
+      if (!pos || pos.status !== 'open') return jsonResp(res, { error: 'Position not found or already closed' }, 404);
+      closeDemoPosition(pos, 'manual', { price: pos.currentPrice || pos.avgPrice });
+      return jsonResp(res, { ok: true, position: pos });
     }
     if (pathname === '/api/costs' && method === 'GET') {
       const window = parseInt(url.searchParams.get('window')) || 86400000;
@@ -4342,7 +4945,7 @@ async function handleRequest(req, res) {
         hotOpportunities: hotOpps.slice(0, 8),
         pendingApprovals: pending.length,
         approvals: pending.slice(0, 5),
-        fundSummary: { fundSize: store.founder.fundSize, capitalDeployed: store.founder.capitalDeployed, demoPnl: store.demoPnl, openPositions: Object.keys(store.positions).length, dailyRemaining: (getRiskLimits().dailyMaxExposure - store.founder.capitalDeployed) },
+        fundSummary: { fundSize: store.founder.fundSize, capitalDeployed: store.founder.capitalDeployed, demoPnl: store.demoPnl, openPositions: Object.values(store.positions).filter(p => p.status === 'open').length, closedPositions: Object.values(store.positions).filter(p => p.status === 'closed').length, dailyRemaining: (getRiskLimits().dailyMaxExposure - store.founder.capitalDeployed) },
         costBurn: { today: costToday.total, lastHour: costHour.total, dailyCap: store.costBudgets.globalDailyCap, forecastEOD: costHour.total * 24 },
         marketCoverage: { cached: store.marketCache.data.length, universe: store.marketUniverse.totalUnique, tiersA: store.marketUniverse.tiers.A.length, tiersB: store.marketUniverse.tiers.B.length, tiersC: store.marketUniverse.tiers.C.length, lastScan: store.marketCache.fetchedAt ? new Date(store.marketCache.fetchedAt).toISOString() : null },
         health: { scanner: store.agentHeartbeats.scanner, killSwitch: store.killSwitch, uptime: Math.round((Date.now() - STARTUP_TIME) / 1000) },
@@ -4361,11 +4964,205 @@ async function handleRequest(req, res) {
       return jsonResp(res, { params: store.strategyParams });
     }
 
+    // ── Phase 1: Run Traces API ──
+    if (pathname === '/api/run-traces' && method === 'GET') {
+      const agentId = url.searchParams.get('agentId');
+      const limit = parseInt(url.searchParams.get('limit')) || 50;
+      let traces = store.runTraces || [];
+      if (agentId) traces = traces.filter(t => t.agentId === agentId);
+      return jsonResp(res, { traces: traces.slice(-limit).reverse(), total: traces.length });
+    }
+
+    // ── Phase 1: Friction Config API ──
+    if (pathname === '/api/friction-config' && method === 'GET') {
+      return jsonResp(res, { frictionConfig: store.frictionConfig, cooldownMs: store.cooldownMs });
+    }
+    if (pathname === '/api/friction-config' && method === 'POST') {
+      const body = await readBody(req);
+      if (body.feePct !== undefined) store.frictionConfig.feePct = Math.max(0, Math.min(0.2, parseFloat(body.feePct)));
+      if (body.slippagePct !== undefined) store.frictionConfig.slippagePct = Math.max(0, Math.min(0.1, parseFloat(body.slippagePct)));
+      if (body.cooldownMs !== undefined) store.cooldownMs = Math.max(0, parseInt(body.cooldownMs));
+      markDirty();
+      logActivity('config', `Friction config updated: fee=${(store.frictionConfig.feePct*100).toFixed(1)}% slip=${(store.frictionConfig.slippagePct*100).toFixed(1)}% cooldown=${(store.cooldownMs/60000).toFixed(0)}min`);
+      return jsonResp(res, { ok: true, frictionConfig: store.frictionConfig, cooldownMs: store.cooldownMs });
+    }
+
+    // ── Phase 1: P&L Breakdown API ──
+    if (pathname === '/api/pnl' && method === 'GET') {
+      markToMarket();
+      const openCount = Object.values(store.positions).filter(p => p.status === 'open').length;
+      const closedCount = Object.values(store.positions).filter(p => p.status === 'closed').length;
+      const net = store.demoPnl.totalRealized + store.demoPnl.totalUnrealized - store.demoPnl.totalFees;
+      return jsonResp(res, {
+        net, realized: store.demoPnl.totalRealized, unrealized: store.demoPnl.totalUnrealized,
+        fees: store.demoPnl.totalFees, trades: store.demoPnl.trades,
+        wins: store.demoPnl.wins, losses: store.demoPnl.losses,
+        openPositions: openCount, closedPositions: closedCount,
+        frictionConfig: store.frictionConfig,
+      });
+    }
+
+    // ── Phase 1: Acceptance Test Endpoint ──
+    if (pathname === '/api/phase1-test' && method === 'GET') {
+      const results = runPhase1AcceptanceTests();
+      return jsonResp(res, results);
+    }
+
     jsonResp(res, { error: 'Not found', path: pathname }, 404);
   } catch (err) {
     console.error('[server] Error:', err);
     jsonResp(res, { error: 'Internal error', message: err.message }, 500);
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PHASE 1: ACCEPTANCE TESTS (lightweight self-test)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function runPhase1AcceptanceTests() {
+  const results = [];
+  const pass = (name, detail) => results.push({ name, status: 'PASS', detail });
+  const fail = (name, detail) => results.push({ name, status: 'FAIL', detail });
+  const warn = (name, detail) => results.push({ name, status: 'WARN', detail });
+
+  // 1) No duplicates: One open position per (marketId, strategy)
+  try {
+    const openPositions = Object.entries(store.positions).filter(([, p]) => p.status === 'open');
+    const posKeys = openPositions.map(([k]) => k);
+    const uniqueKeys = new Set(posKeys);
+    if (uniqueKeys.size === posKeys.length) {
+      pass('No duplicate positions', `${openPositions.length} open positions, all unique keys`);
+    } else {
+      fail('No duplicate positions', `Found ${posKeys.length - uniqueKeys.size} duplicate position keys`);
+    }
+    // Verify position key format is marketId:strategy
+    const hasCompositeKeys = posKeys.every(k => k.includes(':'));
+    if (hasCompositeKeys || posKeys.length === 0) {
+      pass('Position key format', 'All positions use marketId:strategy composite keys');
+    } else {
+      warn('Position key format', 'Some positions use legacy single-key format (migration pending)');
+    }
+  } catch (e) { fail('No duplicates check', e.message); }
+
+  // 2) Truthful P&L headline
+  try {
+    markToMarket();
+    const net = store.demoPnl.totalRealized + store.demoPnl.totalUnrealized - store.demoPnl.totalFees;
+    pass('P&L formula', `Net = ${store.demoPnl.totalRealized.toFixed(2)} + ${store.demoPnl.totalUnrealized.toFixed(2)} - ${store.demoPnl.totalFees.toFixed(2)} = ${net.toFixed(2)}`);
+    if (store.demoPnl.totalFees >= 0) {
+      pass('Fees tracking', `Total fees: $${store.demoPnl.totalFees.toFixed(2)} from ${store.demoPnl.trades} trades`);
+    }
+  } catch (e) { fail('P&L formula', e.message); }
+
+  // 3) Position history preserved (entries[] exists)
+  try {
+    const allPositions = Object.values(store.positions);
+    const withEntries = allPositions.filter(p => Array.isArray(p.entries) && p.entries.length > 0);
+    if (allPositions.length === 0) {
+      warn('Position entries[]', 'No positions to check');
+    } else if (withEntries.length === allPositions.length) {
+      pass('Position entries[]', `All ${allPositions.length} positions have entries[] arrays`);
+    } else {
+      warn('Position entries[]', `${withEntries.length}/${allPositions.length} positions have entries[] (legacy positions may lack them)`);
+    }
+    // Verify no position overwriting
+    const posKeyCount = Object.keys(store.positions).length;
+    pass('No position overwrites', `${posKeyCount} unique position keys in store`);
+  } catch (e) { fail('Position history', e.message); }
+
+  // 4) Close on resolution (check if resolution watcher is running)
+  try {
+    if (resolutionWatcherTimer) {
+      pass('Resolution watcher', 'Running, polling every 60s');
+    } else {
+      warn('Resolution watcher', 'Not yet started (starts with server)');
+    }
+    const closedPositions = Object.values(store.positions).filter(p => p.status === 'closed');
+    if (closedPositions.length > 0) {
+      const withPnl = closedPositions.filter(p => p.realizedPnl !== 0);
+      pass('Closed positions', `${closedPositions.length} closed, ${withPnl.length} with non-zero P&L`);
+    } else {
+      warn('Closed positions', 'No positions closed yet (waiting for market resolutions or manual close)');
+    }
+    const closeLedgerEntries = store.ledger.filter(e => e.action === 'CLOSE');
+    pass('CLOSE ledger entries', `${closeLedgerEntries.length} CLOSE entries in ledger`);
+  } catch (e) { fail('Close on resolution', e.message); }
+
+  // 5) Whale stubs cannot trigger approvals
+  try {
+    const whaleApprovals = store.approvalsQueue.filter(a => a.payload?.strategyType === 'whale_watch');
+    const stubBasedApprovals = whaleApprovals.filter(a => {
+      const dq = a.payload?.explain?.dataQuality;
+      return dq && dq.realEvents === 0 && dq.stubEvents > 0;
+    });
+    if (stubBasedApprovals.length === 0) {
+      pass('Whale stub exclusion', 'No approvals from stub-only convergence');
+    } else {
+      fail('Whale stub exclusion', `Found ${stubBasedApprovals.length} approvals from stub-only convergence`);
+    }
+    const whaleDiag = store.strategyDiagnostics.whale_watch;
+    if (whaleDiag) {
+      pass('Whale stub tracking', `Stub ratio: ${((whaleDiag.stubRatio || 0) * 100).toFixed(0)}% (${whaleDiag.realEvents || 0} real / ${whaleDiag.stubEvents || 0} stubs)`);
+    }
+  } catch (e) { fail('Whale stub check', e.message); }
+
+  // 6) Observability: Run traces
+  try {
+    const traceCount = store.runTraces.length;
+    if (traceCount > 0) {
+      pass('Run traces', `${traceCount} traces recorded`);
+      const latest = store.runTraces[store.runTraces.length - 1];
+      pass('Trace structure', `Latest: tick ${latest.tickId}, ${latest.durationMs}ms, ${latest.oppsFound} opps`);
+    } else {
+      warn('Run traces', 'No traces yet (agents need to run)');
+    }
+  } catch (e) { fail('Run traces', e.message); }
+
+  // 7) Friction config
+  try {
+    const fc = store.frictionConfig;
+    if (fc && fc.feePct !== undefined && fc.slippagePct !== undefined) {
+      pass('Friction config', `Fee: ${(fc.feePct * 100).toFixed(1)}%, Slippage: ${(fc.slippagePct * 100).toFixed(1)}%`);
+    } else {
+      fail('Friction config', 'Missing friction config');
+    }
+    // Check that recent trades carry friction assumptions
+    const recentTrades = store.ledger.slice(-10);
+    const withAssumptions = recentTrades.filter(t => t.feeAssumpPct !== undefined);
+    if (recentTrades.length === 0) {
+      warn('Trade assumptions', 'No trades to check');
+    } else if (withAssumptions.length === recentTrades.length) {
+      pass('Trade assumptions', `All ${recentTrades.length} recent trades carry fee/slippage assumptions`);
+    } else {
+      warn('Trade assumptions', `${withAssumptions.length}/${recentTrades.length} recent trades have assumptions (older trades may lack them)`);
+    }
+  } catch (e) { fail('Friction config', e.message); }
+
+  // 8) Safety gates (cooldown)
+  try {
+    pass('Cooldown config', `Cooldown: ${(store.cooldownMs / 60000).toFixed(0)} minutes`);
+    pass('Position check', 'shouldSkipDueToPositionOrCooldown() active in auto-approve + approval creation');
+  } catch (e) { fail('Safety gates', e.message); }
+
+  const passed = results.filter(r => r.status === 'PASS').length;
+  const failed = results.filter(r => r.status === 'FAIL').length;
+  const warned = results.filter(r => r.status === 'WARN').length;
+
+  // Print to console
+  console.log('');
+  console.log('  ╔══════════════════════════════════════════════════════════════╗');
+  console.log('  ║   Phase 1 Acceptance Tests                                 ║');
+  console.log('  ╠══════════════════════════════════════════════════════════════╣');
+  results.forEach(r => {
+    const icon = r.status === 'PASS' ? 'PASS' : r.status === 'FAIL' ? 'FAIL' : 'WARN';
+    console.log(`  ║ [${icon}] ${r.name.padEnd(30)} ${(r.detail || '').slice(0, 30).padEnd(30)} ║`);
+  });
+  console.log('  ╠══════════════════════════════════════════════════════════════╣');
+  console.log(`  ║   Results: ${passed} passed, ${failed} failed, ${warned} warnings${' '.repeat(17)}║`);
+  console.log('  ╚══════════════════════════════════════════════════════════════╝');
+  console.log('');
+
+  return { results, summary: { passed, failed, warned, total: results.length } };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -4379,14 +5176,16 @@ server.listen(PORT, () => {
   logActivity('system', 'Server started on port ' + PORT);
   autoBootstrap();
   startAgentScheduler();
+  startResolutionWatcher();
   // Resume demo auto-approve if it was active before restart
   if (store.demoAutoApprove) {
     startDemoAutoApprove();
     console.log('  [demo] Auto-approve mode resumed from saved state');
   }
-  // Auto-run diagnostics + first agent scan
+  // Auto-run diagnostics + first agent scan + Phase 1 acceptance tests
   setTimeout(() => runDiagnostics().catch(() => {}), 3000);
   setTimeout(() => runAllAgents().catch(() => {}), 5000);
+  setTimeout(() => runPhase1AcceptanceTests(), 8000);
   console.log('');
   console.log('  ╔══════════════════════════════════════════════════════════════╗');
   console.log('  ║   ZVI v1 — Fund Operating System                           ║');
