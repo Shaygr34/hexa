@@ -20,60 +20,69 @@ const AGENT_ID = 'negrisk-scanner';
  * Build outcome legs from a group of NegRisk markets.
  * Each market in the group represents one outcome.
  */
+/**
+ * Parse token IDs from a GammaMarket.
+ * API returns clobTokenIds as a JSON string: '["yesTokenId", "noTokenId"]'
+ */
+function getTokenIds(market: GammaMarket): { yesTokenId: string; noTokenId: string } | null {
+  if (market.tokens && market.tokens.length >= 2) {
+    const yes = market.tokens.find(t => t.outcome === 'Yes') || market.tokens[0];
+    const no = market.tokens.find(t => t.outcome === 'No') || market.tokens[1];
+    return { yesTokenId: yes.token_id, noTokenId: no.token_id };
+  }
+  if (market.clobTokenIds) {
+    try {
+      const ids: string[] = typeof market.clobTokenIds === 'string'
+        ? JSON.parse(market.clobTokenIds)
+        : market.clobTokenIds;
+      if (ids.length >= 2) return { yesTokenId: ids[0], noTokenId: ids[1] };
+    } catch (_) {}
+  }
+  return null;
+}
+
 async function buildLegs(markets: GammaMarket[], mode: '1A' | '1B'): Promise<OutcomeLeg[]> {
   const legs: OutcomeLeg[] = [];
 
   for (const market of markets) {
-    if (!market.tokens || market.tokens.length === 0) continue;
-
-    // Each NegRisk market has YES (index 0) and NO (index 1) tokens
-    const yesToken = market.tokens.find(t => t.outcome === 'Yes') || market.tokens[0];
-    if (!yesToken) continue;
+    const tokenIds = getTokenIds(market);
+    if (!tokenIds) continue;
 
     try {
-      const book = await fetchOrderbook(yesToken.token_id);
+      const book = await fetchOrderbook(tokenIds.yesTokenId);
       const ask = bestAsk(book);
-      const bid = bestBid(book);
       const bookSpread = spread(book);
 
       if (mode === '1A') {
-        // For 1A (buy all YES): we care about YES ask price
         const depth = depthAtPrice(book.asks, 'asks');
         legs.push({
-          tokenId: yesToken.token_id,
-          outcome: market.question || yesToken.outcome,
-          price: ask?.price ?? 1, // If no ask, price = 1 (no edge)
+          tokenId: tokenIds.yesTokenId,
+          outcome: market.question,
+          price: ask?.price ?? 1,
           depthUsdc: depth.depthUsdc,
           spread: bookSpread,
-          stale: false, // TODO: check timestamp
+          stale: false,
         });
       } else {
-        // For 1B (buy all NO): we use YES price (to compute Σ(YES) > 1)
-        // but we'd actually buy the NO token
-        const noToken = market.tokens.find(t => t.outcome === 'No') || market.tokens[1];
-        if (!noToken) continue;
-
-        const noBook = await fetchOrderbook(noToken.token_id);
-        const noAsk = bestAsk(noBook);
+        const noBook = await fetchOrderbook(tokenIds.noTokenId);
         const noDepth = depthAtPrice(noBook.asks, 'asks');
 
         legs.push({
-          tokenId: noToken.token_id,
-          outcome: market.question || noToken.outcome,
-          price: ask?.price ?? 0, // YES price for sum computation
+          tokenId: tokenIds.noTokenId,
+          outcome: market.question,
+          price: ask?.price ?? 0,
           depthUsdc: noDepth.depthUsdc,
           spread: bookSpread,
           stale: false,
         });
       }
 
-      // Rate limit: small delay between orderbook fetches
       await sleep(200);
     } catch (e: any) {
-      console.warn(`[NegRisk] Failed to fetch orderbook for ${yesToken.token_id}: ${e.message}`);
+      console.warn(`[NegRisk] Failed to fetch orderbook for ${market.question}: ${e.message}`);
       legs.push({
-        tokenId: yesToken.token_id,
-        outcome: market.question || yesToken.outcome,
+        tokenId: tokenIds.yesTokenId,
+        outcome: market.question,
         price: mode === '1A' ? 1 : 0,
         depthUsdc: 0,
         spread: 1,
@@ -122,7 +131,7 @@ export async function scanOnce(): Promise<NegRiskOpportunity[]> {
       if (legs1A.length >= 2) {
         const input1A: MathEngineInput = {
           marketId: negRiskId,
-          conditionId: eventMarkets[0]?.condition_id || '',
+          conditionId: eventMarkets[0]?.conditionId || eventMarkets[0]?.condition_id || '',
           marketName: eventName,
           marketSlug: eventMarkets[0]?.slug || '',
           type: '1A_BUY_ALL_YES',
@@ -142,7 +151,7 @@ export async function scanOnce(): Promise<NegRiskOpportunity[]> {
       if (sumYes > 1) {
         const input1B: MathEngineInput = {
           marketId: negRiskId,
-          conditionId: eventMarkets[0]?.condition_id || '',
+          conditionId: eventMarkets[0]?.conditionId || eventMarkets[0]?.condition_id || '',
           marketName: eventName,
           marketSlug: eventMarkets[0]?.slug || '',
           type: '1B_BUY_ALL_NO_CONVERT',

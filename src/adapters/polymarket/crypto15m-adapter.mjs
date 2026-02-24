@@ -1,309 +1,270 @@
-#!/usr/bin/env node
+// crypto15m-adapter.mjs — Resolve BTC/ETH/SOL/XRP 15-minute Up/Down markets
+// Uses Gamma (market lookup) + CLOB (orderbook reads) only. No Polygon RPC.
+//
+// MODE A (default): live window resolver — finds ACTIVE markets with valid CLOB books
+// MODE B (--discover): broad keyword search across all active markets
+
+import { writeFileSync } from 'fs';
+import { join } from 'path';
+
+const GAMMA = process.env.POLYMARKET_GAMMA_URL || 'https://gamma-api.polymarket.com';
+const CLOB = process.env.POLYMARKET_CLOB_URL || 'https://clob.polymarket.com';
+const STATE_PATH = join(process.cwd(), 'zvi_state.json');
+
 // ═══════════════════════════════════════════════════════════════
-// ZVI v1 — Crypto 15-min UP/DOWN Market Adapter
-// Resolves Polymarket event metadata + token IDs for the anchor
-// crypto 15m markets. Persists to zvi_state.json.
+// CONFIG
 // ═══════════════════════════════════════════════════════════════
+const SYMBOLS = ['btc', 'eth', 'sol', 'xrp'];
+const SLOT_SECONDS = 900; // 15 minutes
+const SANITY_TOLERANCE = 0.05; // yesMid + noMid should be within 1 ± this
 
-import https from 'node:https';
-import fs from 'node:fs';
-import path from 'node:path';
+function currentSlotTimestamp() {
+  return Math.floor(Date.now() / 1000 / SLOT_SECONDS) * SLOT_SECONDS;
+}
 
-const BASE_DIR = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', '..', '..');
-const STATE_PATH = path.join(BASE_DIR, 'zvi_state.json');
+function slugFor(symbol, timestamp) {
+  return `${symbol}-updown-15m-${timestamp}`;
+}
 
-const GAMMA_BASE = process.env.POLYMARKET_GAMMA_URL || 'https://gamma-api.polymarket.com';
-const CLOB_BASE = process.env.POLYMARKET_CLOB_URL || 'https://clob.polymarket.com';
+// Trading window = endDate - 15min → endDate
+function tradingWindow(endDate) {
+  const end = new Date(endDate);
+  const start = new Date(end.getTime() - SLOT_SECONDS * 1000);
+  return { tradingStart: start.toISOString(), tradingEnd: end.toISOString() };
+}
 
-// ── Anchor Markets ──────────────────────────────────────────────
-export const ANCHOR_EVENTS = [
-  { asset: 'BTC', slug: 'btc-updown-15m-1771925400', url: 'https://polymarket.com/event/btc-updown-15m-1771925400' },
-  { asset: 'ETH', slug: 'eth-updown-15m-1771925400', url: 'https://polymarket.com/event/eth-updown-15m-1771925400' },
-  { asset: 'SOL', slug: 'sol-updown-15m-1771925400', url: 'https://polymarket.com/event/sol-updown-15m-1771925400' },
-  { asset: 'XRP', slug: 'xrp-updown-15m-1771925400', url: 'https://polymarket.com/event/xrp-updown-15m-1771925400' },
-];
+function fmtWindow(startIso, endIso) {
+  const fmt = d => new Date(d).toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+  return `${fmt(startIso)} → ${fmt(endIso)}`;
+}
 
-// ── HTTP helpers ────────────────────────────────────────────────
-function httpGetJson(url, timeoutMs = 10000) {
-  return new Promise((resolve, reject) => {
-    const start = Date.now();
-    const req = https.get(url, { headers: { 'Accept': 'application/json' } }, (res) => {
-      let body = '';
-      res.on('data', (chunk) => (body += chunk));
-      res.on('end', () => {
-        const latencyMs = Date.now() - start;
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          try { resolve({ data: JSON.parse(body), latencyMs, status: res.statusCode }); }
-          catch (e) { reject(new Error(`JSON parse error: ${e.message}`)); }
-        } else {
-          reject(new Error(`HTTP ${res.statusCode}: ${body.slice(0, 200)}`));
+// ═══════════════════════════════════════════════════════════════
+// CLOB helpers — fetch BOTH Up and Down books explicitly
+// ═══════════════════════════════════════════════════════════════
+async function fetchBook(tokenId) {
+  try {
+    const r = await fetch(`${CLOB}/book?token_id=${tokenId}`, { headers: { Accept: 'application/json' } });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (_) { return null; }
+}
+
+function topOfBook(book) {
+  if (!book) return { bid: null, ask: null, mid: null, bidSize: null, askSize: null, bidCount: 0, askCount: 0 };
+  const bids = (book.bids || []).sort((a, b) => parseFloat(b.price) - parseFloat(a.price));
+  const asks = (book.asks || []).sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
+  const bid = bids[0] ? parseFloat(bids[0].price) : null;
+  const ask = asks[0] ? parseFloat(asks[0].price) : null;
+  const mid = (bid != null && ask != null) ? (bid + ask) / 2 : null;
+  return {
+    bid, ask, mid,
+    bidSize: bids[0] ? parseFloat(bids[0].size) : null,
+    askSize: asks[0] ? parseFloat(asks[0].size) : null,
+    bidCount: bids.length,
+    askCount: asks.length,
+  };
+}
+
+function parseJsonField(val) {
+  if (!val) return [];
+  if (Array.isArray(val)) return val;
+  try { return JSON.parse(val); } catch (_) { return []; }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MODE A: Live window resolver
+// ═══════════════════════════════════════════════════════════════
+async function resolveBySlug() {
+  const slot = currentSlotTimestamp();
+  // Try next slot first (most likely to be actively trading), then current, then +2
+  const candidates = [slot + SLOT_SECONDS, slot, slot + 2 * SLOT_SECONDS];
+
+  console.log('[crypto15m] MODE A: live window resolver');
+  console.log(`[crypto15m] Trying slots: ${candidates.join(', ')}`);
+  console.log(`[crypto15m] Resolving ${SYMBOLS.length} symbols...\n`);
+
+  const universeActive = [];
+  const universeHistory = [];
+
+  for (const sym of SYMBOLS) {
+    let found = false;
+
+    for (const ts of candidates) {
+      const slug = slugFor(sym, ts);
+      let markets = [];
+      try {
+        const r = await fetch(`${GAMMA}/markets?slug=${slug}`, { headers: { Accept: 'application/json' } });
+        if (r.ok) markets = await r.json();
+      } catch (_) { continue; }
+
+      const market = markets[0];
+      if (!market || market.closed) {
+        if (market?.closed) {
+          universeHistory.push(buildRecord(sym, slug, market, null, null));
         }
-      });
-    });
-    req.on('error', reject);
-    req.setTimeout(timeoutMs, () => { req.destroy(); reject(new Error('timeout')); });
+        continue;
+      }
+
+      // Found an open market — fetch BOTH token books
+      const tokenIds = parseJsonField(market.clobTokenIds);
+      const upTokenId = tokenIds[0];
+      const downTokenId = tokenIds[1];
+
+      if (!upTokenId || !downTokenId) continue;
+
+      const [upBook, downBook] = await Promise.all([
+        fetchBook(upTokenId),
+        fetchBook(downTokenId),
+      ]);
+
+      const up = topOfBook(upBook);
+      const down = topOfBook(downBook);
+
+      // Sanity: need at least bids on one side to be a real book
+      if (up.bidCount === 0 && up.askCount === 0) {
+        continue; // CLOB not ready for this slot
+      }
+
+      const record = buildRecord(sym, slug, market, up, down);
+
+      // Sanity check
+      if (up.mid != null && down.mid != null) {
+        const sum = up.mid + down.mid;
+        if (Math.abs(sum - 1.0) > SANITY_TOLERANCE) {
+          console.log(`[crypto15m]   ⚠ SANITY FAIL ${sym.toUpperCase()}: upMid=${up.mid} + downMid=${down.mid} = ${sum.toFixed(4)} (expected ~1.0)`);
+          console.log(`[crypto15m]     upToken=${upTokenId}`);
+          console.log(`[crypto15m]     downToken=${downTokenId}`);
+        }
+      }
+
+      universeActive.push(record);
+
+      const tw = tradingWindow(market.endDate);
+      console.log(`[crypto15m]   ${sym.toUpperCase()}: [ACTIVE] "${market.question}"`);
+      console.log(`[crypto15m]     slug=${slug}`);
+      console.log(`[crypto15m]     window: ${fmtWindow(tw.tradingStart, tw.tradingEnd)}`);
+      console.log(`[crypto15m]     Up: bid=${up.bid} ask=${up.ask} mid=${up.mid} (${up.bidCount}b/${up.askCount}a)`);
+      console.log(`[crypto15m]     Dn: bid=${down.bid} ask=${down.ask} mid=${down.mid} (${down.bidCount}b/${down.askCount}a)`);
+      if (up.mid != null && down.mid != null) {
+        console.log(`[crypto15m]     sum=${(up.mid + down.mid).toFixed(4)} | lastTrade: Up=${record.lastTradePrice.up} Dn=${record.lastTradePrice.down}`);
+      }
+      found = true;
+      break;
+    }
+
+    if (!found) {
+      const triedSlugs = candidates.map(ts => slugFor(sym, ts));
+      console.log(`[crypto15m]   ${sym.toUpperCase()}: NO ACTIVE WINDOW WITH CLOB`);
+      console.log(`[crypto15m]     tried: ${triedSlugs.join(', ')}`);
+    }
+  }
+
+  return { universeActive, universeHistory };
+}
+
+function buildRecord(sym, slug, market, up, down) {
+  const outcomes = parseJsonField(market.outcomes);
+  const prices = parseJsonField(market.outcomePrices);
+  const tokenIds = parseJsonField(market.clobTokenIds);
+  const tw = market.endDate ? tradingWindow(market.endDate) : { tradingStart: null, tradingEnd: null };
+
+  return {
+    symbol: sym.toUpperCase(),
+    slug,
+    status: market.closed ? 'closed' : 'active',
+    marketId: market.id,
+    conditionId: market.conditionId || null,
+    question: market.question,
+    enableOrderBook: market.enableOrderBook ?? null,
+    outcomes,
+    tokenIds: { up: tokenIds[0] || null, down: tokenIds[1] || null },
+    // Last trade / outcome prices from Gamma
+    lastTradePrice: {
+      up: prices[0] ? parseFloat(prices[0]) : null,
+      down: prices[1] ? parseFloat(prices[1]) : null,
+    },
+    // Live CLOB book data
+    up: up ? { bid: up.bid, ask: up.ask, mid: up.mid, bidSize: up.bidSize, askSize: up.askSize, bidCount: up.bidCount, askCount: up.askCount } : null,
+    down: down ? { bid: down.bid, ask: down.ask, mid: down.mid, bidSize: down.bidSize, askSize: down.askSize, bidCount: down.bidCount, askCount: down.askCount } : null,
+    sanitySum: (up?.mid != null && down?.mid != null) ? parseFloat((up.mid + down.mid).toFixed(4)) : null,
+    // Window
+    tradingWindowStart: tw.tradingStart,
+    tradingWindowEnd: tw.tradingEnd,
+    rawStartDate: market.startDate || null,
+    rawEndDate: market.endDate || null,
+    description: (market.description || '').slice(0, 200),
+    volume: market.volumeNum || 0,
+    liquidity: market.liquidityNum || 0,
+    resolvedAt: new Date().toISOString(),
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MODE B: Discovery search
+// ═══════════════════════════════════════════════════════════════
+async function discoverMarkets() {
+  console.log('[crypto15m] MODE B: discovery search');
+  const allMarkets = [];
+  for (let offset = 0; offset <= 2000; offset += 200) {
+    const r = await fetch(`${GAMMA}/markets?closed=false&active=true&limit=200&offset=${offset}`, { headers: { Accept: 'application/json' } });
+    if (!r.ok) break;
+    const batch = await r.json();
+    if (batch.length === 0) break;
+    allMarkets.push(...batch);
+  }
+  console.log(`[crypto15m] Scanned ${allMarkets.length} active markets`);
+  for (const entry of [{ s: 'BTC', k: ['bitcoin', 'btc'] }, { s: 'ETH', k: ['ethereum'] }, { s: 'SOL', k: ['solana'] }, { s: 'XRP', k: ['xrp', 'ripple'] }]) {
+    const matches = allMarkets.filter(m => entry.k.some(k => new RegExp(`\\b${k}\\b`, 'i').test(m.question || '')));
+    console.log(`  ${entry.s}: ${matches.length} matches`);
+    for (const m of matches.slice(0, 5)) console.log(`    - [${m.id}] ${m.question}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════
+async function resolve() {
+  if (process.argv.includes('--discover')) {
+    await discoverMarkets();
+    return;
+  }
+
+  const { universeActive, universeHistory } = await resolveBySlug();
+
+  const windowRange = universeActive.length > 0
+    ? fmtWindow(universeActive[0].tradingWindowStart, universeActive[0].tradingWindowEnd)
+    : 'none';
+
+  const state = {
+    universeActive,
+    universeHistory,
+    activeWindow: windowRange,
+    resolvedAt: new Date().toISOString(),
+    activeCount: universeActive.length,
+    closedCount: universeHistory.length,
+  };
+
+  writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
+
+  console.log(`\n[crypto15m] resolved ${universeActive.length} active + ${universeHistory.length} history`);
+  if (universeActive.length > 0) {
+    console.log(`[crypto15m] active window: ${windowRange}`);
+  }
+  console.log(`[crypto15m] saved → zvi_state.json`);
+
+  return state;
+}
+
+// Only auto-run when invoked directly (not when imported by controller/measure)
+const isMain = process.argv[1] && (
+  process.argv[1].endsWith('crypto15m-adapter.mjs') ||
+  process.argv[1].includes('crypto15m-adapter')
+);
+if (isMain) {
+  resolve().catch(e => {
+    console.error('[crypto15m] Fatal:', e.message);
+    process.exit(1);
   });
 }
 
-// ── Gamma: resolve event slug → markets + tokens ────────────────
-async function resolveEventBySlug(slug) {
-  // The Gamma API /events endpoint keyed by slug
-  const url = `${GAMMA_BASE}/events?slug=${encodeURIComponent(slug)}`;
-  try {
-    const { data, latencyMs } = await httpGetJson(url);
-    const events = Array.isArray(data) ? data : [data];
-    const event = events.find(e => e && e.slug === slug) || events[0];
-    if (!event) return null;
-    return { event, latencyMs };
-  } catch {
-    // Fallback: search markets by slug substring
-    try {
-      const marketsUrl = `${GAMMA_BASE}/markets?slug=${encodeURIComponent(slug)}&limit=10`;
-      const { data, latencyMs } = await httpGetJson(marketsUrl);
-      if (Array.isArray(data) && data.length > 0) {
-        return { markets: data, latencyMs, fromMarketSearch: true };
-      }
-    } catch { /* swallow */ }
-    return null;
-  }
-}
-
-// ── CLOB: fetch book for a token ────────────────────────────────
-export async function fetchBook(tokenId) {
-  const url = `${CLOB_BASE}/book?token_id=${tokenId}`;
-  try {
-    const { data, latencyMs } = await httpGetJson(url);
-    return { book: data, latencyMs };
-  } catch (e) {
-    return { book: null, latencyMs: -1, error: e.message };
-  }
-}
-
-// ── Book summary helpers ────────────────────────────────────────
-export function bookSummary(book) {
-  if (!book || !book.bids || !book.asks) {
-    return { bid: 'UNAVAILABLE', ask: 'UNAVAILABLE', midpoint: 'UNAVAILABLE', spread: 'UNAVAILABLE', depthNotionalNearMid: 'UNAVAILABLE' };
-  }
-  const bids = book.bids.map(l => ({ price: Number(l.price), size: Number(l.size) })).sort((a, b) => b.price - a.price);
-  const asks = book.asks.map(l => ({ price: Number(l.price), size: Number(l.size) })).sort((a, b) => a.price - b.price);
-
-  const bestBid = bids[0]?.price ?? 0;
-  const bestAsk = asks[0]?.price ?? 1;
-  const midpoint = (bestBid + bestAsk) / 2;
-  const spread = bestAsk - bestBid;
-
-  // Depth: sum notional within 5c of mid
-  let depthBid = 0, depthAsk = 0;
-  for (const l of bids) { if (l.price >= midpoint - 0.05) depthBid += l.price * l.size; }
-  for (const l of asks) { if (l.price <= midpoint + 0.05) depthAsk += l.price * l.size; }
-
-  return {
-    bid: bestBid,
-    ask: bestAsk,
-    midpoint: +midpoint.toFixed(4),
-    spread: +spread.toFixed(4),
-    depthNotionalNearMid: +((depthBid + depthAsk).toFixed(2)),
-  };
-}
-
-// ── Build universe entry for one anchor ─────────────────────────
-async function buildUniverseEntry(anchor) {
-  const entry = {
-    asset: anchor.asset,
-    eventSlug: anchor.slug,
-    eventUrl: anchor.url,
-    marketId: 'UNAVAILABLE',
-    conditionId: 'UNAVAILABLE',
-    yesTokenId: 'UNAVAILABLE',
-    noTokenId: 'UNAVAILABLE',
-    outcomeTokenIds: [],
-    question: 'UNAVAILABLE',
-    startTimestamp: 'UNAVAILABLE',
-    endTimestamp: 'UNAVAILABLE',
-    windowMinutes: 15,
-    rulesRaw: 'UNAVAILABLE',
-    rulesParsed: { type: 'crypto-15m-updown', asset: anchor.asset, windowMinutes: 15 },
-    enableOrderBook: 'UNAVAILABLE',
-    resolvedAt: new Date().toISOString(),
-    bookSummary: { yes: null, no: null },
-  };
-
-  const result = await resolveEventBySlug(anchor.slug);
-
-  if (result && result.event) {
-    const ev = result.event;
-    entry.marketId = ev.id || ev.market_id || 'UNAVAILABLE';
-    entry.conditionId = ev.condition_id || 'UNAVAILABLE';
-    entry.question = ev.title || ev.question || 'UNAVAILABLE';
-    entry.enableOrderBook = ev.enable_order_book ?? ev.enableOrderBook ?? 'UNAVAILABLE';
-    entry.rulesRaw = ev.description || ev.rules || 'UNAVAILABLE';
-    entry.startTimestamp = ev.start_date || ev.startDate || 'UNAVAILABLE';
-    entry.endTimestamp = ev.end_date || ev.endDate || 'UNAVAILABLE';
-
-    // Extract token IDs from event markets
-    const markets = ev.markets || [];
-    for (const mkt of markets) {
-      const tokens = mkt.tokens || mkt.clobTokenIds || [];
-      if (Array.isArray(tokens)) {
-        for (const tok of tokens) {
-          const tid = typeof tok === 'string' ? tok : tok.token_id;
-          const outcome = typeof tok === 'object' ? tok.outcome : null;
-          if (tid) {
-            entry.outcomeTokenIds.push({ tokenId: tid, outcome: outcome || 'UNAVAILABLE', marketQuestion: mkt.question || mkt.groupItemTitle || 'UNAVAILABLE' });
-            if (outcome === 'Yes' || outcome === 'YES') entry.yesTokenId = tid;
-            if (outcome === 'No' || outcome === 'NO') entry.noTokenId = tid;
-          }
-        }
-      }
-    }
-  } else if (result && result.fromMarketSearch && result.markets) {
-    // Came from /markets search - build from market objects
-    for (const mkt of result.markets) {
-      entry.marketId = entry.marketId === 'UNAVAILABLE' ? mkt.id || mkt.condition_id : entry.marketId;
-      entry.conditionId = mkt.condition_id || entry.conditionId;
-      entry.question = mkt.question || entry.question;
-      entry.enableOrderBook = mkt.enable_order_book ?? mkt.enableOrderBook ?? entry.enableOrderBook;
-      entry.rulesRaw = mkt.description || entry.rulesRaw;
-      entry.startTimestamp = mkt.start_date || mkt.startDate || entry.startTimestamp;
-      entry.endTimestamp = mkt.end_date || mkt.endDate || mkt.end_date_iso || entry.endTimestamp;
-
-      const tokens = mkt.tokens || [];
-      for (const tok of tokens) {
-        const tid = tok.token_id || tok;
-        const outcome = tok.outcome || 'UNAVAILABLE';
-        if (tid) {
-          entry.outcomeTokenIds.push({ tokenId: tid, outcome, marketQuestion: mkt.question || 'UNAVAILABLE' });
-          if (outcome === 'Yes') entry.yesTokenId = tid;
-          if (outcome === 'No') entry.noTokenId = tid;
-        }
-      }
-
-      // Also check clobTokenIds string field
-      if (typeof mkt.clobTokenIds === 'string' && mkt.clobTokenIds.includes(',')) {
-        const ids = mkt.clobTokenIds.split(',').map(s => s.trim()).filter(Boolean);
-        const outcomes = Array.isArray(mkt.outcomes) ? (typeof mkt.outcomes[0] === 'string' ? mkt.outcomes : JSON.parse(mkt.outcomes)) : ['Yes', 'No'];
-        for (let i = 0; i < ids.length; i++) {
-          const existing = entry.outcomeTokenIds.find(t => t.tokenId === ids[i]);
-          if (!existing) {
-            entry.outcomeTokenIds.push({ tokenId: ids[i], outcome: outcomes[i] || 'UNAVAILABLE', marketQuestion: mkt.question || 'UNAVAILABLE' });
-          }
-          if ((outcomes[i] || '').toLowerCase() === 'yes') entry.yesTokenId = ids[i];
-          if ((outcomes[i] || '').toLowerCase() === 'no') entry.noTokenId = ids[i];
-        }
-      }
-    }
-  }
-
-  // Derive timestamps from slug if not resolved (epoch in slug name)
-  if (entry.startTimestamp === 'UNAVAILABLE') {
-    const epochMatch = anchor.slug.match(/(\d{10})$/);
-    if (epochMatch) {
-      const epoch = parseInt(epochMatch[1]) * 1000;
-      entry.startTimestamp = new Date(epoch).toISOString();
-      entry.endTimestamp = new Date(epoch + 15 * 60 * 1000).toISOString();
-    }
-  }
-
-  // Fetch order books for discovered tokens
-  const tokensToFetch = entry.outcomeTokenIds.slice(0, 4); // cap to avoid hammering
-  for (const tok of tokensToFetch) {
-    const { book, latencyMs } = await fetchBook(tok.tokenId);
-    const summary = bookSummary(book);
-    tok.bookSummary = summary;
-    tok.bookLatencyMs = latencyMs;
-  }
-
-  return entry;
-}
-
-// ── Main: resolve all anchors and persist ───────────────────────
-export async function resolveAndPersist() {
-  console.log('[crypto15m] Resolving anchor markets...');
-  const universe = [];
-
-  for (const anchor of ANCHOR_EVENTS) {
-    console.log(`  [${anchor.asset}] slug=${anchor.slug}`);
-    try {
-      const entry = await buildUniverseEntry(anchor);
-      universe.push(entry);
-      const tokenCount = entry.outcomeTokenIds.length;
-      console.log(`    → ${tokenCount} tokens found, marketId=${entry.marketId}`);
-    } catch (e) {
-      console.error(`    → ERROR: ${e.message}`);
-      universe.push({
-        asset: anchor.asset,
-        eventSlug: anchor.slug,
-        eventUrl: anchor.url,
-        error: e.message,
-        resolvedAt: new Date().toISOString(),
-      });
-    }
-  }
-
-  // Persist to zvi_state.json
-  let state = {};
-  try {
-    state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf-8'));
-  } catch { /* file doesn't exist yet */ }
-
-  state.crypto15m = state.crypto15m || {};
-  state.crypto15m.universe = universe;
-  state.crypto15m.lastRefresh = new Date().toISOString();
-  state.crypto15m.pollCadenceMs = 1000;
-  state.crypto15m.anchorCount = ANCHOR_EVENTS.length;
-  state.crypto15m.resolvedCount = universe.filter(u => u.marketId !== 'UNAVAILABLE').length;
-
-  fs.mkdirSync(path.dirname(STATE_PATH), { recursive: true });
-  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
-  console.log(`[crypto15m] Persisted ${universe.length} entries to ${STATE_PATH}`);
-
-  return { universe, state: state.crypto15m };
-}
-
-// ── Caps / Limits Report ────────────────────────────────────────
-export function capsReport() {
-  return {
-    fetchMarkets_standalone: {
-      location: 'standalone.mjs:760',
-      description: 'targetLimit = max(store.settings.marketLimit || 200, 500) — fetches up to 500 markets per cycle (5 batches of 100)',
-      settingKey: 'store.settings.marketLimit',
-      default: 200,
-      effectiveCap: 500,
-    },
-    fetchMarkets_standalone_maxBatches: {
-      location: 'standalone.mjs:764',
-      description: 'maxBatches = 5 — hard-coded cap of 5 pagination batches (5 × 100 = 500)',
-    },
-    fetchMarkets_standalone_settingsEndpoint: {
-      location: 'standalone.mjs:4836',
-      description: 'marketLimit clamped to [10, 5000] via /api/settings endpoint',
-    },
-    gammaApi_negrisk: {
-      location: 'src/adapters/polymarket/gamma-api.ts:35',
-      description: 'fetchNegRiskMarkets paginates with offset > 2000 safety break',
-      effectiveCap: 2000,
-    },
-    tierSlice: {
-      location: 'standalone.mjs:796',
-      description: 'Tier arrays sliced to 200 each (A/B/C)',
-      effectiveCap: '200 per tier',
-    },
-  };
-}
-
-// ── CLI entrypoint ──────────────────────────────────────────────
-if (import.meta.url === `file://${process.argv[1]}`) {
-  resolveAndPersist()
-    .then(({ universe }) => {
-      console.log('\n═══ Universe Summary ═══');
-      for (const u of universe) {
-        console.log(`${u.asset}: marketId=${u.marketId}, tokens=${(u.outcomeTokenIds || []).length}, start=${u.startTimestamp}`);
-      }
-      console.log('\n═══ Caps/Limits in fetchMarkets ═══');
-      const caps = capsReport();
-      for (const [k, v] of Object.entries(caps)) {
-        console.log(`  ${k}: ${v.description} [${v.location}]`);
-      }
-    })
-    .catch(e => { console.error('Fatal:', e); process.exit(1); });
-}
+export { resolve };
