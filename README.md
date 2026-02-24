@@ -114,7 +114,20 @@ hexa/
 
 ---
 
-## RUN LOCAL
+## QUICKSTART (one command)
+
+```bash
+cd hexa
+bash scripts/bootstrap.sh
+```
+
+This installs deps, copies `.env.example` → `.env.local` (if missing), inits the DB, and starts the dashboard on [http://localhost:3000](http://localhost:3000).
+
+> **npm audit warnings?** Expected — see [SECURITY.md](SECURITY.md). The app is safe to run. Do **not** run `npm audit fix --force`.
+
+---
+
+## RUN LOCAL (step by step)
 
 ### Prerequisites
 - Node.js 20+ (or Bun)
