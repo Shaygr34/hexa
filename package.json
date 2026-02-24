@@ -19,6 +19,7 @@
     "crypto15m:resolve": "node src/adapters/polymarket/crypto15m-adapter.mjs",
     "measure:crypto15m": "node scripts/measure_crypto15m.mjs",
     "lint": "next lint",
+    "bootstrap": "bash scripts/bootstrap.sh",
     "setup": "npm install && npm run db:init"
   },
   "dependencies": {
