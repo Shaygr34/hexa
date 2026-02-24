@@ -179,17 +179,26 @@ export interface AuditRecord {
 
 export interface GammaMarket {
   id: string;
-  condition_id: string;
+  condition_id?: string;
+  conditionId?: string;
   question: string;
   slug: string;
   active: boolean;
   closed: boolean;
-  neg_risk: boolean;
-  neg_risk_market_id: string;
-  neg_risk_request_id: string;
-  outcomes: string[];
-  tokens: GammaToken[];
-  rewards: { min_size: number; max_spread: number; rates: any[] };
+  // API returns camelCase
+  negRisk?: boolean;
+  negRiskMarketID?: string;
+  negRiskRequestID?: string;
+  // Legacy snake_case aliases
+  neg_risk?: boolean;
+  neg_risk_market_id?: string;
+  neg_risk_request_id?: string;
+  outcomes: string[] | string;  // API returns JSON string
+  outcomePrices?: string[] | string;
+  clobTokenIds?: string;  // JSON string of token IDs
+  tokens?: GammaToken[];
+  rewards?: { min_size: number; max_spread: number; rates: any[] };
+  groupItemTitle?: string;
 }
 
 export interface GammaToken {

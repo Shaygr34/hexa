@@ -7,7 +7,7 @@ import { initDb } from '@/lib/db';
 
 async function main() {
   console.log('═══════════════════════════════════════════');
-  console.log('  ZVI v1 — Agent Runner');
+  console.log('  ZVI v2 — Agent Runner');
   console.log('═══════════════════════════════════════════');
   console.log('');
 

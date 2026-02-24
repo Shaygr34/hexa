@@ -74,11 +74,12 @@ export function groupByNegRiskEvent(markets: GammaMarket[]): Map<string, GammaMa
   const groups = new Map<string, GammaMarket[]>();
 
   for (const market of markets) {
-    if (!market.neg_risk || !market.neg_risk_market_id) continue;
+    const isNegRisk = market.negRisk ?? market.neg_risk;
+    const negRiskId = market.negRiskMarketID ?? market.neg_risk_market_id;
+    if (!isNegRisk || !negRiskId) continue;
 
-    const key = market.neg_risk_market_id;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key)!.push(market);
+    if (!groups.has(negRiskId)) groups.set(negRiskId, []);
+    groups.get(negRiskId)!.push(market);
   }
 
   return groups;

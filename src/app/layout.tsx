@@ -2,7 +2,7 @@ import type { Metadata } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'ZVI v1 — Polymarket Fund OS',
+  title: 'ZVI v2 — Polymarket Fund OS',
   description: 'NegRisk Observatory + LLM Probability Engine + Signal Watcher',
 };
 

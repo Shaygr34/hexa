@@ -1,7 +1,7 @@
 {
   "name": "zvi",
   "version": "1.0.0",
-  "description": "ZVI v1 — Polymarket Fund Operating System",
+  "description": "ZVI v2 — Polymarket Fund Operating System",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -11,6 +11,9 @@
     "agents:negrisk": "tsx src/agents/negrisk-agent.ts",
     "agents:signals": "tsx src/agents/signal-watcher-agent.ts",
     "agents:llm": "tsx src/agents/llm-probability-agent.ts",
+    "crypto15m:resolve": "node src/adapters/polymarket/crypto15m-adapter.mjs",
+    "measure:crypto15m": "node scripts/measure_crypto15m.mjs",
+    "crypto15m:controller": "node src/agents/crypto15m-controller.mjs",
     "db:init": "tsx src/lib/db-init.ts",
     "test:negrisk": "tsx scripts/test-negrisk.ts",
     "test:feerate": "tsx scripts/test-feerate.ts",
