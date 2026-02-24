@@ -71,29 +71,32 @@ interface SystemConfig {
 
 // ── Dashboard ──
 export default function Dashboard() {
-  const [tab, setTab] = useState<'opportunities' | 'pinned' | 'signals' | 'control'>('opportunities');
+  const [tab, setTab] = useState<'opportunities' | 'pinned' | 'signals' | 'crypto15m' | 'control'>('opportunities');
   const [opportunities, setOpportunities] = useState<Opportunity[]>([]);
   const [pinnedMarkets, setPinnedMarkets] = useState<PinnedMarket[]>([]);
   const [signals, setSignals] = useState<Signal[]>([]);
   const [agents, setAgents] = useState<AgentHealth[]>([]);
   const [config, setConfig] = useState<SystemConfig>({ observationOnly: true, manualApprovalRequired: true, autoExec: false, killSwitch: false });
+  const [crypto15m, setCrypto15m] = useState<any>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   const fetchData = useCallback(async () => {
     try {
-      const [oppRes, pinnedRes, sigRes, healthRes, cfgRes] = await Promise.all([
+      const [oppRes, pinnedRes, sigRes, healthRes, cfgRes, c15mRes] = await Promise.all([
         fetch('/api/opportunities').then(r => r.json()).catch(() => []),
         fetch('/api/pinned-markets').then(r => r.json()).catch(() => []),
         fetch('/api/signals').then(r => r.json()).catch(() => []),
         fetch('/api/health').then(r => r.json()).catch(() => []),
         fetch('/api/control').then(r => r.json()).catch(() => ({})),
+        fetch('/api/crypto15m').then(r => r.json()).catch(() => null),
       ]);
       setOpportunities(oppRes);
       setPinnedMarkets(pinnedRes);
       setSignals(sigRes);
       setAgents(healthRes);
       if (cfgRes.observationOnly !== undefined) setConfig(cfgRes);
+      if (c15mRes) setCrypto15m(c15mRes);
     } catch (_) {}
     setLoading(false);
   }, []);
@@ -156,6 +159,9 @@ export default function Dashboard() {
         <button className={`tab ${tab === 'signals' ? 'active' : ''}`} onClick={() => setTab('signals')}>
           Signals ({signals.length})
         </button>
+        <button className={`tab ${tab === 'crypto15m' ? 'active' : ''}`} onClick={() => setTab('crypto15m')}>
+          Crypto 15m ({crypto15m?.resolvedCount ?? 0}/{crypto15m?.anchorCount ?? 4})
+        </button>
         <button className={`tab ${tab === 'control' ? 'active' : ''}`} onClick={() => setTab('control')}>
           Control Panel
         </button>
@@ -165,6 +171,7 @@ export default function Dashboard() {
         {tab === 'opportunities' && <OpportunitiesTab opps={opportunities} expandedId={expandedId} setExpandedId={setExpandedId} onApprove={handleApprove} onSimulate={handleSimulate} />}
         {tab === 'pinned' && <PinnedMarketsTab markets={pinnedMarkets} onRefresh={fetchData} />}
         {tab === 'signals' && <SignalsTab signals={signals} onRefresh={fetchData} />}
+        {tab === 'crypto15m' && <Crypto15mPanel data={crypto15m} />}
         {tab === 'control' && <ControlPanel config={config} agents={agents} onToggle={handleToggle} />}
       </div>
 
@@ -535,6 +542,166 @@ function ControlPanel({ config, agents, onToggle }: { config: SystemConfig; agen
             </div>
           ))}
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════
+// TAB 5: Crypto 15m Coverage Panel
+// ══════════════════════════════════════════
+function Crypto15mPanel({ data }: { data: any }) {
+  if (!data) {
+    return (
+      <div className="card" style={{ textAlign: 'center', padding: 40 }}>
+        <div style={{ fontSize: 16, marginBottom: 8 }}>No crypto 15m data loaded</div>
+        <div style={{ color: 'var(--text-dim)' }}>
+          Run the adapter: <code>node src/adapters/polymarket/crypto15m-adapter.mjs</code>
+        </div>
+      </div>
+    );
+  }
+
+  const universe: any[] = data.universe || [];
+  const caps: Record<string, any> = data.caps || {};
+
+  return (
+    <div>
+      {/* Summary Card */}
+      <div className="card">
+        <div className="card-title" style={{ marginBottom: 12 }}>Coverage Summary</div>
+        <div className="metrics">
+          <div className="metric">
+            <div className="metric-label">Universe</div>
+            <div className="metric-value">{data.resolvedCount}/{data.anchorCount}</div>
+          </div>
+          <div className="metric">
+            <div className="metric-label">Last Refresh</div>
+            <div className="metric-value" style={{ fontSize: 12 }}>
+              {data.lastRefresh ? new Date(data.lastRefresh).toLocaleString() : 'Never'}
+            </div>
+          </div>
+          <div className="metric">
+            <div className="metric-label">Poll Cadence</div>
+            <div className="metric-value">{data.pollCadenceMs}ms</div>
+          </div>
+          <div className="metric">
+            <div className="metric-label">Anchors</div>
+            <div className="metric-value">{data.anchorCount}</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Per-Market Cards */}
+      {universe.map((entry: any, idx: number) => {
+        const tokens = entry.outcomeTokenIds || [];
+        return (
+          <div key={idx} className="card">
+            <div className="card-header">
+              <div>
+                <span className="card-title">{entry.asset}</span>
+                <span className="card-subtitle" style={{ marginLeft: 8 }}>
+                  {entry.eventSlug}
+                </span>
+              </div>
+              <span className={`badge ${entry.marketId !== 'UNAVAILABLE' ? 'badge-go' : 'badge-kill'}`}>
+                {entry.marketId !== 'UNAVAILABLE' ? 'RESOLVED' : 'PENDING'}
+              </span>
+            </div>
+
+            <div className="metrics">
+              <div className="metric">
+                <div className="metric-label">Market ID</div>
+                <div className="metric-value" style={{ fontSize: 11, wordBreak: 'break-all' }}>
+                  {entry.marketId === 'UNAVAILABLE' ? 'UNAVAILABLE' : entry.marketId.slice(0, 16) + '...'}
+                </div>
+              </div>
+              <div className="metric">
+                <div className="metric-label">Window</div>
+                <div className="metric-value">{entry.windowMinutes || 15}m</div>
+              </div>
+              <div className="metric">
+                <div className="metric-label">Start</div>
+                <div className="metric-value" style={{ fontSize: 11 }}>
+                  {entry.startTimestamp !== 'UNAVAILABLE' ? new Date(entry.startTimestamp).toLocaleString() : 'UNAVAILABLE'}
+                </div>
+              </div>
+              <div className="metric">
+                <div className="metric-label">End</div>
+                <div className="metric-value" style={{ fontSize: 11 }}>
+                  {entry.endTimestamp !== 'UNAVAILABLE' ? new Date(entry.endTimestamp).toLocaleString() : 'UNAVAILABLE'}
+                </div>
+              </div>
+              <div className="metric">
+                <div className="metric-label">Tokens</div>
+                <div className="metric-value">{tokens.length}</div>
+              </div>
+              <div className="metric">
+                <div className="metric-label">OrderBook</div>
+                <div className="metric-value">{String(entry.enableOrderBook)}</div>
+              </div>
+            </div>
+
+            {/* Token-level book summaries */}
+            {tokens.length > 0 && (
+              <table className="table" style={{ marginTop: 8 }}>
+                <thead>
+                  <tr>
+                    <th>Outcome</th>
+                    <th>Token ID</th>
+                    <th>Bid</th>
+                    <th>Ask</th>
+                    <th>Mid</th>
+                    <th>Spread</th>
+                    <th>Depth (5c)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {tokens.map((tok: any, ti: number) => {
+                    const bs = tok.bookSummary || {};
+                    return (
+                      <tr key={ti}>
+                        <td>{tok.outcome}</td>
+                        <td style={{ fontSize: 10 }}>{tok.tokenId?.slice(0, 12)}...</td>
+                        <td>{bs.bid ?? 'UNAVAILABLE'}</td>
+                        <td>{bs.ask ?? 'UNAVAILABLE'}</td>
+                        <td style={{ fontWeight: 700 }}>{bs.midpoint ?? 'UNAVAILABLE'}</td>
+                        <td>{bs.spread ?? 'UNAVAILABLE'}</td>
+                        <td>${bs.depthNotionalNearMid ?? 'UNAVAILABLE'}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+
+            {entry.question && entry.question !== 'UNAVAILABLE' && (
+              <div style={{ color: 'var(--text-dim)', fontSize: 11, marginTop: 6 }}>
+                Q: {entry.question}
+              </div>
+            )}
+          </div>
+        );
+      })}
+
+      {/* Caps/Limits Card */}
+      <div className="card">
+        <div className="card-title" style={{ marginBottom: 12 }}>fetchMarkets Caps/Limits</div>
+        <table className="table">
+          <thead>
+            <tr><th>Cap</th><th>Location</th><th>Description</th><th>Effective</th></tr>
+          </thead>
+          <tbody>
+            {Object.entries(caps).map(([key, cap]: [string, any]) => (
+              <tr key={key}>
+                <td style={{ fontWeight: 600 }}>{key}</td>
+                <td><code style={{ fontSize: 10 }}>{cap.location}</code></td>
+                <td style={{ fontSize: 11 }}>{cap.description}</td>
+                <td>{cap.effectiveCap ?? '--'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
     </div>
   );
