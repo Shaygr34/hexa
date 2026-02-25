@@ -1,5 +1,5 @@
 // crypto15m-controller.mjs — Fee-curve-aware controller for 15m Up/Down markets
-// Usage: node src/agents/crypto15m-controller.mjs [--interval 60000] [--duration 3600000] [--once]
+// Usage: node src/agents/crypto15m-controller.mjs [--interval 15000] [--duration 3600000] [--once] [--vol-floor 0.00008] [--vol-mult 2.0] [--vol-window 180] [--z-clamp 3]
 //
 // Connects Binance spot WebSocket, reads CLOB books via crypto15m-adapter,
 // computes p_hat from CEX features with vol-floor/z-clamp/p_hat-clamp,
@@ -61,25 +61,28 @@ function estimateSlippage(askSize) {
 // ═══════════════════════════════════════════════════════════════
 const SIGMOID_K = 1.0;
 const SIGMOID_EPS = 1e-6;
-const VOL_FLOOR = 0.0002;        // below this → NO_SIGNAL
-const Z_CLAMP = 6;               // clamp z to [-6, +6]
+let VOL_FLOOR = 0.00008;          // below this → NO_SIGNAL (tunable via --vol-floor)
+let VOL_MULT = 2.0;              // effectiveVol = max(vol, volFloor * VOL_MULT) — tunable via --vol-mult
+let Z_CLAMP = 3;                 // clamp z to [-3, +3] (tunable via --z-clamp)
 const P_HAT_MIN = 0.01;          // clamp p_hat to [0.01, 0.99]
 const P_HAT_MAX = 0.99;
 const PROPOSAL_THRESHOLD = 0.02; // |p_hat - upMid| must exceed this
 const EDGE_BUFFER = 0.005;       // 0.5% safety
+let VOL_WINDOW_SEC = 180;        // vol estimation window (tunable via --vol-window)
 
 function sigmoid(x) { return 1 / (1 + Math.exp(-x)); }
 
 function computePHat(return_60s, vol_60s) {
   const volFloorHit = vol_60s < VOL_FLOOR;
-  const effectiveVol = Math.max(vol_60s, VOL_FLOOR);
+  const effectiveVol = Math.max(vol_60s, VOL_FLOOR * VOL_MULT);
+  const volMultApplied = effectiveVol > vol_60s;
   const rawZ = SIGMOID_K * return_60s / (effectiveVol + SIGMOID_EPS);
   const zClamped = rawZ !== Math.max(-Z_CLAMP, Math.min(Z_CLAMP, rawZ));
   const z = Math.max(-Z_CLAMP, Math.min(Z_CLAMP, rawZ));
   const rawPHat = sigmoid(z);
   const p_hat = Math.max(P_HAT_MIN, Math.min(P_HAT_MAX, rawPHat));
   const pHatClamped = rawPHat !== p_hat;
-  return { p_hat, z, rawZ, volFloorHit, zClamped, pHatClamped };
+  return { p_hat, z, rawZ, volFloorHit, zClamped, pHatClamped, effectiveVol, volMultApplied };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -143,11 +146,134 @@ function updatePersistence(symbol, signalSide) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// COUNTERFACTUALS — "what would happen if we relaxed ONE gate?"
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Simulate the full decision pipeline with ONE gate parameter changed.
+ * Returns { CF1..CF4 booleans, CF3_netEdge, cfCount }.
+ */
+function computeCounterfactuals(record, market, signal, gatesResult, persistence) {
+  const cf = { CF1: false, CF2: false, CF3: false, CF3_netEdge: null, CF4: false, cfCount: 0 };
+
+  // Helper: would this combination produce a PROPOSE?
+  // Needs: signal fires (edge >= threshold && netEdge >= minNetEdge), gates pass, persistence met
+  function wouldPropose({ netEdgeThreshold = GATE_MIN_NET_EDGE, persistenceThreshold = PERSISTENCE_N,
+                          volFloorOverride = null, maxSpreadOverride = null } = {}) {
+    // Re-derive signal values if volFloor is overridden
+    let edge = signal.edge;
+    let netEdge = signal.netEdge;
+    let volFloorHit = signal.volFloorHit;
+
+    if (volFloorOverride !== null) {
+      // Recompute p_hat with volFloor=0 (use actual vol, no floor)
+      const cexReturn = record.return_60s;
+      const cexVol = record.vol_60s;
+      if (cexReturn == null || cexVol == null) return false;
+
+      const effectiveVol = Math.max(cexVol, volFloorOverride);
+      const rawZ = SIGMOID_K * cexReturn / (effectiveVol + SIGMOID_EPS);
+      const z = Math.max(-Z_CLAMP, Math.min(Z_CLAMP, rawZ));
+      const p_hat = Math.max(P_HAT_MIN, Math.min(P_HAT_MAX, sigmoid(z)));
+      volFloorHit = cexVol < volFloorOverride;
+
+      const upMid = signal.upMid;
+      if (upMid == null) return false;
+
+      const buyUp = p_hat > upMid;
+      const buyPrice = buyUp ? market.up?.ask : market.down?.ask;
+      const buyAskSize = buyUp ? (market.up?.askSize ?? 0) : (market.down?.askSize ?? 0);
+      if (buyPrice == null) return false;
+
+      edge = Math.abs(p_hat - upMid);
+      const fees = takerFee(buyPrice);
+      const slippage = estimateSlippage(buyAskSize);
+      netEdge = edge - fees - slippage - EDGE_BUFFER;
+
+      // Store CF3 netEdge for reporting
+      if (volFloorOverride === 0) {
+        cf.CF3_netEdge = parseFloat(netEdge.toFixed(6));
+      }
+    }
+
+    // If volFloor still hit (only possible if volFloorOverride > 0), signal is unreliable
+    if (volFloorHit) return false;
+
+    // Signal must fire
+    if (edge == null || netEdge == null) return false;
+    if (edge < PROPOSAL_THRESHOLD) return false;
+    if (netEdge < netEdgeThreshold) return false;
+
+    // Gates must pass (with potential spread override)
+    const effectiveMaxSpread = maxSpreadOverride !== null ? maxSpreadOverride : GATE_MAX_SPREAD;
+    for (const g of gatesResult.gates) {
+      if (g.name === 'spread' && maxSpreadOverride !== null) {
+        // Re-evaluate spread gate with relaxed threshold
+        const upSpread = (market.up?.ask != null && market.up?.bid != null) ? market.up.ask - market.up.bid : 1;
+        const dnSpread = (market.down?.ask != null && market.down?.bid != null) ? market.down.ask - market.down.bid : 1;
+        if (Math.min(upSpread, dnSpread) > effectiveMaxSpread) return false;
+      } else if (!g.pass) {
+        return false;
+      }
+    }
+
+    // Persistence must be met
+    if (persistence.count < persistenceThreshold) return false;
+
+    return true;
+  }
+
+  // CF1: relaxed netEdge (0.01 instead of 0.03)
+  cf.CF1 = wouldPropose({ netEdgeThreshold: 0.01 });
+
+  // CF2: no persistence (threshold=1 instead of N)
+  cf.CF2 = wouldPropose({ persistenceThreshold: 1 });
+
+  // CF3: no vol floor (volFloor=0 instead of 0.0002)
+  cf.CF3 = wouldPropose({ volFloorOverride: 0 });
+
+  // CF4: relaxed spread (0.05 instead of 0.03)
+  cf.CF4 = wouldPropose({ maxSpreadOverride: 0.05 });
+
+  cf.cfCount = [cf.CF1, cf.CF2, cf.CF3, cf.CF4].filter(Boolean).length;
+  return cf;
+}
+
+/**
+ * Return the single label for the FIRST gate that blocks, following evaluation order.
+ */
+function computeDominantBlocker(record, gatesResult) {
+  // 1. No CEX feed
+  if (record.binancePrice == null || !gatesResult.gates.find(g => g.name === 'cexFeed')?.pass) {
+    return 'NO_CEX_FEED';
+  }
+  // 2. Vol floor
+  if (record.volFloorHit) return 'VOL_FLOOR';
+  // 3. Sanity
+  if (!gatesResult.gates.find(g => g.name === 'sanitySum')?.pass) return 'SANITY';
+  // 4. Spread
+  if (!gatesResult.gates.find(g => g.name === 'spread')?.pass) return 'SPREAD';
+  // 5. Depth
+  if (!gatesResult.gates.find(g => g.name === 'depth')?.pass) return 'DEPTH';
+  // 6. Time remaining
+  if (!gatesResult.gates.find(g => g.name === 'timeRemaining')?.pass) return 'TIME_REMAINING';
+  // 7. Net edge too low
+  if (record.netEdge != null && record.netEdge < GATE_MIN_NET_EDGE) return 'NET_EDGE';
+  // 8. Edge below proposal threshold (signal doesn't fire)
+  if (record.edge != null && record.edge < PROPOSAL_THRESHOLD) return 'NET_EDGE';
+  // 9. Persistence not met
+  if (record.decision && record.decision.includes('CANDIDATE')) return 'PERSISTENCE';
+  // 10. Nothing blocked — it's a PROPOSE
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════
 // SIGNAL COMPUTATION
 // ═══════════════════════════════════════════════════════════════
 const NULL_SIGNAL = {
   decision: 'DO_NOTHING', reason: '', p_hat: null, z: null, rawZ: null,
   volFloorHit: false, zClamped: false, pHatClamped: false,
+  effectiveVol: null, volMultApplied: false,
   edge: null, fees: null, slippage: null, buffer: EDGE_BUFFER, netEdge: null,
   buySide: null, buyPrice: null,
   binancePrice: null, return_60s: null, vol_60s: null, upMid: null, dnMid: null,
@@ -178,12 +304,13 @@ function computeSignal(market, cexFeatures) {
       reason: `NO_SIGNAL: vol_60s=${cexFeatures.vol_60s} < floor=${VOL_FLOOR}`,
       p_hat: pResult.p_hat, z: parseFloat(pResult.z.toFixed(4)), rawZ: parseFloat(pResult.rawZ.toFixed(4)),
       volFloorHit: true, zClamped: pResult.zClamped, pHatClamped: pResult.pHatClamped,
+      effectiveVol: pResult.effectiveVol, volMultApplied: pResult.volMultApplied,
       binancePrice: cexFeatures.price, return_60s: cexFeatures.return_60s, vol_60s: cexFeatures.vol_60s,
       upMid, dnMid,
     };
   }
 
-  const { p_hat, z, rawZ, volFloorHit, zClamped, pHatClamped } = pResult;
+  const { p_hat, z, rawZ, volFloorHit, zClamped, pHatClamped, effectiveVol, volMultApplied } = pResult;
 
   // Direction
   const buyUp = p_hat > upMid;
@@ -195,7 +322,7 @@ function computeSignal(market, cexFeatures) {
     return {
       ...NULL_SIGNAL, reason: 'no ask price',
       p_hat, z: parseFloat(z.toFixed(4)), rawZ: parseFloat(rawZ.toFixed(4)),
-      volFloorHit, zClamped, pHatClamped,
+      volFloorHit, zClamped, pHatClamped, effectiveVol, volMultApplied,
       buySide, binancePrice: cexFeatures.price, return_60s: cexFeatures.return_60s, vol_60s: cexFeatures.vol_60s,
       upMid, dnMid,
     };
@@ -234,6 +361,7 @@ function computeSignal(market, cexFeatures) {
     z: parseFloat(z.toFixed(4)),
     rawZ: parseFloat(rawZ.toFixed(4)),
     volFloorHit, zClamped, pHatClamped,
+    effectiveVol, volMultApplied,
     edge: parseFloat(edge.toFixed(6)),
     fees: parseFloat(fees.toFixed(6)),
     slippage: parseFloat(slippage.toFixed(6)),
@@ -290,6 +418,10 @@ function createShadowProposal(d, cycle) {
     netEdge: d.netEdge,
     fees: d.fees,
     slippage: d.slippage,
+    buffer: d.buffer,
+    buyPrice: d.buyPrice,
+    effectiveVol: d.effectiveVol,
+    volMultApplied: d.volMultApplied,
     binancePrice: d.binancePrice,
     return_60s: d.return_60s,
     vol_60s: d.vol_60s,
@@ -337,13 +469,26 @@ async function resolveShadowProposals() {
       (proposal.side === 'DN' && outcome === 'DOWN')
     );
 
+    // Compute realized PnL
+    const entryCost = proposal.buyPrice ?? 0;
+    const entryFees = proposal.fees ?? 0;
+    const entrySlippage = proposal.slippage ?? 0;
+    const entryBuffer = proposal.buffer ?? 0;
+    const costs = entryFees + entrySlippage + entryBuffer;
+    const realizedPnl = proposal.buyPrice != null
+      ? (won ? 1 - entryCost : -entryCost) - costs
+      : null;
+
     proposal.status = 'resolved';
     proposal.resolvedAt = new Date().toISOString();
     proposal.outcome = outcome;
     proposal.won = won ?? null;
+    proposal.costs = costs > 0 ? parseFloat(costs.toFixed(6)) : null;
+    proposal.realizedPnl = realizedPnl != null ? parseFloat(realizedPnl.toFixed(6)) : null;
 
     logShadowOutcome(proposal);
-    console.log(`[shadow] resolved ${proposal.id}: ${proposal.symbol} ${proposal.side} → outcome=${outcome} won=${won} (p_hat=${proposal.p_hat} edge=${proposal.edge})`);
+    const pnlStr = realizedPnl != null ? ` pnl=${realizedPnl.toFixed(4)}` : '';
+    console.log(`[shadow] resolved ${proposal.id}: ${proposal.symbol} ${proposal.side} → outcome=${outcome} won=${won} (p_hat=${proposal.p_hat} edge=${proposal.edge}${pnlStr})`);
   }
 
   // Remove resolved from in-memory list
@@ -401,7 +546,7 @@ async function controllerCycle(cycle) {
   const decisions = [];
 
   for (const market of state.universeActive) {
-    const cexFeatures = getFeatures(market.symbol);
+    const cexFeatures = getFeatures(market.symbol, VOL_WINDOW_SEC);
     const hasCexFeed = cexFeatures.ok && feedConnected();
 
     const { gates, allPass, timeRemaining } = checkGates(market, hasCexFeed);
@@ -459,6 +604,8 @@ async function controllerCycle(cycle) {
       volFloorHit: signal.volFloorHit,
       zClamped: signal.zClamped,
       pHatClamped: signal.pHatClamped,
+      effectiveVol: signal.effectiveVol,
+      volMultApplied: signal.volMultApplied,
       // Edge
       edge: signal.edge,
       fees: signal.fees,
@@ -473,6 +620,10 @@ async function controllerCycle(cycle) {
       window: { start: market.tradingWindowStart, end: market.tradingWindowEnd },
       bookSnapshot: { up: market.up, down: market.down, sanitySum: market.sanitySum },
     };
+
+    // Counterfactuals + dominant blocker
+    record.counterfactuals = computeCounterfactuals(record, market, signal, { gates, allPass }, persistence);
+    record.dominantBlocker = computeDominantBlocker(record, { gates, allPass });
 
     // Shadow: log actionable proposals (PROPOSE_UP/DN only, not candidates)
     if (SHADOW_MODE && (finalDecision === 'PROPOSE_UP' || finalDecision === 'PROPOSE_DN')) {
@@ -543,8 +694,12 @@ function logDecisions(result) {
       binancePrice: d.binancePrice, return_60s: d.return_60s, vol_60s: d.vol_60s,
       p_hat: d.p_hat, z: d.z, rawZ: d.rawZ,
       volFloorHit: d.volFloorHit, zClamped: d.zClamped, pHatClamped: d.pHatClamped,
+      effectiveVol: d.effectiveVol, volMultApplied: d.volMultApplied,
       edge: d.edge, fees: d.fees, slippage: d.slippage, buffer: d.buffer, netEdge: d.netEdge,
       upMid: d.upMid, dnMid: d.dnMid, timeRemaining: d.timeRemaining,
+      gatesFailing: d.gates?.filter(g => !g.pass).map(g => g.name) || [],
+      dominantBlocker: d.dominantBlocker || null,
+      counterfactuals: d.counterfactuals || null,
       shadowId: d.shadowId || null,
     })),
   });
@@ -578,7 +733,7 @@ function saveControllerState(result, tickBuffer) {
     tickBuffer,
     config: {
       feeRate: FEE_RATE, feeExponent: FEE_EXPONENT, notional: NOTIONAL_USDC,
-      sigmoidK: SIGMOID_K, volFloor: VOL_FLOOR, zClamp: Z_CLAMP,
+      sigmoidK: SIGMOID_K, volFloor: VOL_FLOOR, volMult: VOL_MULT, volWindowSec: VOL_WINDOW_SEC, zClamp: Z_CLAMP,
       pHatRange: [P_HAT_MIN, P_HAT_MAX],
       proposalThreshold: PROPOSAL_THRESHOLD, edgeBuffer: EDGE_BUFFER,
       persistenceN: PERSISTENCE_N,
@@ -598,13 +753,17 @@ function saveControllerState(result, tickBuffer) {
 // ═══════════════════════════════════════════════════════════════
 function parseArgs() {
   const args = process.argv.slice(2);
-  let interval = 60_000;
+  let interval = 15_000;
   let duration = 3_600_000;
   let once = false;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--interval' && args[i + 1]) { interval = Number(args[i + 1]); i++; }
     else if (args[i] === '--duration' && args[i + 1]) { duration = Number(args[i + 1]); i++; }
+    else if (args[i] === '--vol-floor' && args[i + 1]) { VOL_FLOOR = Number(args[i + 1]); i++; }
+    else if (args[i] === '--vol-mult' && args[i + 1]) { VOL_MULT = Number(args[i + 1]); i++; }
+    else if (args[i] === '--vol-window' && args[i + 1]) { VOL_WINDOW_SEC = Number(args[i + 1]); i++; }
+    else if (args[i] === '--z-clamp' && args[i + 1]) { Z_CLAMP = Number(args[i + 1]); i++; }
     else if (args[i] === '--once') { once = true; }
   }
 
@@ -616,7 +775,7 @@ async function main() {
 
   console.log(`[controller] crypto15m controller v2 starting`);
   console.log(`[controller] fee: ${FEE_RATE} * (p*(1-p))^${FEE_EXPONENT}`);
-  console.log(`[controller] signal: sigmoid(${SIGMOID_K} * ret60 / (vol60 + eps)) | volFloor=${VOL_FLOOR} zClamp=±${Z_CLAMP} pHat=[${P_HAT_MIN},${P_HAT_MAX}]`);
+  console.log(`[controller] signal: sigmoid(${SIGMOID_K} * ret60 / (vol60 + eps)) | volFloor=${VOL_FLOOR} volMult=${VOL_MULT} volWindow=${VOL_WINDOW_SEC}s zClamp=±${Z_CLAMP} pHat=[${P_HAT_MIN},${P_HAT_MAX}]`);
   console.log(`[controller] persistence: ${PERSISTENCE_N} consecutive same-side ticks to promote CANDIDATE → PROPOSE`);
   console.log(`[controller] gates: sanity±${GATE_SANITY_TOL} spread≤${GATE_MAX_SPREAD} depth≥${GATE_MIN_DEPTH} time≥${GATE_MIN_TIME_REMAINING}s netEdge≥${GATE_MIN_NET_EDGE} cexFeed=required`);
   console.log(`[controller] shadow: ${SHADOW_MODE ? 'ON' : 'OFF'}`);
@@ -641,7 +800,7 @@ async function main() {
     console.log(`[controller] waiting ${waitSec}s for price data to accumulate...`);
     await new Promise(r => setTimeout(r, waitSec * 1000));
     for (const sym of ['BTC', 'ETH', 'SOL', 'XRP']) {
-      const f = getFeatures(sym);
+      const f = getFeatures(sym, VOL_WINDOW_SEC);
       console.log(`[controller]   ${sym}: $${f.price} buckets=${f.bucketCount} ok=${f.ok}${f.reason ? ` (${f.reason})` : ''}`);
     }
   }
