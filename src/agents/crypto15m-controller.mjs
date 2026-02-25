@@ -418,6 +418,10 @@ function createShadowProposal(d, cycle) {
     netEdge: d.netEdge,
     fees: d.fees,
     slippage: d.slippage,
+    buffer: d.buffer,
+    buyPrice: d.buyPrice,
+    effectiveVol: d.effectiveVol,
+    volMultApplied: d.volMultApplied,
     binancePrice: d.binancePrice,
     return_60s: d.return_60s,
     vol_60s: d.vol_60s,
@@ -465,13 +469,26 @@ async function resolveShadowProposals() {
       (proposal.side === 'DN' && outcome === 'DOWN')
     );
 
+    // Compute realized PnL
+    const entryCost = proposal.buyPrice ?? 0;
+    const entryFees = proposal.fees ?? 0;
+    const entrySlippage = proposal.slippage ?? 0;
+    const entryBuffer = proposal.buffer ?? 0;
+    const costs = entryFees + entrySlippage + entryBuffer;
+    const realizedPnl = proposal.buyPrice != null
+      ? (won ? 1 - entryCost : -entryCost) - costs
+      : null;
+
     proposal.status = 'resolved';
     proposal.resolvedAt = new Date().toISOString();
     proposal.outcome = outcome;
     proposal.won = won ?? null;
+    proposal.costs = costs > 0 ? parseFloat(costs.toFixed(6)) : null;
+    proposal.realizedPnl = realizedPnl != null ? parseFloat(realizedPnl.toFixed(6)) : null;
 
     logShadowOutcome(proposal);
-    console.log(`[shadow] resolved ${proposal.id}: ${proposal.symbol} ${proposal.side} → outcome=${outcome} won=${won} (p_hat=${proposal.p_hat} edge=${proposal.edge})`);
+    const pnlStr = realizedPnl != null ? ` pnl=${realizedPnl.toFixed(4)}` : '';
+    console.log(`[shadow] resolved ${proposal.id}: ${proposal.symbol} ${proposal.side} → outcome=${outcome} won=${won} (p_hat=${proposal.p_hat} edge=${proposal.edge}${pnlStr})`);
   }
 
   // Remove resolved from in-memory list

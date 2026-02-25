@@ -192,6 +192,40 @@ interface ControllerState {
   } | null;
 }
 
+// ── Performance types ──
+interface PerfEntry {
+  id: string;
+  ts: string;
+  symbol: string;
+  side: string;
+  p_hat: number | null;
+  z: number | null;
+  edge: number | null;
+  netEdge: number | null;
+  buyPrice: number | null;
+  realizedPnl: number | null;
+  outcome: string;
+  won: boolean | null;
+}
+
+interface PerfData {
+  hours: number;
+  proposals: number;
+  pending: number;
+  resolved: number;
+  wins: number;
+  losses: number;
+  winRate: number | null;
+  avgEdge: number;
+  avgNetEdge: number;
+  totalPnl: number;
+  avgPnl: number;
+  pnlBySymbol: Record<string, { resolved: number; wins: number; losses: number; totalPnl: number }>;
+  maxDrawdown: number;
+  topWins: PerfEntry[];
+  topLosses: PerfEntry[];
+}
+
 // ── Diagnostics types ──
 interface DiagnosticsData {
   windowSize: number;
@@ -227,6 +261,7 @@ export default function Dashboard() {
   const [universe, setUniverse] = useState<{ activeCount: number; closedCount: number; activeWindow: string | null; symbols: string[] } | null>(null);
   const [controller, setController] = useState<ControllerState | null>(null);
   const [diagnostics, setDiagnostics] = useState<DiagnosticsData | null>(null);
+  const [perf, setPerf] = useState<PerfData | null>(null);
 
   const fetchData = useCallback(async () => {
     try {
@@ -267,6 +302,14 @@ export default function Dashboard() {
     const fetchDiag = () => fetch('/api/crypto15m/diagnostics?N=200').then(r => r.json()).then(d => { if (d.windowSize > 0) setDiagnostics(d); }).catch(() => {});
     fetchDiag();
     const i = setInterval(fetchDiag, 30000);
+    return () => clearInterval(i);
+  }, []);
+
+  // Poll shadow performance on 30s interval (parses shadow JSONL)
+  useEffect(() => {
+    const fetchPerf = () => fetch('/api/crypto15m/perf?hours=24').then(r => r.json()).then((d: PerfData) => { if (d.resolved > 0) setPerf(d); }).catch(() => {});
+    fetchPerf();
+    const i = setInterval(fetchPerf, 30000);
     return () => clearInterval(i);
   }, []);
 
@@ -411,7 +454,7 @@ export default function Dashboard() {
       </div>
 
       <div className="scroll-y">
-        {tab === 'crypto15m' && <Crypto15mTab controller={controller} diagnostics={diagnostics} />}
+        {tab === 'crypto15m' && <Crypto15mTab controller={controller} diagnostics={diagnostics} perf={perf} />}
         {tab === 'opportunities' && <OpportunitiesTab opps={opportunities} expandedId={expandedId} setExpandedId={setExpandedId} onApprove={handleApprove} onSimulate={handleSimulate} />}
         {tab === 'pinned' && <PinnedMarketsTab markets={pinnedMarkets} onRefresh={fetchData} />}
         {tab === 'signals' && <SignalsTab signals={signals} onRefresh={fetchData} />}
@@ -431,7 +474,7 @@ export default function Dashboard() {
 // ══════════════════════════════════════════
 // TAB 0: Crypto15m Controller
 // ══════════════════════════════════════════
-function Crypto15mTab({ controller, diagnostics }: { controller: ControllerState | null; diagnostics: DiagnosticsData | null }) {
+function Crypto15mTab({ controller, diagnostics, perf }: { controller: ControllerState | null; diagnostics: DiagnosticsData | null; perf: PerfData | null }) {
   const [expandedSymbol, setExpandedSymbol] = useState<string | null>(null);
 
   if (!controller || controller.lastCycle === null) {
@@ -1004,6 +1047,126 @@ function Crypto15mTab({ controller, diagnostics }: { controller: ControllerState
               zClamp filtered: {controller.shadowStats.zClampFiltered}
             </span>
           </div>
+        </div>
+      )}
+
+      {/* Performance (Shadow) */}
+      {perf && perf.resolved > 0 && (
+        <div className="card" style={{ borderLeft: '3px solid var(--green)' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+            <div className="card-title">Last {perf.hours}h Performance (Shadow)</div>
+            <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>
+              {perf.resolved} resolved / {perf.pending} pending / {perf.proposals} total
+            </span>
+          </div>
+
+          <div className="metrics" style={{ marginBottom: 12 }}>
+            <div className="metric">
+              <div className="metric-label">Win Rate</div>
+              <div className={`metric-value ${(perf.winRate ?? 0) >= 0.5 ? 'positive' : 'warn'}`}>
+                {perf.winRate != null ? `${(perf.winRate * 100).toFixed(1)}%` : '--'}
+              </div>
+            </div>
+            <div className="metric">
+              <div className="metric-label">W / L</div>
+              <div className="metric-value">{perf.wins} / {perf.losses}</div>
+            </div>
+            <div className="metric">
+              <div className="metric-label">Total PnL</div>
+              <div className="metric-value" style={{ color: perf.totalPnl >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 700 }}>
+                {perf.totalPnl >= 0 ? '+' : ''}{perf.totalPnl.toFixed(4)}
+              </div>
+            </div>
+            <div className="metric">
+              <div className="metric-label">Avg PnL</div>
+              <div className="metric-value" style={{ color: perf.avgPnl >= 0 ? 'var(--green)' : 'var(--red)' }}>
+                {perf.avgPnl >= 0 ? '+' : ''}{perf.avgPnl.toFixed(4)}
+              </div>
+            </div>
+            <div className="metric">
+              <div className="metric-label">Max Drawdown</div>
+              <div className="metric-value" style={{ color: perf.maxDrawdown > 0 ? 'var(--red)' : 'var(--text-dim)' }}>
+                {perf.maxDrawdown > 0 ? `-${perf.maxDrawdown.toFixed(4)}` : '0'}
+              </div>
+            </div>
+            <div className="metric">
+              <div className="metric-label">Avg Edge</div>
+              <div className="metric-value">{(perf.avgEdge * 100).toFixed(2)}%</div>
+            </div>
+            <div className="metric">
+              <div className="metric-label">Avg Net Edge</div>
+              <div className="metric-value">{(perf.avgNetEdge * 100).toFixed(2)}%</div>
+            </div>
+          </div>
+
+          {/* Per-symbol breakdown */}
+          {Object.keys(perf.pnlBySymbol).length > 0 && (
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Per-Symbol Breakdown</div>
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Symbol</th>
+                    <th>Resolved</th>
+                    <th>Wins</th>
+                    <th>Losses</th>
+                    <th>PnL</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {Object.entries(perf.pnlBySymbol)
+                    .sort((a, b) => b[1].totalPnl - a[1].totalPnl)
+                    .map(([sym, s]) => (
+                    <tr key={sym}>
+                      <td style={{ fontWeight: 600 }}>{sym}</td>
+                      <td>{s.resolved}</td>
+                      <td style={{ color: 'var(--green)' }}>{s.wins}</td>
+                      <td style={{ color: 'var(--red)' }}>{s.losses}</td>
+                      <td style={{ color: s.totalPnl >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>
+                        {s.totalPnl >= 0 ? '+' : ''}{s.totalPnl.toFixed(4)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* Top Wins / Top Losses */}
+          {(perf.topWins.length > 0 || perf.topLosses.length > 0) && (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+              {perf.topWins.length > 0 && (
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--green)', marginBottom: 4 }}>Top Wins</div>
+                  {perf.topWins.map(e => (
+                    <div key={e.id} style={{ fontSize: 11, padding: '4px 8px', background: 'rgba(34,197,94,0.06)', borderRadius: 4, marginBottom: 3 }}>
+                      <span style={{ fontWeight: 600 }}>{e.symbol}</span>{' '}
+                      <span style={{ color: 'var(--text-dim)' }}>{e.side}</span>{' '}
+                      <span>p={e.p_hat?.toFixed(3)}</span>{' '}
+                      <span style={{ color: 'var(--green)', fontWeight: 600 }}>
+                        +{e.realizedPnl?.toFixed(4)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {perf.topLosses.length > 0 && (
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--red)', marginBottom: 4 }}>Top Losses</div>
+                  {perf.topLosses.map(e => (
+                    <div key={e.id} style={{ fontSize: 11, padding: '4px 8px', background: 'rgba(239,68,68,0.06)', borderRadius: 4, marginBottom: 3 }}>
+                      <span style={{ fontWeight: 600 }}>{e.symbol}</span>{' '}
+                      <span style={{ color: 'var(--text-dim)' }}>{e.side}</span>{' '}
+                      <span>p={e.p_hat?.toFixed(3)}</span>{' '}
+                      <span style={{ color: 'var(--red)', fontWeight: 600 }}>
+                        {e.realizedPnl?.toFixed(4)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
