@@ -123,7 +123,7 @@ function checkGates(market, hasCexFeed) {
 // ═══════════════════════════════════════════════════════════════
 // PERSISTENCE GATE — require N consecutive same-side signals
 // ═══════════════════════════════════════════════════════════════
-const PERSISTENCE_N = 3;
+const PERSISTENCE_N = 2;
 const persistenceTracker = {}; // { BTC: { side: 'UP'|'DN', count: 2 }, ... }
 
 function updatePersistence(symbol, signalSide) {
