@@ -112,6 +112,8 @@ interface ControllerDecision {
   volFloorHit: boolean;
   zClamped: boolean;
   pHatClamped: boolean;
+  effectiveVol: number | null;
+  volMultApplied: boolean;
   // Persistence
   persistenceCount: number;
   persistenceNeeded: number;
@@ -130,6 +132,12 @@ interface ControllerDecision {
   buyPrice: number | null;
   window: { start: string | null; end: string | null };
   bookSnapshot: { up: any; down: any; sanitySum: number | null };
+  // Diagnostics
+  dominantBlocker: string | null;
+  counterfactuals: {
+    CF1: boolean; CF2: boolean; CF3: boolean; CF4: boolean;
+    CF3_netEdge: number | null; cfCount: number;
+  } | null;
 }
 
 interface ShadowStats {
@@ -167,6 +175,8 @@ interface ControllerState {
     notional: number;
     sigmoidK: number;
     volFloor: number;
+    volMult: number;
+    volWindowSec: number;
     zClamp: number;
     pHatRange: [number, number];
     proposalThreshold: number;
@@ -180,6 +190,26 @@ interface ControllerState {
       minNetEdge: number;
     };
   } | null;
+}
+
+// ── Diagnostics types ──
+interface DiagnosticsData {
+  windowSize: number;
+  cycleCount: number;
+  timeRange: { start: string | null; end: string | null };
+  dominantBlockerStats: Record<string, { count: number; pct: number }>;
+  blockerCooccurrence: Record<string, { count: number; pct: number }>;
+  distributionStats: {
+    p_hat: { mean: number; std: number; min: number; max: number; count: number; clampCount: number };
+    edge: { mean: number; std: number; min: number; max: number; count: number };
+    netEdge: { mean: number; std: number; min: number; max: number; count: number };
+    z: { mean: number; std: number; min: number; max: number; count: number; clampCount: number };
+  };
+  counterfactualImpact: Record<string, { wouldUnblock: number; pct: number; label: string }>;
+  topBlockers: { name: string; count: number; pct: number; suggestion: string }[];
+  proposalCount: number;
+  candidateCount: number;
+  doNothingCount: number;
 }
 
 // ── Dashboard ──
@@ -196,6 +226,7 @@ export default function Dashboard() {
   const [apiStatus, setApiStatus] = useState<ApiStatus | null>(null);
   const [universe, setUniverse] = useState<{ activeCount: number; closedCount: number; activeWindow: string | null; symbols: string[] } | null>(null);
   const [controller, setController] = useState<ControllerState | null>(null);
+  const [diagnostics, setDiagnostics] = useState<DiagnosticsData | null>(null);
 
   const fetchData = useCallback(async () => {
     try {
@@ -228,6 +259,14 @@ export default function Dashboard() {
     const fetchController = () => fetch('/api/crypto15m').then(r => r.json()).then(setController).catch(() => {});
     fetchController();
     const i = setInterval(fetchController, 5000);
+    return () => clearInterval(i);
+  }, []);
+
+  // Poll diagnostics on 30s interval (parses JSONL, heavier)
+  useEffect(() => {
+    const fetchDiag = () => fetch('/api/crypto15m/diagnostics?N=200').then(r => r.json()).then(d => { if (d.windowSize > 0) setDiagnostics(d); }).catch(() => {});
+    fetchDiag();
+    const i = setInterval(fetchDiag, 30000);
     return () => clearInterval(i);
   }, []);
 
@@ -372,7 +411,7 @@ export default function Dashboard() {
       </div>
 
       <div className="scroll-y">
-        {tab === 'crypto15m' && <Crypto15mTab controller={controller} />}
+        {tab === 'crypto15m' && <Crypto15mTab controller={controller} diagnostics={diagnostics} />}
         {tab === 'opportunities' && <OpportunitiesTab opps={opportunities} expandedId={expandedId} setExpandedId={setExpandedId} onApprove={handleApprove} onSimulate={handleSimulate} />}
         {tab === 'pinned' && <PinnedMarketsTab markets={pinnedMarkets} onRefresh={fetchData} />}
         {tab === 'signals' && <SignalsTab signals={signals} onRefresh={fetchData} />}
@@ -392,7 +431,7 @@ export default function Dashboard() {
 // ══════════════════════════════════════════
 // TAB 0: Crypto15m Controller
 // ══════════════════════════════════════════
-function Crypto15mTab({ controller }: { controller: ControllerState | null }) {
+function Crypto15mTab({ controller, diagnostics }: { controller: ControllerState | null; diagnostics: DiagnosticsData | null }) {
   const [expandedSymbol, setExpandedSymbol] = useState<string | null>(null);
 
   if (!controller || controller.lastCycle === null) {
@@ -429,7 +468,7 @@ function Crypto15mTab({ controller }: { controller: ControllerState | null }) {
           <div>
             <div className="card-title">Crypto15m Controller</div>
             <div style={{ color: 'var(--text-dim)', fontSize: 11, marginTop: 2 }}>
-              p_hat = sigmoid({controller.config?.sigmoidK} * ret60 / (vol60 + eps)) | volFloor={controller.config?.volFloor} | z-clamp=&plusmn;{controller.config?.zClamp} | persist={controller.config?.persistenceN}
+              p_hat = sigmoid({controller.config?.sigmoidK} * ret60 / (vol{controller.config?.volWindowSec ?? 60}s + eps)) | volFloor={controller.config?.volFloor} | volMult={controller.config?.volMult} | volWindow={controller.config?.volWindowSec}s | z-clamp=&plusmn;{controller.config?.zClamp} | persist={controller.config?.persistenceN}
             </div>
           </div>
           <div style={{ textAlign: 'right' }}>
@@ -458,7 +497,7 @@ function Crypto15mTab({ controller }: { controller: ControllerState | null }) {
         <div className="metrics">
           <div className="metric">
             <div className="metric-label">Proposals</div>
-            <div className={`metric-value ${controller.proposalCount > 0 ? 'positive' : ''}`}>
+            <div className="metric-value" style={{ color: controller.proposalCount > 0 ? 'var(--green)' : undefined }}>
               {controller.proposalCount}
             </div>
           </div>
@@ -472,6 +511,18 @@ function Crypto15mTab({ controller }: { controller: ControllerState | null }) {
             <div className="metric-label">DO_NOTHING</div>
             <div className="metric-value">{controller.doNothingCount}</div>
           </div>
+          {diagnostics && diagnostics.dominantBlockerStats?.VOL_FLOOR && (
+            <div className="metric">
+              <div className="metric-label">VF Blocks %</div>
+              <div className="metric-value" style={{
+                color: diagnostics.dominantBlockerStats.VOL_FLOOR.pct > 0.5
+                  ? 'var(--red)' : diagnostics.dominantBlockerStats.VOL_FLOOR.pct > 0.2
+                  ? 'var(--yellow)' : 'var(--green)',
+              }}>
+                {(diagnostics.dominantBlockerStats.VOL_FLOOR.pct * 100).toFixed(0)}%
+              </div>
+            </div>
+          )}
           <div className="metric">
             <div className="metric-label">Active Window</div>
             <div className="metric-value" style={{ fontSize: 11 }}>
@@ -509,6 +560,12 @@ function Crypto15mTab({ controller }: { controller: ControllerState | null }) {
               volFloor: {controller.config.volFloor}
             </span>
             <span style={{ padding: '2px 8px', background: 'var(--bg)', borderRadius: 3, fontSize: 10, color: 'var(--text-dim)', border: '1px solid var(--border)' }}>
+              volMult: {controller.config.volMult}
+            </span>
+            <span style={{ padding: '2px 8px', background: 'var(--bg)', borderRadius: 3, fontSize: 10, color: 'var(--text-dim)', border: '1px solid var(--border)' }}>
+              volWindow: {controller.config.volWindowSec}s
+            </span>
+            <span style={{ padding: '2px 8px', background: 'var(--bg)', borderRadius: 3, fontSize: 10, color: 'var(--text-dim)', border: '1px solid var(--border)' }}>
               zClamp: &plusmn;{controller.config.zClamp}
             </span>
             <span style={{ padding: '2px 8px', background: 'var(--bg)', borderRadius: 3, fontSize: 10, color: 'var(--text-dim)', border: '1px solid var(--border)' }}>
@@ -517,6 +574,62 @@ function Crypto15mTab({ controller }: { controller: ControllerState | null }) {
           </div>
         )}
       </div>
+
+      {/* "Why Nothing Happened" Banner */}
+      {controller.proposalCount === 0 && diagnostics && diagnostics.windowSize > 0 && (
+        <div className="card" style={{
+          borderLeft: '4px solid var(--yellow)',
+          background: 'rgba(234,179,8,0.05)',
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+            <div className="card-title" style={{ color: 'var(--yellow)' }}>
+              Why Nothing Happened
+            </div>
+            <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>
+              0 proposals in {diagnostics.cycleCount} cycles ({diagnostics.windowSize} decisions)
+            </span>
+          </div>
+
+          {/* Top blockers */}
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 12 }}>
+            {diagnostics.topBlockers.map((b, i) => (
+              <div key={b.name} style={{
+                flex: '1 1 200px',
+                padding: '10px 14px',
+                background: 'var(--bg)',
+                borderRadius: 6,
+                border: '1px solid var(--border)',
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                  <span style={{
+                    fontSize: 11, fontWeight: 700,
+                    color: i === 0 ? 'var(--red)' : i === 1 ? 'var(--yellow)' : 'var(--text-dim)',
+                  }}>
+                    #{i + 1} {b.name}
+                  </span>
+                  <span style={{ fontSize: 12, fontWeight: 700 }}>
+                    {b.count} <span style={{ fontSize: 10, color: 'var(--text-dim)', fontWeight: 400 }}>({(b.pct * 100).toFixed(0)}%)</span>
+                  </span>
+                </div>
+                <div style={{ fontSize: 10, color: 'var(--text-dim)', lineHeight: 1.3 }}>{b.suggestion}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* CF preview */}
+          <div style={{ fontSize: 11, color: 'var(--text-dim)', padding: '6px 10px', background: 'var(--bg)', borderRadius: 4, fontFamily: 'monospace' }}>
+            Would unblock:{' '}
+            {Object.entries(diagnostics.counterfactualImpact).map(([cf, v]) => (
+              <span key={cf} style={{ marginRight: 12 }}>
+                <span style={{ color: v.wouldUnblock > 0 ? 'var(--green)' : 'var(--text-dim)', fontWeight: v.wouldUnblock > 0 ? 600 : 400 }}>
+                  {v.wouldUnblock}
+                </span>
+                {' '}{v.label}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Decisions Table */}
       <div className="card">
@@ -534,6 +647,8 @@ function Crypto15mTab({ controller }: { controller: ControllerState | null }) {
               <th>Net Edge</th>
               <th>Persist</th>
               <th>Flags</th>
+              <th>Blocker</th>
+              <th>CF</th>
               <th>Gates</th>
               <th>Time</th>
               <th></th>
@@ -568,6 +683,41 @@ function Crypto15mTab({ controller }: { controller: ControllerState | null }) {
                   {d.zClamped && <span style={{ color: 'var(--yellow)', marginRight: 2 }} title="z-score clamped">ZC</span>}
                   {d.pHatClamped && <span style={{ color: 'var(--yellow)' }} title="p_hat clamped">PC</span>}
                   {!d.volFloorHit && !d.zClamped && !d.pHatClamped && <span style={{ color: 'var(--text-dim)' }}>--</span>}
+                </td>
+                <td>
+                  {d.dominantBlocker ? (
+                    <span style={{
+                      padding: '1px 6px', borderRadius: 3, fontSize: 9, fontWeight: 600,
+                      background: 'rgba(239,68,68,0.12)', color: 'var(--red)',
+                    }}>
+                      {d.dominantBlocker}
+                    </span>
+                  ) : (
+                    <span style={{
+                      padding: '1px 6px', borderRadius: 3, fontSize: 9, fontWeight: 600,
+                      background: 'rgba(34,197,94,0.12)', color: 'var(--green)',
+                    }}>
+                      PROPOSE
+                    </span>
+                  )}
+                </td>
+                <td>
+                  {d.counterfactuals ? (
+                    <span
+                      style={{
+                        fontSize: 11, fontWeight: 600,
+                        color: d.counterfactuals.cfCount > 0 ? 'var(--green)' : 'var(--text-dim)',
+                      }}
+                      title={[
+                        d.counterfactuals.CF1 && 'CF1: relaxedNetEdge=0.01',
+                        d.counterfactuals.CF2 && 'CF2: noPersistence',
+                        d.counterfactuals.CF3 && 'CF3: noVolFloor',
+                        d.counterfactuals.CF4 && 'CF4: relaxedSpread=0.05',
+                      ].filter(Boolean).join('\n') || 'none would propose'}
+                    >
+                      {d.counterfactuals.cfCount}/4
+                    </span>
+                  ) : <span style={{ color: 'var(--text-dim)', fontSize: 10 }}>--</span>}
                 </td>
                 <td>
                   <span style={{ color: d.allGatesPass ? 'var(--green)' : 'var(--red)', fontSize: 11 }}>
@@ -620,6 +770,13 @@ function Crypto15mTab({ controller }: { controller: ControllerState | null }) {
                 <div className="metric-value">{num8(d.vol_60s)}</div>
               </div>
               <div className="metric">
+                <div className="metric-label">effectiveVol</div>
+                <div className="metric-value">
+                  {num8(d.effectiveVol)}
+                  {d.volMultApplied && <span style={{ color: 'var(--yellow)', fontSize: 9, marginLeft: 4 }}>(boosted)</span>}
+                </div>
+              </div>
+              <div className="metric">
                 <div className="metric-label">z-score</div>
                 <div className="metric-value">
                   {d.z != null ? d.z.toFixed(4) : '--'}
@@ -644,7 +801,7 @@ function Crypto15mTab({ controller }: { controller: ControllerState | null }) {
               <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
                 {d.volFloorHit && (
                   <span style={{ padding: '3px 8px', background: 'rgba(234,179,8,0.15)', border: '1px solid rgba(234,179,8,0.3)', borderRadius: 4, fontSize: 10, color: 'var(--yellow)' }}>
-                    VOL_FLOOR: vol_60s={num8(d.vol_60s)} &lt; 0.0002 → NO_SIGNAL
+                    VOL_FLOOR: vol_60s={num8(d.vol_60s)} &lt; {controller.config?.volFloor ?? '?'} → NO_SIGNAL
                   </span>
                 )}
                 {d.zClamped && (
@@ -846,6 +1003,113 @@ function Crypto15mTab({ controller }: { controller: ControllerState | null }) {
             <span style={{ padding: '2px 8px', background: 'var(--bg)', borderRadius: 3, fontSize: 10, color: 'var(--text-dim)', border: '1px solid var(--border)' }}>
               zClamp filtered: {controller.shadowStats.zClampFiltered}
             </span>
+          </div>
+        </div>
+      )}
+
+      {/* Diagnostics Panel */}
+      {diagnostics && diagnostics.windowSize > 0 && (
+        <div className="card" style={{ borderLeft: '3px solid var(--accent)' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+            <div className="card-title">Diagnostics ({diagnostics.windowSize} decisions)</div>
+            <span style={{ fontSize: 10, color: 'var(--text-dim)' }}>
+              {diagnostics.timeRange.start ? new Date(diagnostics.timeRange.start).toLocaleTimeString() : '?'}
+              {' → '}
+              {diagnostics.timeRange.end ? new Date(diagnostics.timeRange.end).toLocaleTimeString() : '?'}
+              {' | '}{diagnostics.cycleCount} cycles
+            </span>
+          </div>
+
+          {/* Signal Distributions */}
+          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Signal Distributions</div>
+          <div className="metrics" style={{ marginBottom: 12 }}>
+            {(['p_hat', 'z', 'edge', 'netEdge'] as const).map(key => {
+              const s = diagnostics.distributionStats[key];
+              return (
+                <div className="metric" key={key}>
+                  <div className="metric-label">
+                    {key}
+                    {'clampCount' in s && (s as any).clampCount > 0 && (
+                      <span style={{ color: 'var(--yellow)', fontSize: 9, marginLeft: 4 }}>
+                        {(s as any).clampCount} clamped
+                      </span>
+                    )}
+                  </div>
+                  <div className="metric-value" style={{ fontSize: 12 }}>
+                    {key === 'edge' || key === 'netEdge'
+                      ? `${(s.mean * 100).toFixed(2)}%`
+                      : s.mean.toFixed(4)}
+                  </div>
+                  <div style={{ fontSize: 9, color: 'var(--text-dim)', fontFamily: 'monospace' }}>
+                    std={key === 'edge' || key === 'netEdge' ? `${(s.std * 100).toFixed(2)}%` : s.std.toFixed(4)}
+                    {' '}[{key === 'edge' || key === 'netEdge' ? `${(s.min * 100).toFixed(2)}%` : s.min.toFixed(4)}
+                    ..{key === 'edge' || key === 'netEdge' ? `${(s.max * 100).toFixed(2)}%` : s.max.toFixed(4)}]
+                    {' '}n={s.count}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Dominant Blocker Breakdown */}
+          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Dominant Blocker Breakdown</div>
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 12 }}>
+            {Object.entries(diagnostics.dominantBlockerStats)
+              .sort((a, b) => b[1].count - a[1].count)
+              .map(([label, stats]) => (
+                <span key={label} style={{
+                  padding: '3px 10px',
+                  borderRadius: 4,
+                  fontSize: 10,
+                  fontWeight: 600,
+                  background: label === 'PROPOSE'
+                    ? 'rgba(34,197,94,0.12)' : 'rgba(239,68,68,0.08)',
+                  color: label === 'PROPOSE' ? 'var(--green)' : 'var(--red)',
+                  border: `1px solid ${label === 'PROPOSE' ? 'var(--green)' : 'var(--red)'}22`,
+                }}>
+                  {label}: {stats.count} ({(stats.pct * 100).toFixed(0)}%)
+                </span>
+              ))}
+          </div>
+
+          {/* Gate Co-occurrence */}
+          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Gate Co-occurrence</div>
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 12 }}>
+            {Object.entries(diagnostics.blockerCooccurrence).map(([name, stats]) => (
+              <span key={name} style={{
+                padding: '3px 10px',
+                borderRadius: 4,
+                fontSize: 10,
+                background: stats.count > 0 ? 'rgba(234,179,8,0.08)' : 'var(--bg)',
+                color: stats.count > 0 ? 'var(--yellow)' : 'var(--text-dim)',
+                border: `1px solid ${stats.count > 0 ? 'var(--yellow)' : 'var(--border)'}33`,
+              }}>
+                {name}: {stats.count} ({(stats.pct * 100).toFixed(0)}%)
+              </span>
+            ))}
+          </div>
+
+          {/* Counterfactual Summary */}
+          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Counterfactual Summary</div>
+          <div className="metrics">
+            {Object.entries(diagnostics.counterfactualImpact).map(([cf, v]) => (
+              <div className="metric" key={cf}>
+                <div className="metric-label">{cf}: {v.label}</div>
+                <div className={`metric-value ${v.wouldUnblock > 0 ? 'positive' : ''}`}>
+                  {v.wouldUnblock}
+                </div>
+                <div style={{ fontSize: 9, color: 'var(--text-dim)' }}>
+                  {(v.pct * 100).toFixed(1)}% of decisions
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* Decision counts */}
+          <div style={{ display: 'flex', gap: 12, marginTop: 10, fontSize: 11, color: 'var(--text-dim)' }}>
+            <span>Proposals: <b style={{ color: 'var(--green)' }}>{diagnostics.proposalCount}</b></span>
+            <span>Candidates: <b style={{ color: 'var(--yellow)' }}>{diagnostics.candidateCount}</b></span>
+            <span>DO_NOTHING: <b>{diagnostics.doNothingCount}</b></span>
           </div>
         </div>
       )}
