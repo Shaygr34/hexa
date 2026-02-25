@@ -31,6 +31,10 @@ let connected = false;
 let reconnectTimer = null;
 let reconnectDelay = 1000;
 const MAX_RECONNECT_DELAY = 30000;
+let lastMessageTs = 0;          // timestamp of last received message
+let healthCheckTimer = null;
+const HEALTH_CHECK_INTERVAL = 30_000;  // check every 30s
+const STALE_THRESHOLD = 60_000;        // no data for 60s = stale
 
 // ═══════════════════════════════════════════════════════════════
 // INIT BUFFERS
@@ -60,6 +64,20 @@ async function resolveWS() {
   }
 }
 
+function destroySocket() {
+  if (ws) {
+    try {
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onclose = null;
+      ws.onerror = null;
+      ws.close();
+    } catch (_) {}
+    ws = null;
+  }
+  connected = false;
+}
+
 async function connect() {
   if (!WS) {
     WS = await resolveWS();
@@ -68,6 +86,9 @@ async function connect() {
       return;
     }
   }
+
+  // Force-cleanup any old socket before opening a new one
+  destroySocket();
 
   const streams = Object.values(SYMBOLS_MAP).map(s => `${s}@trade`).join('/');
   const url = `${STREAM_URL}?streams=${streams}`;
@@ -79,11 +100,13 @@ async function connect() {
   ws.onopen = () => {
     connected = true;
     reconnectDelay = 1000;
+    lastMessageTs = Date.now();
     console.log('[binance] connected');
   };
 
   ws.onmessage = (event) => {
     try {
+      lastMessageTs = Date.now();
       const msg = JSON.parse(typeof event.data === 'string' ? event.data : event.data.toString());
       const data = msg.data;
       if (!data || !data.s || !data.p) return;
@@ -100,6 +123,7 @@ async function connect() {
 
   ws.onclose = () => {
     connected = false;
+    ws = null;
     console.log(`[binance] disconnected, reconnecting in ${reconnectDelay}ms...`);
     scheduleReconnect();
   };
@@ -115,8 +139,32 @@ function scheduleReconnect() {
   reconnectTimer = setTimeout(async () => {
     reconnectTimer = null;
     reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
-    try { await connect(); } catch (_) {}
+    try { await connect(); } catch (e) {
+      console.error('[binance] reconnect failed:', e.message || 'unknown');
+      scheduleReconnect(); // retry on failure
+    }
   }, reconnectDelay);
+}
+
+function startHealthCheck() {
+  if (healthCheckTimer) return;
+  healthCheckTimer = setInterval(() => {
+    const sinceLast = Date.now() - lastMessageTs;
+    if (lastMessageTs > 0 && sinceLast > STALE_THRESHOLD) {
+      console.warn(`[binance] stale connection: no data for ${(sinceLast / 1000).toFixed(0)}s, forcing reconnect`);
+      destroySocket();
+      reconnectDelay = 1000;
+      scheduleReconnect();
+    } else if (!connected && !reconnectTimer) {
+      console.warn('[binance] health check: not connected and no reconnect scheduled, forcing reconnect');
+      reconnectDelay = 1000;
+      scheduleReconnect();
+    }
+  }, HEALTH_CHECK_INTERVAL);
+}
+
+function stopHealthCheck() {
+  if (healthCheckTimer) { clearInterval(healthCheckTimer); healthCheckTimer = null; }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -130,18 +178,15 @@ async function start() {
     if (connected && Object.values(buffers).some(b => b.length > 0)) break;
     await new Promise(r => setTimeout(r, 200));
   }
+  startHealthCheck();
   const tickCounts = Object.entries(buffers).map(([k, v]) => `${k}:${v.length}`).join(' ');
   console.log(`[binance] ready (connected=${connected} ticks: ${tickCounts})`);
 }
 
 function stop() {
+  stopHealthCheck();
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  if (ws) {
-    ws.onclose = null; // prevent reconnect
-    ws.close();
-    ws = null;
-  }
-  connected = false;
+  destroySocket();
   console.log('[binance] stopped');
 }
 
