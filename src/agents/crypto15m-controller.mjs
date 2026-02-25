@@ -51,6 +51,40 @@ const NOTIONAL_USDC = 100;
 const SLIPPAGE_COEFF = 2.0;
 const MAX_SLIPPAGE = 0.05;
 
+// ═══════════════════════════════════════════════════════════════
+// SHADOW BANKROLL — $100 fixed-fraction simulator
+// ═══════════════════════════════════════════════════════════════
+const BANKROLL_START = 100;
+const STAKE_FRACTION = 0.05;       // 5% of bankroll per trade
+const MAX_STAKE_USDC = 10;         // cap per trade
+const BANKROLL_STATE_PATH = join(process.cwd(), 'shadow_bankroll.json');
+
+function loadBankrollState() {
+  try {
+    if (existsSync(BANKROLL_STATE_PATH)) {
+      return JSON.parse(readFileSync(BANKROLL_STATE_PATH, 'utf-8'));
+    }
+  } catch (_) {}
+  return {
+    bankroll: BANKROLL_START,
+    totalTrades: 0,
+    wins: 0,
+    losses: 0,
+    peakBankroll: BANKROLL_START,
+    maxDrawdown: 0,
+    equity: [],
+    lastControllerTickAt: null,
+    lastResolveScanAt: null,
+    lastResolvedAt: null,
+    pendingCount: 0,
+    pendingOldestTs: null,
+  };
+}
+
+function saveBankrollState(state) {
+  writeFileSync(BANKROLL_STATE_PATH, JSON.stringify(state, null, 2));
+}
+
 function estimateSlippage(askSize) {
   if (!askSize || askSize <= 0) return MAX_SLIPPAGE;
   return Math.min(NOTIONAL_USDC / (askSize * SLIPPAGE_COEFF), MAX_SLIPPAGE);
@@ -430,6 +464,13 @@ function createShadowProposal(d, cycle) {
     zClamped: d.zClamped,
     pHatClamped: d.pHatClamped,
   };
+  // Bankroll stake sizing
+  const bankrollState = loadBankrollState();
+  const stakeUsdc = Math.min(bankrollState.bankroll * STAKE_FRACTION, MAX_STAKE_USDC);
+  const shares = d.buyPrice ? stakeUsdc / d.buyPrice : 0;
+  proposal.stakeUsdc = parseFloat(stakeUsdc.toFixed(4));
+  proposal.shares = parseFloat(shares.toFixed(4));
+
   shadowProposals.push(proposal);
   logShadowProposal(proposal);
   return proposal.id;
@@ -437,6 +478,18 @@ function createShadowProposal(d, cycle) {
 
 async function resolveShadowProposals() {
   const now = Date.now();
+  const nowIso = new Date().toISOString();
+
+  // Stamp liveness: resolve scan always runs, even if nothing to resolve
+  const livenessState = loadBankrollState();
+  livenessState.lastResolveScanAt = nowIso;
+  livenessState.pendingCount = shadowProposals.filter(p => p.status === 'pending').length;
+  const pendingTimes = shadowProposals.filter(p => p.status === 'pending' && p.ts).map(p => p.ts);
+  livenessState.pendingOldestTs = pendingTimes.length > 0
+    ? pendingTimes.sort()[0]
+    : null;
+  saveBankrollState(livenessState);
+
   const toResolve = shadowProposals.filter(p =>
     p.status === 'pending' && p.windowEnd && new Date(p.windowEnd).getTime() < now
   );
@@ -486,9 +539,51 @@ async function resolveShadowProposals() {
     proposal.costs = costs > 0 ? parseFloat(costs.toFixed(6)) : null;
     proposal.realizedPnl = realizedPnl != null ? parseFloat(realizedPnl.toFixed(6)) : null;
 
+    // Bankroll: compute dollar-denominated tradePnl from shares
+    const stakeShares = proposal.shares ?? 0;
+    const perSharePnl = proposal.buyPrice != null
+      ? (won ? 1 - proposal.buyPrice : -proposal.buyPrice) - costs
+      : 0;
+    const tradePnl = stakeShares * perSharePnl;
+    proposal.tradePnl = parseFloat(tradePnl.toFixed(6));
+
     logShadowOutcome(proposal);
     const pnlStr = realizedPnl != null ? ` pnl=${realizedPnl.toFixed(4)}` : '';
-    console.log(`[shadow] resolved ${proposal.id}: ${proposal.symbol} ${proposal.side} → outcome=${outcome} won=${won} (p_hat=${proposal.p_hat} edge=${proposal.edge}${pnlStr})`);
+    const bankrollStr = stakeShares > 0 ? ` tradePnl=$${tradePnl.toFixed(4)}` : '';
+    console.log(`[shadow] resolved ${proposal.id}: ${proposal.symbol} ${proposal.side} → outcome=${outcome} won=${won} (p_hat=${proposal.p_hat} edge=${proposal.edge}${pnlStr}${bankrollStr})`);
+  }
+
+  // Update bankroll state with all resolved trades in this batch
+  const justResolved = toResolve.filter(p => p.status === 'resolved' && p.tradePnl != null);
+  if (justResolved.length > 0) {
+    const bankrollState = loadBankrollState();
+    bankrollState.lastResolvedAt = nowIso;
+    for (const resolved of justResolved) {
+      bankrollState.bankroll += resolved.tradePnl ?? 0;
+      bankrollState.totalTrades++;
+      if (resolved.won) bankrollState.wins++;
+      else bankrollState.losses++;
+      if (bankrollState.bankroll > bankrollState.peakBankroll) {
+        bankrollState.peakBankroll = bankrollState.bankroll;
+      }
+      const dd = bankrollState.peakBankroll - bankrollState.bankroll;
+      if (dd > bankrollState.maxDrawdown) bankrollState.maxDrawdown = dd;
+      bankrollState.equity.push({
+        ts: resolved.resolvedAt,
+        bankroll: parseFloat(bankrollState.bankroll.toFixed(4)),
+        tradeId: resolved.id,
+        pnl: resolved.tradePnl,
+      });
+    }
+    bankrollState.bankroll = parseFloat(bankrollState.bankroll.toFixed(4));
+    // Cap equity at 2000 entries
+    if (bankrollState.equity.length > 2000) {
+      bankrollState.equity = bankrollState.equity.slice(-2000);
+    }
+    // Update pending count after resolution
+    bankrollState.pendingCount = shadowProposals.filter(p => p.status === 'pending').length;
+    saveBankrollState(bankrollState);
+    console.log(`[shadow] bankroll: $${bankrollState.bankroll.toFixed(2)} (${justResolved.length} settled, peak=$${bankrollState.peakBankroll.toFixed(2)}, maxDD=$${bankrollState.maxDrawdown.toFixed(2)})`);
   }
 
   // Remove resolved from in-memory list
@@ -535,6 +630,13 @@ function computeShadowStats() {
 // CONTROLLER CYCLE
 // ═══════════════════════════════════════════════════════════════
 async function controllerCycle(cycle) {
+  // Stamp liveness tick on every cycle
+  {
+    const bs = loadBankrollState();
+    bs.lastControllerTickAt = new Date().toISOString();
+    saveBankrollState(bs);
+  }
+
   // Resolve any expired shadow proposals first
   if (SHADOW_MODE) await resolveShadowProposals();
 

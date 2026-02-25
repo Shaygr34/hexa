@@ -226,6 +226,44 @@ interface PerfData {
   topLosses: PerfEntry[];
 }
 
+// ── Bankroll types ──
+interface BankrollWindowAgg {
+  trades: number;
+  wins: number;
+  losses: number;
+  winRate: number | null;
+  pnl: number;
+  roiPct: number;
+  maxDrawdown: number;
+  avgPnl: number;
+  avgEdge: number | null;
+  avgNetEdge: number | null;
+}
+
+interface BankrollData {
+  bankroll: number;
+  startingCapital: number;
+  totalPnl: number;
+  roi: number;
+  totalTrades: number;
+  wins: number;
+  losses: number;
+  winRate: number | null;
+  peakBankroll: number;
+  maxDrawdown: number;
+  maxDrawdownPct: number;
+  equity: { ts: string; bankroll: number; tradeId: string; pnl: number }[];
+  recentTrades: { ts: string; tradeId: string; pnl: number; bankroll: number }[];
+  // Liveness
+  lastControllerTickAt: string | null;
+  lastResolveScanAt: string | null;
+  lastResolvedAt: string | null;
+  pendingCount: number;
+  pendingOldestAgeSec: number | null;
+  // Windows
+  windows: { '1h': BankrollWindowAgg; '24h': BankrollWindowAgg; all: BankrollWindowAgg };
+}
+
 // ── Diagnostics types ──
 interface DiagnosticsData {
   windowSize: number;
@@ -262,6 +300,7 @@ export default function Dashboard() {
   const [controller, setController] = useState<ControllerState | null>(null);
   const [diagnostics, setDiagnostics] = useState<DiagnosticsData | null>(null);
   const [perf, setPerf] = useState<PerfData | null>(null);
+  const [bankroll, setBankroll] = useState<BankrollData | null>(null);
 
   const fetchData = useCallback(async () => {
     try {
@@ -310,6 +349,14 @@ export default function Dashboard() {
     const fetchPerf = () => fetch('/api/crypto15m/perf?hours=24').then(r => r.json()).then((d: PerfData) => { if (d.resolved > 0) setPerf(d); }).catch(() => {});
     fetchPerf();
     const i = setInterval(fetchPerf, 30000);
+    return () => clearInterval(i);
+  }, []);
+
+  // Poll bankroll on 15s interval (reads small JSON file)
+  useEffect(() => {
+    const fetchBankroll = () => fetch('/api/crypto15m/bankroll').then(r => r.json()).then(setBankroll).catch(() => {});
+    fetchBankroll();
+    const i = setInterval(fetchBankroll, 15000);
     return () => clearInterval(i);
   }, []);
 
@@ -454,7 +501,7 @@ export default function Dashboard() {
       </div>
 
       <div className="scroll-y">
-        {tab === 'crypto15m' && <Crypto15mTab controller={controller} diagnostics={diagnostics} perf={perf} />}
+        {tab === 'crypto15m' && <Crypto15mTab controller={controller} diagnostics={diagnostics} perf={perf} bankroll={bankroll} />}
         {tab === 'opportunities' && <OpportunitiesTab opps={opportunities} expandedId={expandedId} setExpandedId={setExpandedId} onApprove={handleApprove} onSimulate={handleSimulate} />}
         {tab === 'pinned' && <PinnedMarketsTab markets={pinnedMarkets} onRefresh={fetchData} />}
         {tab === 'signals' && <SignalsTab signals={signals} onRefresh={fetchData} />}
@@ -474,7 +521,248 @@ export default function Dashboard() {
 // ══════════════════════════════════════════
 // TAB 0: Crypto15m Controller
 // ══════════════════════════════════════════
-function Crypto15mTab({ controller, diagnostics, perf }: { controller: ControllerState | null; diagnostics: DiagnosticsData | null; perf: PerfData | null }) {
+// ══════════════════════════════════════════
+// Bankroll Card with liveness + window selector
+// ══════════════════════════════════════════
+function BankrollCard({ bankroll }: { bankroll: BankrollData }) {
+  const [window, setWindow] = useState<'all' | '24h' | '1h'>('all');
+  const [nowTs, setNowTs] = useState(Date.now());
+
+  // Tick a local clock every 5s so "ago" labels stay fresh without needing a new API call
+  useEffect(() => {
+    const i = setInterval(() => setNowTs(Date.now()), 5000);
+    return () => clearInterval(i);
+  }, []);
+
+  const agoStr = (iso: string | null) => {
+    if (!iso) return 'never';
+    const sec = Math.floor((nowTs - new Date(iso).getTime()) / 1000);
+    if (sec < 0) return 'just now';
+    if (sec < 60) return `${sec}s ago`;
+    if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
+    return `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m ago`;
+  };
+
+  const w = bankroll.windows?.[window] ?? bankroll.windows?.all;
+  const hasWindows = !!bankroll.windows;
+
+  // Pick metrics from selected window, fall back to all-time top-level fields
+  const wTrades = hasWindows ? w.trades : bankroll.totalTrades;
+  const wWins = hasWindows ? w.wins : bankroll.wins;
+  const wLosses = hasWindows ? w.losses : bankroll.losses;
+  const wWinRate = hasWindows ? w.winRate : bankroll.winRate;
+  const wPnl = hasWindows ? w.pnl : bankroll.totalPnl;
+  const wRoi = hasWindows ? w.roiPct : bankroll.roi;
+  const wMaxDD = hasWindows ? w.maxDrawdown : bankroll.maxDrawdown;
+  const wAvgPnl = hasWindows ? w.avgPnl : (bankroll.totalTrades > 0 ? bankroll.totalPnl / bankroll.totalTrades : 0);
+
+  // Liveness dot color
+  const tickAgeSec = bankroll.lastControllerTickAt
+    ? (nowTs - new Date(bankroll.lastControllerTickAt).getTime()) / 1000
+    : Infinity;
+  const liveColor = tickAgeSec < 30 ? 'var(--green)' : tickAgeSec < 120 ? 'var(--yellow)' : 'var(--red)';
+
+  return (
+    <div className="card" style={{ borderLeft: '3px solid var(--accent)' }}>
+      {/* Header */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+        <div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div className="card-title">Shadow Bankroll</div>
+            <span style={{
+              width: 8, height: 8, borderRadius: '50%', background: liveColor,
+              display: 'inline-block', boxShadow: tickAgeSec < 30 ? `0 0 6px ${liveColor}` : 'none',
+            }} />
+          </div>
+          <div style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 2 }}>
+            ${bankroll.startingCapital} start | 5% fixed-fraction | hold-to-resolution
+          </div>
+        </div>
+        <div style={{ textAlign: 'right' }}>
+          <div style={{
+            fontSize: 24, fontWeight: 700, fontFamily: 'monospace',
+            color: bankroll.bankroll >= bankroll.startingCapital ? 'var(--green)' : 'var(--red)',
+          }}>
+            ${bankroll.bankroll.toFixed(2)}
+          </div>
+          <div style={{
+            fontSize: 11,
+            color: bankroll.totalPnl >= 0 ? 'var(--green)' : 'var(--red)',
+          }}>
+            {bankroll.totalPnl >= 0 ? '+' : ''}{bankroll.totalPnl.toFixed(2)} ({bankroll.roi >= 0 ? '+' : ''}{bankroll.roi.toFixed(1)}%)
+          </div>
+        </div>
+      </div>
+
+      {/* Liveness bar */}
+      <div style={{
+        display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 12,
+        padding: '6px 10px', background: 'var(--bg)', borderRadius: 4,
+        fontSize: 10, fontFamily: 'monospace', color: 'var(--text-dim)',
+      }}>
+        <span>
+          tick: <span style={{ color: liveColor, fontWeight: 600 }}>{agoStr(bankroll.lastControllerTickAt)}</span>
+        </span>
+        <span>
+          resolve scan: <span style={{ fontWeight: 600 }}>{agoStr(bankroll.lastResolveScanAt)}</span>
+        </span>
+        <span>
+          last settled: <span style={{ fontWeight: 600 }}>{agoStr(bankroll.lastResolvedAt)}</span>
+        </span>
+        <span>
+          pending: <span style={{ fontWeight: 600, color: bankroll.pendingCount > 0 ? 'var(--yellow)' : 'var(--text-dim)' }}>
+            {bankroll.pendingCount}
+          </span>
+          {bankroll.pendingOldestAgeSec != null && bankroll.pendingCount > 0 && (
+            <span> (oldest {Math.floor(bankroll.pendingOldestAgeSec / 60)}m)</span>
+          )}
+        </span>
+      </div>
+
+      {/* Window selector */}
+      <div style={{ display: 'flex', gap: 4, marginBottom: 12 }}>
+        {(['all', '24h', '1h'] as const).map(w => (
+          <button key={w} onClick={() => setWindow(w)} style={{
+            padding: '3px 12px', borderRadius: 4, border: '1px solid var(--border)',
+            background: window === w ? 'var(--accent)' : 'var(--bg)',
+            color: window === w ? '#fff' : 'var(--text-dim)',
+            fontSize: 11, fontWeight: 600, cursor: 'pointer',
+          }}>
+            {w === 'all' ? 'All Time' : w}
+          </button>
+        ))}
+        {hasWindows && (
+          <span style={{ fontSize: 10, color: 'var(--text-dim)', alignSelf: 'center', marginLeft: 8 }}>
+            {wTrades} trades in window
+          </span>
+        )}
+      </div>
+
+      {/* Metrics row — driven by selected window */}
+      <div className="metrics" style={{ marginBottom: 12 }}>
+        <div className="metric">
+          <div className="metric-label">Trades</div>
+          <div className="metric-value">{wTrades}</div>
+        </div>
+        <div className="metric">
+          <div className="metric-label">P&L</div>
+          <div className="metric-value" style={{ color: wPnl >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 700 }}>
+            {wPnl >= 0 ? '+' : ''}${wPnl.toFixed(2)}
+          </div>
+        </div>
+        <div className="metric">
+          <div className="metric-label">ROI</div>
+          <div className="metric-value" style={{ color: wRoi >= 0 ? 'var(--green)' : 'var(--red)' }}>
+            {wRoi >= 0 ? '+' : ''}{wRoi.toFixed(1)}%
+          </div>
+        </div>
+        <div className="metric">
+          <div className="metric-label">Win Rate</div>
+          <div className={`metric-value ${(wWinRate ?? 0) >= 0.5 ? 'positive' : 'warn'}`}>
+            {wWinRate != null ? `${(wWinRate * 100).toFixed(1)}%` : '--'}
+          </div>
+        </div>
+        <div className="metric">
+          <div className="metric-label">W / L</div>
+          <div className="metric-value">{wWins} / {wLosses}</div>
+        </div>
+        <div className="metric">
+          <div className="metric-label">Avg PnL</div>
+          <div className="metric-value" style={{ color: wAvgPnl >= 0 ? 'var(--green)' : 'var(--red)' }}>
+            {wAvgPnl >= 0 ? '+' : ''}{wAvgPnl.toFixed(4)}
+          </div>
+        </div>
+        <div className="metric">
+          <div className="metric-label">Max DD</div>
+          <div className="metric-value" style={{ color: wMaxDD > 0 ? 'var(--red)' : 'var(--text-dim)' }}>
+            ${wMaxDD.toFixed(2)}
+          </div>
+        </div>
+        {hasWindows && w.avgEdge != null && (
+          <div className="metric">
+            <div className="metric-label">Avg Edge</div>
+            <div className="metric-value">{(w.avgEdge * 100).toFixed(2)}%</div>
+          </div>
+        )}
+      </div>
+
+      {/* Equity curve sparkline */}
+      {bankroll.equity.length >= 2 && (() => {
+        const eq = bankroll.equity;
+        const values = eq.map(e => e.bankroll);
+        const minVal = Math.min(...values, bankroll.startingCapital) - 1;
+        const maxVal = Math.max(...values, bankroll.startingCapital) + 1;
+        const range = maxVal - minVal || 1;
+        const svgW = 600;
+        const h = 80;
+        const padY = 4;
+
+        const toX = (i: number) => (i / (eq.length - 1)) * svgW;
+        const toY = (v: number) => h - padY - ((v - minVal) / range) * (h - 2 * padY);
+
+        const points = eq.map((e, i) => `${toX(i).toFixed(1)},${toY(e.bankroll).toFixed(1)}`).join(' ');
+        const baselineY = toY(bankroll.startingCapital).toFixed(1);
+
+        const lastVal = values[values.length - 1];
+        const lineColor = lastVal >= bankroll.startingCapital ? 'var(--green)' : 'var(--red)';
+
+        return (
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4 }}>Equity Curve (all time)</div>
+            <svg viewBox={`0 0 ${svgW} ${h}`} style={{ width: '100%', height: 80, background: 'var(--bg)', borderRadius: 4 }}>
+              <line x1="0" y1={baselineY} x2={svgW} y2={baselineY}
+                stroke="var(--text-dim)" strokeWidth="0.5" strokeDasharray="4,4" opacity="0.5" />
+              <text x="4" y={Number(baselineY) - 3} fill="var(--text-dim)" fontSize="8" fontFamily="monospace">${bankroll.startingCapital}</text>
+              <polyline points={points} fill="none" stroke={lineColor} strokeWidth="1.5" strokeLinejoin="round" />
+              <circle cx={toX(eq.length - 1)} cy={toY(lastVal)} r="2.5" fill={lineColor} />
+              <text x={toX(eq.length - 1) - 30} y={toY(lastVal) - 5} fill={lineColor} fontSize="9" fontFamily="monospace" fontWeight="bold">
+                ${lastVal.toFixed(2)}
+              </text>
+            </svg>
+          </div>
+        );
+      })()}
+
+      {/* Recent trades table */}
+      {bankroll.recentTrades.length > 0 && (
+        <div>
+          <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 6 }}>Recent Trades</div>
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Trade</th>
+                <th>PnL</th>
+                <th>Bankroll</th>
+              </tr>
+            </thead>
+            <tbody>
+              {bankroll.recentTrades.slice(0, 10).map((t, i) => (
+                <tr key={i}>
+                  <td style={{ fontSize: 10, color: 'var(--text-dim)' }}>
+                    {new Date(t.ts).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                  </td>
+                  <td style={{ fontSize: 10, fontFamily: 'monospace', color: 'var(--text-dim)' }}>{t.tradeId.substring(0, 22)}</td>
+                  <td style={{
+                    fontWeight: 600, fontSize: 12, fontFamily: 'monospace',
+                    color: t.pnl >= 0 ? 'var(--green)' : 'var(--red)',
+                  }}>
+                    {t.pnl >= 0 ? '+' : ''}{t.pnl.toFixed(4)}
+                  </td>
+                  <td style={{ fontFamily: 'monospace', fontSize: 12 }}>
+                    ${t.bankroll.toFixed(2)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Crypto15mTab({ controller, diagnostics, perf, bankroll }: { controller: ControllerState | null; diagnostics: DiagnosticsData | null; perf: PerfData | null; bankroll: BankrollData | null }) {
   const [expandedSymbol, setExpandedSymbol] = useState<string | null>(null);
 
   if (!controller || controller.lastCycle === null) {
@@ -1169,6 +1457,9 @@ function Crypto15mTab({ controller, diagnostics, perf }: { controller: Controlle
           )}
         </div>
       )}
+
+      {/* Shadow Bankroll */}
+      {bankroll && bankroll.totalTrades > 0 && <BankrollCard bankroll={bankroll} />}
 
       {/* Diagnostics Panel */}
       {diagnostics && diagnostics.windowSize > 0 && (
